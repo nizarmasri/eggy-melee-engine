@@ -1,6 +1,7 @@
 #include "gm_1601.h"
 #include <stdlib.h>
 
+#include "pc/eggy/eggy.h"
 #include "pc/pc.h"
 
 #include <Runtime/platform.h>
@@ -4410,8 +4411,9 @@ u8 gm_GetNumCostumesForCKind(u8 ckind)
     }
     /* VS-only profile: the default costume and the first alternate only (the
      * bundled web app ships no other costume files); every costume choice,
-     * character select's included, wraps on this count. */
-    if (pc_vs_only() && lbl_803D51A0[ckind].ncolors > 2) {
+     * character select's included, wraps on this count. MELEE_EGGY wears
+     * them all (src/pc/eggy). */
+    if (pc_vs_only() && !pc_eggy_enabled() && lbl_803D51A0[ckind].ncolors > 2) {
         return 2;
     }
     return lbl_803D51A0[ckind].ncolors;

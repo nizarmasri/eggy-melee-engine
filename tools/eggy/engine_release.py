@@ -10,6 +10,8 @@ melee.pak, so the release is code only:
 - any other script the link emitted beside them (pthread or worklet loaders);
 - initial_pipeline_cache.db.gz, the shader seed the page installs as
   /initial_pipeline_cache.db (tools/browser/vs_pipeline_cache.db.gz);
+- melee-audio.worklet.js, the audio output's AudioWorklet as a static file,
+  for a page whose CSP allows no blob: script (src/pc/audio.c);
 - the host page's modules from platforms/browser/bundle (and coi-sw.js,
   gpu-preflight.mjs), with index.html as the reference page. vendor/sentry.mjs
   is left out: it is the third-party Sentry SDK, imported only when a build
@@ -50,7 +52,8 @@ FEATURES = ['--mvp-features', '--enable-threads', '--enable-bulk-memory', '--ena
 
 # The host page: no game data in any of these.
 HOST_MODULES = ['app.mjs', 'pak-reader.mjs', 'netplay.mjs', 'controller-view.mjs', 'gc-adapter.mjs',
-                'lzma.mjs', 'lzma.worker.mjs', 'pak-prefetch.worker.mjs', 'telemetry.mjs', 'index.html']
+                'lzma.mjs', 'lzma.worker.mjs', 'pak-prefetch.worker.mjs', 'telemetry.mjs', 'index.html',
+                'melee-audio.worklet.js']
 PLATFORM_FILES = ['coi-sw.js', 'gpu-preflight.mjs']
 
 # What the glue scan looks for, with a short reason each.

@@ -785,7 +785,17 @@ static void SDLCALL audio_pull(void* userdata, SDL_AudioStream* stream, int addi
  * on, so a long frame starved it and it stole time from frames. Instead the
  * mix goes into this ring in (shared) wasm memory, and an AudioWorklet reads
  * it on the browser's audio thread. The frame counters wrap freely; the
- * worklet owns s_web_read, pc_audio_pump owns s_web_write. */
+ * worklet owns s_web_read, pc_audio_pump owns s_web_write.
+ *
+ * The worklet (MeleeOut) is also a static file, bundle/melee-audio.worklet.js,
+ * shipped with every engine release: a page whose CSP allows scripts from its
+ * own origin only (Eggy's script-src 'self') cannot load a blob: module. The
+ * page names the file with Module.meleeAudioWorkletUrl, or resolves it with
+ * its Module.locateFile; with neither (melee-web's own page) the copy inlined
+ * below is loaded from a blob: URL, as before. platforms/browser/tests/
+ * audio-worklet.test.mjs keeps the two copies identical. A page that already
+ * unlocked an AudioContext on a user gesture (iOS needs one) passes it as
+ * Module.meleeAudioContext and the mix plays through it. */
 #include <emscripten.h>
 #include <stdatomic.h>
 
@@ -827,14 +837,23 @@ EM_JS(int, web_audio_start, (float* ring, unsigned frames, void* write_idx, void
     }
   }
   registerProcessor('melee-out', MeleeOut);`;
-  let ctx;
-  try {
-    ctx = new AudioContext({ sampleRate: rate, latencyHint: 'interactive' });
-  } catch (e) {
-    ctx = new AudioContext({ latencyHint: 'interactive' }); /* the worklet resamples */
+  let ctx = Module.meleeAudioContext;
+  if (!ctx) {
+    try {
+      ctx = new AudioContext({ sampleRate: rate, latencyHint: 'interactive' });
+    } catch (e) {
+      ctx = new AudioContext({ latencyHint: 'interactive' }); /* the worklet resamples */
+    }
   }
-  const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
-  ctx.audioWorklet.addModule(url).then(() => {
+  const inline = () => ctx.audioWorklet.addModule(
+    URL.createObjectURL(new Blob([source], { type: 'text/javascript' })));
+  const file = Module.meleeAudioWorkletUrl || (typeof Module.locateFile === 'function' ?
+    Module.locateFile('melee-audio.worklet.js', typeof scriptDirectory === 'string' ? scriptDirectory : '') : '');
+  const loaded = file ? ctx.audioWorklet.addModule(file).catch((e) => {
+    err('audio: ' + file + ' did not load (' + e + '); trying the inline worklet');
+    return inline();
+  }) : inline();
+  loaded.then(() => {
     const node = new AudioWorkletNode(ctx, 'melee-out', {
       numberOfInputs: 0, outputChannelCount: [2],
       processorOptions: { buffer: HEAPU8.buffer, ring, frames, write: write_idx, read: read_idx, rate },

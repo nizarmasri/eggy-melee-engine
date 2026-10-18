@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#include "pc/eggy/eggy.h"
 #include "pc/file_cache.h"
 #include "pc/net.h"
 #include "pc/pc.h"
@@ -31,6 +32,9 @@ bool pc_is_unlock_all_enabled(void) {
  * transformations. */
 bool pc_is_frozen_stadium_enabled(void) {
     bool unlock_all, frozen;
+    if (pc_eggy_enabled()) {
+        return pc_eggy_frozen_stadium(); /* the page's config, word 11 */
+    }
     if (pc_net_rules(&unlock_all, &frozen)) {
         return frozen;
     }
@@ -42,13 +46,14 @@ bool pc_is_free_camera_enabled(void) {
 }
 bool pc_is_ucf_enabled(void) {
     const char* env = getenv("MELEE_UCF");
-    if (pc_net_deterministic()) {
+    if (pc_net_deterministic() || pc_eggy_enabled()) {
         return true; /* both peers must agree; launcher.cpp forces it too */
     }
     return env != NULL ? env[0] != '0' : pc_vs_only();
 }
+/* MELEE_EGGY plays fixed 16:9 (src/pc/eggy), with the HUD spread to it. */
 int pc_get_hud_mode(void) {
-    return 0;
+    return pc_eggy_enabled() ? 1 : 0;
 }
 bool pc_is_custom_textures_enabled(void) {
     return false;

@@ -30,6 +30,19 @@ jobs:
       - run: python3 tools/check_style.py
       - run: python3 tools/compile_check.py
 
+  eggy-config:
+    name: Eggy config validation
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # src/pc/eggy/eggy_config.c is pure C (no game state), so the host
+      # compiler builds it against its test.
+      - run: |
+          mkdir -p build
+          gcc -std=c11 -O1 -Wall -Wextra -Werror -Isrc tests/eggy/eggy_config_test.c \
+            src/pc/eggy/eggy_config.c -o build/eggy_config_test
+          build/eggy_config_test
+
   web-unit:
     name: Web app unit tests
     runs-on: ubuntu-24.04

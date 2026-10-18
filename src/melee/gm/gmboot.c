@@ -9,6 +9,7 @@
 #include <melee/ty/toy.h>
 #ifdef TARGET_PC
 #include "gmonlinemode.h"
+#include "pc/eggy/eggy.h"
 #include <stdlib.h>
 #include <string.h>
 #endif
@@ -37,7 +38,7 @@ static struct loadData load_data;
 static struct leaveData leave_data;
 
 #ifdef TARGET_PC
-/* MELEE_BOOT_SCENE=<title|vs|classic|training|unranked|direct|ranked>: skip the whole menu walk and
+/* MELEE_BOOT_SCENE=<title|vs|classic|training|unranked|direct|ranked|eggy>: skip the whole menu walk and
  * boot into one scene with a fixed setup. Menu navigation here can only be
  * driven by synthetic input, which misses keypresses often enough that an
  * automated run cannot rely on it (see tools/smoke_test.py).
@@ -45,7 +46,8 @@ static struct leaveData leave_data;
  * vs maps to GM_DEBUG_VS because that mode already *is* a fixed direct start
  * (onEnterDebugVs in gmvsmode.c fills the StartMeleeData itself). classic and
  * training still open on a character-select state, so their on_load hooks
- * seed the pick and jump past it. */
+ * seed the pick and jump past it. eggy is GM_EGGY, the matches the Eggy page
+ * configures (EGGY.md), and only with MELEE_EGGY=1 and MELEE_VS_ONLY=1. */
 u8 pc_boot_scene(void)
 {
     static int done;
@@ -71,9 +73,12 @@ u8 pc_boot_scene(void)
         } else if (strcmp(want, "ranked") == 0) {
             scene = GM_ONLINE;
             gmOnline_SetKind(ONLINE_KIND_RANKED);
+        } else if (strcmp(want, "eggy") == 0 && pc_eggy_enabled()) {
+            scene = GM_EGGY;
         } else {
             OSReport("MELEE_BOOT_SCENE: unknown scene '%s'; valid values are "
-                     "title, vs, classic, unranked, direct, ranked\n",
+                     "title, vs, classic, unranked, direct, ranked, and eggy "
+                     "with MELEE_EGGY=1 MELEE_VS_ONLY=1\n",
                      want);
         }
     }

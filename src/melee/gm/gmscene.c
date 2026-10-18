@@ -1,5 +1,6 @@
 #include "gmscene.h"
 #ifdef TARGET_PC
+#include "pc/eggy/eggy.h"
 #include "pc/net.h"
 #include "pc/pc.h"
 #include "pc/slp.h"
@@ -345,6 +346,10 @@ static bool gm_RunSimTick(void (*on_frame)(void), struct gm_80479D58_t* temp_r25
         OSCheckActiveThreads();
     }
     gmMainLib_8046B0F0.xC = false;
+#ifdef TARGET_PC
+    /* MELEE_EGGY: the page's HUD, abort and results timer (src/pc/eggy). */
+    pc_eggy_after_tick();
+#endif
     return temp_r25->unk_C != 0;
 }
 
@@ -389,6 +394,12 @@ void gm_801A4D34(void (*on_frame)(void), GameSceneInfo* info)
     gm_80479D58.unk_4 = 0;
     gm_80479D58.unk_8 = 0;
     gm_80479D58.unk_C = 0;
+#ifdef TARGET_PC
+    /* MELEE_EGGY: a loaded match holds here, frame 0 next, until the page
+     * says go (src/pc/eggy). Before the flush, so it drops the samples the
+     * hold queued and the first tick reads the newest. */
+    pc_eggy_scene_begin(info != NULL ? info->scene_kind : -1);
+#endif
     HSD_PadFlushQueue(HSD_PAD_FLUSH_QUEUE_LEAVE1);
     lb_8001CF18();
 

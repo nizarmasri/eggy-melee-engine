@@ -43,6 +43,9 @@
 #include "gmvsmode.h"
 #include "gmonlinemode.h"
 #include "types.h"
+#ifdef TARGET_PC
+#include "pc/eggy/eggy_mode.h"
+#endif
 #include <melee/if/ifprize.h>
 #include <melee/mn/mncharsel.h>
 #include <melee/mn/mnmain.h>
@@ -741,6 +744,16 @@ static GameMode modes[] = {
         NULL,
         gm_Mode_Online_States,
     },
+#ifdef TARGET_PC
+    {
+        false,
+        GM_EGGY,
+        NULL,
+        NULL,
+        NULL,
+        gm_Mode_Eggy_States,
+    },
+#endif
     {
         false,
         GM_COUNT,

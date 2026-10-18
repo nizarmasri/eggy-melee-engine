@@ -63,7 +63,8 @@ typedef enum GameModeKind {
     /* 2B */ GM_EVENT,
     /* 2C */ GM_SINGLE_BUTTON_VS,
     /* 2D */ GM_ONLINE, ///< PC: netplay (docs/netcode-plan.md §10)
-    /* 2E */ GM_COUNT,
+    /* 2E */ GM_EGGY,   ///< PC: matches the Eggy page configures (EGGY.md)
+    /* 2F */ GM_COUNT,
 } GameModeKind;
 
 /// Index into #gmm_x0_vsmodes::table.

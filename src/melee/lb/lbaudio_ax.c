@@ -14,6 +14,7 @@
 #include "pc/music_stream.h"
 #include "pc/net.h"
 #ifdef TARGET_PC
+#include "pc/eggy/eggy.h"
 #include "pc/net_sfx.h"
 #endif
 #include <dolphin/ai.h>
@@ -776,6 +777,13 @@ int lbAudioAx_80023F28(int arg0)
     if (arg0 < 0 || arg0 >= 0x62 || pc_net_resim()) {
         return true;
     }
+#ifdef TARGET_PC
+    /* MELEE_EGGY with music off on this device: the stream never starts, so
+     * no music file is read. No VS caller uses the result. */
+    if (pc_eggy_music_off()) {
+        return true;
+    }
+#endif
     if (!(filename = getHPSFile(arg0))) {
         return true;
     }

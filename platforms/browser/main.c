@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include "pc/discfont.h"
+#include "pc/eggy/eggy.h"
 #include "pc/launcher.h"
 #include "pc/pc.h"
 #include <SDL3/SDL.h>
@@ -61,12 +62,16 @@ int main(int argc, char** argv) {
     /* The page owns the canvas, so it owns the render size too. */
     c.windowWidth = EM_ASM_INT({ return Module.canvas.width; });
     c.windowHeight = EM_ASM_INT({ return Module.canvas.height; });
+    if (pc_eggy_enabled())
+        pc_eggy_preinit(); /* the Eggy page owns the keyboard (src/pc/eggy) */
     AuroraInfo info = aurora_initialize(argc, argv, &c);
     (void)info;
     extern void browser_prepare_graphics(void);
     browser_prepare_graphics();
     pc_gcadapter_init(); /* before the input thread: registers the WebHID buffer */
     pc_platform_init();
-    aurora_card_set_present(true);
+    /* MELEE_EGGY: no memory card, so every device builds the same
+     * card-absent save (everything unlocked) and nothing is written. */
+    aurora_card_set_present(!pc_eggy_enabled());
     return melee_main();
 }

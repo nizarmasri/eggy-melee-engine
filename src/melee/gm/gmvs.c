@@ -47,6 +47,7 @@
 #include <sysdolphin/baselib/gobjproc.h>
 #include <stdlib.h>
 #ifdef TARGET_PC
+#include "pc/eggy/eggy.h"
 #include "pc/slp.h"
 #endif
 
@@ -1568,6 +1569,11 @@ void fn_8016D8AC(int arg0, struct PlayerInitData* arg1)
         Player_SetPadPort(arg0, arg1->slot - 1);
     }
     if (arg1->slot_type == Gm_PKind_Human &&
+#ifdef TARGET_PC
+        /* MELEE_EGGY: the config names Zelda or Sheik outright; a button
+         * still held from the last scene must not swap her. */
+        !pc_eggy_enabled() &&
+#endif
         (HSD_PadCopyStatus[(u8) Player_GetPadPort(arg0)].button & HSD_PAD_A) &&
         (Player_GetPlayerCharacter(arg0) == CKind_Zelda ||
          Player_GetPlayerCharacter(arg0) == CKind_Seak))

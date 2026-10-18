@@ -21,6 +21,7 @@ extern void browser_yield(void);
 #include <stdlib.h>
 #include <string.h>
 
+#include "pc/eggy/eggy.h"
 #include "pc/input_poll.h"
 #include "pc/pc.h"
 #include "pc/launcher.h"
@@ -241,8 +242,9 @@ void pc_frame_boundary(void) {
     pc_handle_events(event);
     pc_menu_update();
     /* Nothing draws while the overlay pauses the game, so hold the last
-     * frame instead of clearing the EFB to black underneath the menu. */
-    aurora_preserve_frame_buffer(pc_menu_is_open());
+     * frame instead of clearing the EFB to black underneath the menu. The
+     * same while MELEE_EGGY parks or holds a match at frame 0 (src/pc/eggy). */
+    aurora_preserve_frame_buffer(pc_menu_is_open() || pc_eggy_hold_frame());
     pc_keyboard_apply();
 #ifdef __EMSCRIPTEN__
     pc_input_note_sample();

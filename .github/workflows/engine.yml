@@ -6,7 +6,9 @@ name: Engine
 # link and the node tests), then tools/eggy/engine_release.py, which collects
 # what bundle.py would ship minus melee.pak and writes engine.json. bundle.py
 # itself is never run: it needs a disc. Modelled on upstream melee-pc's
-# pages.yml, which builds the same target.
+# pages.yml, which builds the same target. Only master publishes a release; a
+# run on any other ref (workflow_dispatch --ref) builds the same folder and
+# uploads it as the artifact engine-release-<sha> instead.
 on:
   push:
     branches: [master]
@@ -92,6 +94,7 @@ jobs:
       # A release is never replaced: Eggy pins its files by sha256. A re-run of
       # the same commit only reports whether it rebuilt the same bytes.
       - name: Publish the release engine-<shortsha>
+        if: github.ref == 'refs/heads/master'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -110,6 +113,14 @@ jobs:
             cat build/eggy-release-notes.md >> "$GITHUB_STEP_SUMMARY"
           fi
           echo "https://github.com/$GH_REPO/releases/tag/$tag" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep a branch build as an artifact
+        if: github.ref != 'refs/heads/master'
+        uses: actions/upload-artifact@v7
+        with:
+          name: engine-release-${{ github.sha }}
+          path: build/eggy-release
+          if-no-files-found: error
 
       # compile_game.py writes one log per game unit; only the non-empty ones
       # say anything.
