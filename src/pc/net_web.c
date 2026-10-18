@@ -20,6 +20,13 @@
  * protocol already resends everything that matters. Nothing here parses a
  * datagram: net.c's gate (rx_datagram) authenticates and checks each one
  * exactly as it does for a socket.
+ *
+ * A mesh session (net_mesh.c, MELEE_EGGY netplay) has two to four phones on
+ * the same rings, so each of its datagrams carries one leading byte naming
+ * the other end: the destination engine port in tx, the source engine port in
+ * rx, inside the slot's 512 bytes. The page maps ports to its links.
+ * Module.meleeNetLink.mesh is the mesh protocol this engine speaks (an M2
+ * engine has none, and its rings never carry the byte).
  */
 #ifdef __EMSCRIPTEN__
 #include "compat.h"
@@ -34,6 +41,7 @@
 
 #define WEB_SLOTS 256 /* power of two */
 #define WEB_SLOT_BYTES 512
+_Static_assert(WEB_SLOT_BYTES == MESH_SLOT_BYTES, "a mesh datagram and its port byte fill a slot");
 
 typedef struct WebRing {
     _Atomic uint32_t head; /* slots written, ever (producer) */
@@ -48,14 +56,14 @@ static WebRing s_tx, s_rx;
 static _Atomic uint32_t s_generation;
 
 // clang-format off
-EM_JS(void, web_net_register, (void* tx, void* rx, void* generation, int slots, int bytes), {
-  Module.meleeNetLink = { buffer: HEAPU8.buffer, tx, rx, generation, slots, bytes };
+EM_JS(void, web_net_register, (void* tx, void* rx, void* generation, int slots, int bytes, int mesh), {
+  Module.meleeNetLink = { buffer: HEAPU8.buffer, tx, rx, generation, slots, bytes, mesh };
   Module.meleeNetLinkReady?.();
 });
 // clang-format on
 
 __attribute__((constructor)) static void net_web_init(void) {
-    web_net_register(&s_tx, &s_rx, &s_generation, WEB_SLOTS, WEB_SLOT_BYTES);
+    web_net_register(&s_tx, &s_rx, &s_generation, WEB_SLOTS, WEB_SLOT_BYTES, MESH_VERSION);
 }
 
 // clang-format off

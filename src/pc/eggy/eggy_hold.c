@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * The pure part of MELEE_EGGY netplay (src/pc/eggy/eggy_net.h): the hold's
- * rules and the barrier payload. No game or session state, so
+ * rules and the HELLO payload. No game or session state, so
  * tests/eggy/eggy_net_test.c builds it with the host compiler.
  */
 #include "pc/eggy/eggy_net.h"
@@ -41,28 +41,30 @@ uint32_t eggy_net_seed(const EggyConfig* c) {
     return c->seed != 0 ? c->seed : EGGY_NONZERO;
 }
 
-void eggy_hold_init(EggyHold* h, bool leader) {
+void eggy_hold_init(EggyHold* h, uint8_t humans, int self) {
     memset(h, 0, sizeof *h);
-    h->leader = leader;
+    h->humans = humans;
+    h->self = self;
 }
 
-int eggy_hold_next(const EggyHold* h, bool go) {
+int eggy_hold_next(const EggyHold* h, bool go, uint8_t away, int leader) {
+    const uint8_t others = (uint8_t)(h->humans & ~away & ~(1u << h->self));
     if (!h->sent_loaded) {
         return EGGY_HOLD_SEND_LOADED;
     }
     if (!h->reported) {
-        return h->peer_loaded ? EGGY_HOLD_REPORT : EGGY_HOLD_WAIT;
-    }
-    if (h->leader) {
-        if (h->sent_go) {
-            return EGGY_HOLD_RELEASE;
-        }
-        return go && h->peer_armed ? EGGY_HOLD_SEND_GO : EGGY_HOLD_WAIT;
+        return (h->loaded & others) == others ? EGGY_HOLD_REPORT : EGGY_HOLD_WAIT;
     }
     if (!h->sent_armed) {
         return go ? EGGY_HOLD_SEND_ARMED : EGGY_HOLD_WAIT;
     }
-    return h->peer_go ? EGGY_HOLD_RELEASE : EGGY_HOLD_WAIT;
+    if (h->sent_go || h->got_go) {
+        return EGGY_HOLD_RELEASE;
+    }
+    if (leader == h->self && (h->armed & others) == others) {
+        return EGGY_HOLD_SEND_GO;
+    }
+    return EGGY_HOLD_WAIT;
 }
 
 void eggy_hold_done(EggyHold* h, int action) {
@@ -84,20 +86,20 @@ void eggy_hold_done(EggyHold* h, int action) {
     }
 }
 
-void eggy_hold_receive(EggyHold* h, int type) {
+void eggy_hold_receive(EggyHold* h, int type, int from) {
+    if (from < 0 || from >= EGGY_PORTS || from == h->self || (h->humans & (1u << from)) == 0) {
+        return;
+    }
+    const uint8_t bit = (uint8_t)(1u << from);
     switch (type) {
     case EGGY_REL_LOADED:
-        h->peer_loaded = true;
+        h->loaded |= bit;
         break;
     case EGGY_REL_ARMED:
-        if (h->leader) {
-            h->peer_armed = true;
-        }
+        h->armed |= bit;
         break;
     case EGGY_REL_GO:
-        if (!h->leader) {
-            h->peer_go = true;
-        }
+        h->got_go = true;
         break;
     default:
         break;

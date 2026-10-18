@@ -178,8 +178,10 @@ static void delay_auto(void) {
      * (net_handshake.c). Reading net.hs_host instead would miss the window
      * before the handshake is claimed, which in a direct session used to be
      * the whole session: the documented MELEE_NET_DELAY=auto then never
-     * moved off its initial guess in direct play. */
-    bool announcer = net.local == 0;
+     * moved off its initial guess in direct play. A mesh's announcer is its
+     * acting leader, which every phone works out the same way (net_mesh.c),
+     * and the announcement goes to every phone. */
+    bool announcer = net_delay_announcer();
     if (!net.delay_auto || !announcer || net.delay_at != 0) {
         return;
     }
@@ -248,7 +250,7 @@ void net_delay_rel(const void* payload, int len) {
      * arriving here at the host is either a peer that has the roles confused
      * or one that has decided its own latency should be the host's -- either
      * way it must not retune this side. */
-    if (net.local == 0) {
+    if (net_delay_announcer()) {
         pc_log_line("net: REL_DELAY from the guest ignored (the host announces)");
         return;
     }

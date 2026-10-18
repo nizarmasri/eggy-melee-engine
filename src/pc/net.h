@@ -205,6 +205,41 @@ int pc_net_quiet_ms(void);
  * once and the session closes (BYE). Cleared by the next connect. */
 void pc_net_leave(void);
 
+/* A mesh of two to four phones over the page's link, one human port each
+ * (src/pc/net_mesh.c, src/pc/eggy): every phone sends its own port's input to
+ * every other and rolls back over all of them. `humans` is the human ports'
+ * mask, local_port this phone's; every phone passes the same session id, seed
+ * and first frame (no handshake: the caller has agreed the match). Reliable
+ * messages go to every phone still in (pc_net_send_reliable) and arrive with
+ * their sender's port (pc_net_mesh_recv). */
+bool pc_net_mesh_connect(
+    uint8_t humans, int local_port, uint32_t session, uint32_t seed, int32_t start_frame);
+/* How long a phone may be silent before it is settled away: away_ms in play,
+ * load_ms while it is still loading a scene. Read at connect; <= 0 keeps the
+ * defaults, 1500 and 120000. */
+void pc_net_mesh_set_timing(int away_ms, int load_ms);
+/* From here on silent phones are settled away (the match's hold). */
+void pc_net_mesh_arm(void);
+enum {
+    PC_NET_MESH_NONE,         /* not a human port of the mesh */
+    PC_NET_MESH_SELF,         /* this phone */
+    PC_NET_MESH_WAITING,      /* not heard from yet */
+    PC_NET_MESH_LIVE,         /* talking */
+    PC_NET_MESH_SILENT,       /* silent past its limit, or left: about to be settled */
+    PC_NET_MESH_AWAY,         /* settled away */
+    PC_NET_MESH_INCOMPATIBLE, /* another engine build's protocol */
+};
+int pc_net_mesh_link(int port);
+int pc_net_mesh_ping_ms(int port); /* -1 none yet */
+/* Settled away, and the last frame of its input the match uses (*frame). For
+ * this phone's own port: the others settled it, and it has left. Kept after
+ * the session closes, until the next connect. */
+bool pc_net_mesh_away(int port, int32_t* frame);
+int pc_net_mesh_leader(void);   /* the acting leader's port */
+uint8_t pc_net_mesh_live(void); /* human ports still in, this one included */
+int pc_net_mesh_recv(int* from, uint8_t* type, void* payload, int max);
+bool pc_net_mesh_send_to(int port, uint8_t type, const void* payload, int len);
+
 typedef struct PcNetCounters {
     int ping_ms;            /* smoothed round trip */
     int delay;              /* input delay in frames */

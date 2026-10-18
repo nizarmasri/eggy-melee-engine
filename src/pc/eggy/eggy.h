@@ -34,26 +34,33 @@
  *        +5 handicap: 0 off, 1..9 Melee's handicap levels
  *        +6, +7 reserved, 0
  *   [48] netplay 0/1: 0 plays on this phone alone and words 49..63 are not
- *        read; 1 plays two phones over the page's link (src/pc/eggy/eggy_net.c)
- *   [49] this phone's port: one of the two human ports
- *   [50] phones in the match: 2 (nothing else yet)
- *   [51] the mesh leader's port: the lowest human port. Its phone hosts the
- *        session; the other human's is the guest
+ *        read; 1 plays two to four phones over the page's link, one per human
+ *        port (src/pc/eggy/eggy_net.c, src/pc/net_mesh.c)
+ *   [49] this phone's port: one of the human ports
+ *   [50] phones in the match: 2..4, the number of human ports
+ *   [51] the leader's port: the lowest human port. Its phone releases the
+ *        hold, announces the input delay and settles a silent phone away;
+ *        if it goes silent itself, the next lowest phone still in does
  *   [52] session id (uint32), distinct per match: datagrams of any other
  *        session are dropped
  *   [53] input delay in frames: 0 auto (from ping), 1..4 fixed
  *   [54..63] reserved, 0
- * Two fighters at least; with teams on, two teams at least. Netplay: exactly
- * two humans, one per phone; CPUs are simulated identically on both.
- * Both phones' configs must agree on every word but 12..14 and 49
+ * Two fighters at least; with teams on, two teams at least. Netplay: two to
+ * four humans, one per phone; CPUs are simulated identically on every phone.
+ * Every phone's config must agree on every word but 12..14 and 49
  * (eggy_config_hash), or the session is refused.
  *
  * Netplay stats (int32 words at eggy_net_stats(), kept after a session ends):
- *   [0] state: 0 none, 1 waiting for the page's link, 2 handshaking, 3 loading
+ *   [0] state: 0 none, 1 waiting for the page's links, 2 handshaking, 3 loading
  *       and holding, 4 playing, 5 closing, 6 closed, 7 failed
- *   [1] ping ms, [2] input delay, [3] rollbacks, [4] deepest rollback,
- *   [5] desyncs (0/1: the first one is reported), [6] frames stalled on the
- *   peer, [7] link quality 0 stable .. 3 reconnecting
+ *   [1] ping ms (the worst phone's), [2] input delay, [3] rollbacks,
+ *   [4] deepest rollback, [5] desyncs (0/1: the first one is reported),
+ *   [6] frames stalled on the other phones, [7] link quality 0 stable ..
+ *   2 stalling
+ *   [8 + port] that port's phone: 0 not a phone of the match, 1 this phone,
+ *       2 not heard from yet, 3 playing, 4 silent (about to be settled away),
+ *       5 settled away, 6 another engine build (net-error 7)
+ *   [12 + port] ping ms to that port's phone, -1 none
  *
  * HUD (int32 words at eggy_hud(), current at every tick):
  *   [0] state: 0 parked, 1 loading, 2 loaded (held at frame 0), 3 fighting,
@@ -90,8 +97,9 @@ extern "C" {
 #define EGGY_HUD_PORT_BASE 3
 #define EGGY_RESULTS_WORDS (2 + 8 * EGGY_PORTS)
 #define EGGY_RESULTS_PORT_BASE 2
-#define EGGY_NET_STATS_WORDS 8
-#define EGGY_NET_PHONES 2
+#define EGGY_NET_STATS_WORDS 16
+#define EGGY_NET_PHONES_MIN 2
+#define EGGY_NET_PHONES_MAX 4
 
 /* CharacterKind 0..25, Sheik included. */
 #define EGGY_CKIND_COUNT 26
@@ -142,9 +150,9 @@ enum EggyNetError {
     EGGY_NET_ERR_LINK = 1,         /* the page's link did not open (status) */
     EGGY_NET_ERR_CONNECT = 2,      /* the session could not be opened */
     EGGY_NET_ERR_HANDSHAKE = 3,    /* RULES/READY failed or timed out */
-    EGGY_NET_ERR_MISMATCH = 4,     /* the other phone's config is another match */
-    EGGY_NET_ERR_PEER_LEFT = 5,    /* the other phone left or went silent */
-    EGGY_NET_ERR_TIMEOUT = 6,      /* it never finished loading */
+    EGGY_NET_ERR_MISMATCH = 4,     /* another phone's config is another match */
+    EGGY_NET_ERR_PEER_LEFT = 5,    /* every other phone left, or this one was settled away */
+    EGGY_NET_ERR_TIMEOUT = 6,      /* a phone never answered or never finished loading */
     EGGY_NET_ERR_INCOMPATIBLE = 7, /* another wire protocol (engine build) */
 };
 
@@ -155,7 +163,7 @@ enum EggyNetError {
 #define EGGY_ERR_FIGHTERS 101   /* fewer than two fighters */
 #define EGGY_ERR_TEAMS 102      /* teams on, every fighter on one team */
 #define EGGY_ERR_DISABLED 103   /* the engine was not started with MELEE_EGGY */
-#define EGGY_ERR_NET_HUMANS 104 /* netplay without exactly two humans */
+#define EGGY_ERR_NET_HUMANS 104 /* netplay humans not 2..4 */
 
 typedef struct EggyPort {
     int32_t kind; /* enum EggyPortKind */
@@ -185,8 +193,9 @@ typedef struct EggyConfig {
     /* netplay, words 48..53 */
     bool netplay;
     int32_t local_port;
-    int32_t leader_port;
-    int32_t guest_port; /* the other human's */
+    int32_t leader_port; /* the lowest human port */
+    uint8_t humans;      /* the human ports, one phone each */
+    int32_t phones;      /* how many */
     uint32_t session;
     int32_t input_delay; /* 0 auto */
     uint32_t hash;       /* eggy_config_hash() of the words */

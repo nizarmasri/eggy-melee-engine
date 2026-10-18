@@ -39,28 +39,33 @@ uint32_t eggy_config_hash(const int32_t* w) {
     return h;
 }
 
-/* Words 48..63 with netplay on: two humans, one per phone. */
+/* Words 48..63 with netplay on: two to four humans, one per phone. */
 static int parse_netplay(const int32_t* w, EggyConfig* c) {
-    int humans[EGGY_PORTS];
-    int n = 0;
+    uint8_t humans = 0;
+    int n = 0, lowest = -1;
     for (int port = 0; port < EGGY_PORTS; port++) {
         if (c->ports[port].kind == EGGY_PORT_HUMAN) {
-            humans[n++] = port;
+            humans |= (uint8_t)(1u << port);
+            lowest = lowest < 0 ? port : lowest;
+            n++;
         }
     }
     if (!in_range(w[49], 0, EGGY_PORTS - 1)) {
         return EGGY_ERR_FIELD(49);
     }
-    if (w[50] != EGGY_NET_PHONES) {
+    if (!in_range(w[50], EGGY_NET_PHONES_MIN, EGGY_NET_PHONES_MAX)) {
         return EGGY_ERR_FIELD(50);
     }
-    if (n != EGGY_NET_PHONES) {
+    if (n < EGGY_NET_PHONES_MIN || n > EGGY_NET_PHONES_MAX) {
         return EGGY_ERR_NET_HUMANS;
     }
-    if (w[49] != humans[0] && w[49] != humans[1]) {
+    if (w[50] != n) {
+        return EGGY_ERR_FIELD(50); /* one phone per human */
+    }
+    if ((humans & (1u << w[49])) == 0) {
         return EGGY_ERR_FIELD(49); /* this phone's port must be one of the humans */
     }
-    if (w[51] != humans[0]) {
+    if (w[51] != lowest) {
         return EGGY_ERR_FIELD(51); /* the leader is the lowest human port */
     }
     if (!in_range(w[53], 0, 4)) {
@@ -72,8 +77,9 @@ static int parse_netplay(const int32_t* w, EggyConfig* c) {
         }
     }
     c->local_port = w[49];
-    c->leader_port = humans[0];
-    c->guest_port = humans[1];
+    c->leader_port = lowest;
+    c->humans = humans;
+    c->phones = n;
     c->session = (uint32_t)w[52];
     c->input_delay = w[53];
     return 0;

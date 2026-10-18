@@ -12,6 +12,10 @@
  *   net_sync.c      time sync (offset/jitter rings, skip/advance, auto delay)
  *   net_snapshot.c  snapshots, frame checksum, state ring, sync test,
  *                   record/replay
+ *   net_mesh.c      the transport of a mesh of two to four instances over
+ *                   the page's link (src/pc/eggy), in place of the two-peer
+ *                   one above when net.mesh is set; net_mesh_wire.c is its
+ *                   pure part (wire format, leader and settlement rules)
  *
  * Threading
  * ---------
@@ -67,6 +71,7 @@
 
 #include "pc/net.h"
 #include "pc/net_lan.h"
+#include "pc/net_mesh_wire.h"
 #include "pc/pc.h"
 
 #include <dolphin/pad.h>
@@ -407,6 +412,10 @@ struct NetSession {
 
     /* sync test (net_snapshot.c) */
     bool synctest;
+
+    /* A mesh session (pc_net_mesh_connect, net_mesh.c): the transport is the
+     * mesh's, game thread only, and every remote port is a slot. */
+    bool mesh;
 };
 extern struct NetSession net;
 
@@ -515,6 +524,43 @@ void net_delay_rel(const void* payload, int len);
 /* A REL_SCENE payload from the peer (on_rel dispatches it here, like
  * REL_DELAY): the frame its scene asked to end on. */
 void net_scene_rel(const void* payload, int len);
+/* The same from the phone on controller port `port` (a mesh). */
+void net_scene_rel_from(int port, const void* payload, int len);
+/* The one side that announces the input delay: player 1 of a plain session,
+ * the acting leader of a mesh. */
+bool net_delay_announcer(void);
+
+/* ---- net.c, for net_mesh.c ---------------------------------------------
+ * Every remote player is a slot (net.c "remote slots"): its input ring, its
+ * contiguous mark and, once the mesh settles it away, the last frame of real
+ * input it will ever have. */
+void net_slots_setup(int local_port, const int* remote_ports, int n);
+void net_slot_take(int k, int64_t first, int count, const WirePad* pads);
+void net_slot_settle(int k, int32_t frame);
+int32_t net_slot_have(int k);
+const WirePad* net_slot_real(int k, int32_t f);
+int32_t net_slot_adv(int k);
+int32_t net_local_wrote(void);
+const WirePad* net_local_pad(int32_t f);
+int32_t net_confirmed(void);
+uint32_t net_ck_at(int32_t f);
+int32_t net_scene_first(void);
+void net_desync_found(int32_t f, uint32_t mine, uint32_t theirs, int port);
+void net_peer_gone(int status);
+
+/* ---- net_mesh.c --------------------------------------------------------- */
+
+void mesh_open(uint8_t humans, int local_port);
+void mesh_send_inputs(void);
+void mesh_recv(void);   /* drain the link, apply, settle silent phones */
+void mesh_rx_now(void); /* the page's arrival pump */
+void mesh_check_desync(void);
+void mesh_bye(uint8_t reason);
+bool mesh_announcer(void);
+uint8_t mesh_scene_peers(void);
+int mesh_quiet_ms(void);
+bool mesh_send_reliable(uint8_t type, const void* payload, int len);
+int mesh_recv_reliable(int* from, uint8_t* type, void* payload, int max);
 
 /* A silent freeze: the transmit timer notices the game thread has stopped
  * ticking and asks it for a stack (src/pc/net_watchdog.c). */

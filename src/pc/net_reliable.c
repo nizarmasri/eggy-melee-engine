@@ -135,6 +135,9 @@ bool pc_net_send_reliable(uint8_t type, const void* payload, int len) {
     if (!net.active || len < 0 || len > REL_MAX || (len > 0 && payload == NULL)) {
         return false;
     }
+    if (net.mesh) {
+        return mesh_send_reliable(type, payload, len); /* to every phone still in */
+    }
     RelTx* t = &s_rel_tx[lane_of(type)];
     SDL_LockMutex(net.tx_lock);
     bool ok = t->n < REL_QUEUE && (!rel_low_priority(type) || low_queued(t) < REL_LOW_QUEUE);
@@ -152,6 +155,12 @@ bool pc_net_send_reliable(uint8_t type, const void* payload, int len) {
 }
 
 int pc_net_recv_reliable(uint8_t* type, void* payload, int max) {
+    if (net.mesh) {
+        int from;
+        return type == NULL || payload == NULL || max < 0 ?
+                   -1 :
+                   mesh_recv_reliable(&from, type, payload, max);
+    }
     if (s_rel_rx_n == 0 || type == NULL || payload == NULL || max < 0) {
         return -1;
     }

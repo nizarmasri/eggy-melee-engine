@@ -16,9 +16,10 @@
  *   sudden death (2)  only after a tie, as VS mode plays it (gmvsmelee.c)
  *   results (3)       Melee's results screen, ended after [15] seconds
  *
- * Netplay (word 48) is the same loop with melee-web's session around it
- * (src/pc/eggy/eggy_net.c): the park opens it, the hold waits for the other
- * phone too, and the park after the match closes it.
+ * Netplay (word 48) is the same loop with melee-web's session around it, over
+ * a mesh of two to four phones (src/pc/eggy/eggy_net.c): the park opens it,
+ * the hold waits for every other phone too, and the park after the match
+ * closes it.
  *
  * All of this runs on the game thread. The exports only latch requests the
  * game thread acts on at its next frame boundary or tick, so the page can call
@@ -78,11 +79,12 @@ enum {
     JS_NET_ERROR = 4,
     JS_DESYNC = 5,
     JS_PEER_LOST = 6,
+    JS_AWAY = 7,
 };
 
 // clang-format off
 EM_JS(void, eggy_js_state, (int kind, int a, int b), {
-  const names = ['parked', 'loaded', 'ended', 'error', 'net-error', 'desync', 'peer-lost'];
+  const names = ['parked', 'loaded', 'ended', 'error', 'net-error', 'desync', 'peer-lost', 'away'];
   const eggy = Module['eggy'];
   if (eggy && typeof eggy.onState === 'function') {
     try {
@@ -110,7 +112,7 @@ static bool s_scene_live; /* inside GS_VS or GS_SUDDEN_DEATH, fighters exist */
 static bool s_sudden_death;
 static bool s_net_lost;      /* netplay: the session died mid-match, outcome 4 */
 static bool s_net_failed;    /* netplay: it died in the hold, before frame 0 */
-static bool s_net_closing;   /* netplay: the park is waiting for the other phone */
+static bool s_net_closing;   /* netplay: the park is waiting for the other phones */
 static int32_t s_frame_base; /* ticks of the scenes before this one (VS before sudden death) */
 static int32_t s_end_frame;
 static int32_t s_results_ticks;
@@ -175,8 +177,8 @@ bool pc_eggy_frozen_stadium(void) {
  * In a netplay session the sample net.c takes is port 0's (net.c
  * capture_local_sample: "physical port zero is the local controller"), and
  * the session writes every port of the frame itself (write_head), so port 0
- * carries this phone's own port and nothing else is read: the other phone's
- * pads come from the other phone. */
+ * carries this phone's own port and nothing else is read: the other phones'
+ * pads come from the other phones. */
 u32 __real_PADRead(PADStatus* status);
 u32 __wrap_PADRead(PADStatus* status) {
     if (!pc_eggy_enabled()) {
@@ -445,7 +447,17 @@ static void enter_vs(GameModeState* state) {
     *HSD_RandSeedPtr = s_cfg.netplay ? eggy_net_seed(&s_cfg) : s_cfg.seed;
 }
 
-/* Netplay's hold: until both phones are loaded and both pages said go
+/* onState('away', port, frame) for every phone settled away since the last
+ * look, this one's own included. */
+static void net_away_report(void) {
+    int32_t frame;
+    for (int port; (port = eggy_net_next_away(&frame)) >= 0;) {
+        pc_log_line("eggy: port %d settled away after frame %d", port, frame);
+        eggy_js_state(JS_AWAY, port, frame);
+    }
+}
+
+/* Netplay's hold: until every phone is loaded and every page said go
  * (eggy_net.c). A failure unwinds the loaded scene as an abort does. */
 static void net_hold(void) {
     for (;;) {
@@ -455,6 +467,7 @@ static void net_hold(void) {
         }
         bool loaded = false;
         const int r = eggy_net_hold_step(s_go, &loaded);
+        net_away_report();
         if (loaded) {
             eggy_js_state(JS_LOADED, s_serial, 0);
         }
@@ -471,11 +484,14 @@ static void net_hold(void) {
     }
 }
 
-/* Netplay, once per tick of the match: a desync is reported, and a session
- * that died before the match was decided ends it where it stands. */
+/* Netplay, once per tick of the match: a desync is reported, a phone
+ * settled away is reported (the rest play on), and a match that cannot go on
+ * here before it was decided -- this phone settled away by the others, its
+ * session gone, or no other phone left -- ends where it stands. */
 static void net_tick(void) {
     int32_t frame = 0;
     const int event = eggy_net_tick(&frame);
+    net_away_report();
     if (event > 0) {
         eggy_js_state(JS_DESYNC, frame, s_serial);
     } else if (event < 0 && s_state == EGGY_STATE_FIGHTING && s_scene_live && !s_abort &&
@@ -483,9 +499,13 @@ static void net_tick(void) {
     {
         s_net_lost = true;
         frame = s_frame_base + (int32_t)gm_801A4BA8();
-        pc_log_line("eggy: the other phone is gone at match frame %d (status %d)", frame,
+        const bool evicted = eggy_net_evicted();
+        pc_log_line("eggy: %s at match frame %d (status %d)",
+            evicted ? "this phone was settled away" : "no other phone is left", frame,
             pc_net_peer_status());
-        eggy_js_state(JS_PEER_LOST, frame, s_serial);
+        if (!evicted) {
+            eggy_js_state(JS_PEER_LOST, frame, s_serial); /* 'away' told this one already */
+        }
         /* Melee's own early end: the match is scored as it stands (gmvs.c
          * gm_GetMatchOutcome, OUTCOME_TERMINATED), and GAME! closes it on
          * this phone alone. */
@@ -544,6 +564,7 @@ void pc_eggy_after_tick(void) {
         if (s_cfg.netplay && fresh) {
             int32_t frame;
             eggy_net_tick(&frame); /* keep the lane drained; the match is decided */
+            net_away_report();
         }
         if (s_abort && fresh) {
             if (s_cfg.netplay) {
@@ -595,7 +616,7 @@ static void finish(const MatchEnd* end) {
     set_state(EGGY_STATE_ENDED);
     hud_update();
     eggy_js_state(JS_ENDED, outcome, s_serial);
-    /* A lost session has no results screen: the other phone is not there. */
+    /* A lost session has no results screen: the other phones are not there. */
     gm_SetNextGameModeStateId(
         s_cfg.results_seconds > 0 && !s_net_lost ? MODE_STATE_RESULTS : MODE_STATE_VS);
 }

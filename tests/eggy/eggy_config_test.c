@@ -278,11 +278,12 @@ static void test_netplay(void) {
     EggyConfig c;
     net_base(w);
     CHECK(parse(w, &c) == 0);
-    CHECK(c.netplay && c.local_port == 0 && c.leader_port == 0 && c.guest_port == 2);
+    CHECK(
+        c.netplay && c.local_port == 0 && c.leader_port == 0 && c.humans == 0x05 && c.phones == 2);
     CHECK(c.session == 0xC0FFEE01u && c.input_delay == 0);
     w[49] = 2; /* the other phone's view of the same match */
     CHECK(parse(w, &c) == 0);
-    CHECK(c.local_port == 2 && c.leader_port == 0 && c.guest_port == 2);
+    CHECK(c.local_port == 2 && c.leader_port == 0 && c.humans == 0x05);
 
     net_expect(48, 2, EGGY_ERR_FIELD(48));
     net_expect(48, -1, EGGY_ERR_FIELD(48));
@@ -291,7 +292,10 @@ static void test_netplay(void) {
     net_expect(49, 4, EGGY_ERR_FIELD(49));
     net_expect(49, -1, EGGY_ERR_FIELD(49));
     net_expect(50, 1, EGGY_ERR_FIELD(50));
-    net_expect(50, 3, EGGY_ERR_FIELD(50));
+    net_expect(50, 3, EGGY_ERR_FIELD(50)); /* in range, but two humans: one phone each */
+    net_expect(50, 4, EGGY_ERR_FIELD(50));
+    net_expect(50, 5, EGGY_ERR_FIELD(50));
+    net_expect(50, 0, EGGY_ERR_FIELD(50));
     net_expect(51, 2, EGGY_ERR_FIELD(51)); /* the leader is the lowest human */
     net_expect(51, 1, EGGY_ERR_FIELD(51));
     net_expect(52, 0, 0);
@@ -303,11 +307,37 @@ static void test_netplay(void) {
         net_expect(i, 1, EGGY_ERR_FIELD(i));
     }
 
-    /* Exactly two humans, one per phone. */
+    /* Two to four humans, one per phone. Falco on port 1 makes three. */
     net_base(w);
-    w[EGGY_CONFIG_PORT_BASE + EGGY_CONFIG_PORT_WORDS] = EGGY_PORT_HUMAN; /* Falco too */
+    w[EGGY_CONFIG_PORT_BASE + EGGY_CONFIG_PORT_WORDS] = EGGY_PORT_HUMAN;
     w[EGGY_CONFIG_PORT_BASE + EGGY_CONFIG_PORT_WORDS + 4] = 0;
-    CHECK(parse(w, &c) == EGGY_ERR_NET_HUMANS);
+    CHECK(parse(w, &c) == EGGY_ERR_FIELD(50)); /* [50] still says two */
+    w[50] = 3;
+    CHECK(parse(w, &c) == 0);
+    CHECK(c.humans == 0x07 && c.phones == 3 && c.leader_port == 0 && c.local_port == 0);
+    w[49] = 1;
+    CHECK(parse(w, &c) == 0 && c.local_port == 1);
+    w[49] = 3;
+    CHECK(parse(w, &c) == EGGY_ERR_FIELD(49)); /* nobody's yet */
+    /* A fourth human on port 3: four phones. */
+    int32_t* p3 = &w[EGGY_CONFIG_PORT_BASE + 3 * EGGY_CONFIG_PORT_WORDS];
+    p3[0] = EGGY_PORT_HUMAN;
+    p3[1] = 2;
+    p3[2] = 0;
+    p3[3] = 1;
+    p3[4] = 0;
+    w[50] = 4;
+    CHECK(parse(w, &c) == 0);
+    CHECK(c.humans == 0x0F && c.phones == 4 && c.local_port == 3 && c.leader_port == 0);
+    w[51] = 1;
+    CHECK(parse(w, &c) == EGGY_ERR_FIELD(51)); /* still the lowest human */
+    /* Leader follows the humans: port 0 a CPU, port 1 leads three phones. */
+    w[51] = 1;
+    w[EGGY_CONFIG_PORT_BASE] = EGGY_PORT_CPU;
+    w[EGGY_CONFIG_PORT_BASE + 4] = 3;
+    w[50] = 3;
+    CHECK(parse(w, &c) == 0 && c.leader_port == 1 && c.humans == 0x0E);
+    /* One human is not netplay. */
     net_base(w);
     w[EGGY_CONFIG_PORT_BASE + 2 * EGGY_CONFIG_PORT_WORDS] = EGGY_PORT_CPU;
     w[EGGY_CONFIG_PORT_BASE + 2 * EGGY_CONFIG_PORT_WORDS + 4] = 5;

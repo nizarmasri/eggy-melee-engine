@@ -57,12 +57,25 @@
 struct NetSession net = {
     .sock = SOCK_INVALID, .tick_frame = -1, .rb_barrier = -1, .start_frame = -1};
 
-static WirePad s_local_ring[RING];   /* indexed by frame & (RING-1) */
-static WirePad s_remote_ring[RING];  /* real input, or the prediction in use */
-static int32_t s_remote_have = -1;   /* newest contiguous real remote frame */
-static int32_t s_remote_newest = -1; /* newest frame the peer reported holding */
-static int32_t s_last_acked = -1;    /* newest local frame the peer holds */
-static int32_t s_rb_frame = -1;      /* oldest mispredicted frame not rolled back yet */
+static WirePad s_local_ring[RING]; /* indexed by frame & (RING-1) */
+/* The remote players, one slot each: the peer of a two-instance session, or
+ * up to three phones of a mesh (net_mesh.c). Each slot's ring holds real
+ * input, or the prediction in use; s_remote_have is the lowest slot's
+ * contiguous mark, so "every remote input up to here is real". A slot whose
+ * player was settled away (net_slot_settle) reads neutral after its last real
+ * frame, and once it holds that frame it no longer holds anyone back. */
+#define REMOTES 3
+#define HAVE_ALL (INT32_MAX / 2) /* a settled slot holding everything */
+static WirePad s_rem_ring[REMOTES][RING];
+static int32_t s_rem_have[REMOTES];   /* newest contiguous real frame, per slot */
+static int32_t s_rem_settle[REMOTES]; /* last real frame of a settled slot, else -2 */
+static int s_rem_port[REMOTES];       /* the controller port each slot drives */
+static int s_nrem = 1;                /* slots in use */
+static int s_local_port;              /* the port this instance drives */
+static int32_t s_remote_have = -1;    /* min over the slots */
+static int32_t s_remote_newest = -1;  /* newest frame the peer reported holding */
+static int32_t s_last_acked = -1;     /* newest local frame the peer holds */
+static int32_t s_rb_frame = -1;       /* oldest mispredicted frame not rolled back yet */
 /* The peer's checksums by frame. Each input packet reports one frame, the
  * newest it has confirmed, and that is often ahead of ours; a single slot
  * overwritten by every packet meant those frames were never compared from
@@ -221,6 +234,7 @@ static bool s_timer_tried;      /* SDL_AddTimer attempted this session */
  * Snapshot failure uses s_lockstep instead: earlier predicted frames must
  * remain eligible for correction. */
 static int s_scene_last = -1; /* scene_kind() at the last fresh tick */
+static int32_t s_scene_first; /* the frame that scene began on */
 /* Lockstep frames a fight's first loads get before it predicts. */
 #define FIGHT_ENTRY_LEAD 10
 static bool s_rb_lost_logged; /* rb_lost: one log per session */
@@ -480,6 +494,10 @@ static Uint32 SDLCALL tx_timer(void* ud, SDL_TimerID id, Uint32 interval) {
 }
 
 static void send_inputs(void) {
+    if (net.mesh) {
+        mesh_send_inputs();
+        return;
+    }
     /* The local sample taken at frame f is the input for frame f + delay. */
     int32_t newest = s_wrote;
     if (newest < 0) {
@@ -725,20 +743,51 @@ static void rx_input(const Packet* pk, int n, bool reordered) {
     send_ack(s_rx_have, pk->seq);
 }
 
-/* The game thread's half of a packet rx_input queued. rx_input's rule over
- * the same packets in the same order, against a net.frame never behind the
- * one it checked, so a drain leaves s_remote_have at or above s_rx_have. */
-static void on_inputs(const Packet* pk, bool reordered) {
-    int count = pk->count > REDUNDANCY ? REDUNDANCY : pk->count;
-    int64_t last = (int64_t)pk->first + count - 1;
-    if (count > 0 && pk->first <= s_remote_have + 1 && last > s_remote_have &&
+/* ---- remote slots ------------------------------------------------------ */
+
+static int32_t slot_have_eff(int k) {
+    const int32_t settle = s_rem_settle[k];
+    return settle >= -1 && s_rem_have[k] >= settle ? HAVE_ALL : s_rem_have[k];
+}
+
+static void remote_have_update(void) {
+    int32_t h = HAVE_ALL;
+    for (int k = 0; k < s_nrem; k++) {
+        const int32_t e = slot_have_eff(k);
+        if (e < h) {
+            h = e;
+        }
+    }
+    s_remote_have = h;
+}
+
+/* The pad slot k drives on frame f: neutral after a settled slot's last real
+ * frame, its ring otherwise (real input, or the prediction). */
+static const WirePad* slot_pad(int k, int32_t f) {
+    static const WirePad neutral;
+    const int32_t settle = s_rem_settle[k];
+    if (settle >= -1 && f > settle) {
+        return &neutral;
+    }
+    return &s_rem_ring[k][f & (RING - 1)];
+}
+
+/* Real input of slot k for frames first..first+count-1. Only contiguous data
+ * is taken; a frame already simulated holds the prediction it ran on, and a
+ * real input that differs from it marks the rollback. */
+static void slot_take(int k, int64_t first, int count, const WirePad* pads) {
+    int64_t last = first + count - 1;
+    const int32_t settle = s_rem_settle[k];
+    if (settle >= -1 && last > settle) {
+        last = settle; /* past a settled player's last frame it is neutral */
+    }
+    if (count > 0 && first <= (int64_t)s_rem_have[k] + 1 && last > s_rem_have[k] &&
         last < (int64_t)net.frame + RING / 2)
     {
         int32_t upto = simulated_upto();
-        for (int32_t f = s_remote_have + 1; f <= last; f++) {
-            WirePad pad = pk->pads[f - pk->first];
-            WirePad* slot = &s_remote_ring[f & (RING - 1)];
-            /* A frame already simulated holds the prediction it ran on. */
+        for (int32_t f = s_rem_have[k] + 1; f <= last; f++) {
+            WirePad pad = pads[f - first];
+            WirePad* slot = &s_rem_ring[k][f & (RING - 1)];
             if (f <= upto && memcmp(slot, &pad, sizeof pad) != 0 &&
                 (s_rb_frame < 0 || f < s_rb_frame))
             {
@@ -746,9 +795,114 @@ static void on_inputs(const Packet* pk, bool reordered) {
             }
             *slot = pad;
         }
-        s_remote_have = last;
+        s_rem_have[k] = (int32_t)last;
         s_progress_ns = SDL_GetTicksNS();
+        remote_have_update();
     }
+}
+
+static void slots_reset(void) {
+    memset(s_rem_ring, 0, sizeof s_rem_ring);
+    for (int k = 0; k < REMOTES; k++) {
+        s_rem_have[k] = -1;
+        s_rem_settle[k] = -2;
+        s_rem_port[k] = 1;
+    }
+    s_nrem = 1;
+    s_local_port = 0;
+    s_remote_have = -1;
+}
+
+/* ---- the slot API, for the mesh session (net_mesh.c) ------------------- */
+
+void net_slots_setup(int local_port, const int* remote_ports, int n) {
+    slots_reset();
+    s_local_port = local_port;
+    s_nrem = n < 1 ? 1 : n > REMOTES ? REMOTES : n;
+    for (int k = 0; k < s_nrem; k++) {
+        s_rem_port[k] = remote_ports[k];
+    }
+}
+
+void net_slot_take(int k, int64_t first, int count, const WirePad* pads) {
+    if (k >= 0 && k < s_nrem) {
+        slot_take(k, first, count, pads);
+    }
+}
+
+/* Slot k's player is gone: its last real input is `frame`, and every frame
+ * after it is neutral for the rest of the session. A frame past it that was
+ * already simulated on something else (a prediction, or real input this
+ * instance held beyond what the mesh settled on) is rolled back, exactly as
+ * a misprediction is. Frames up to it that are still missing arrive as usual
+ * (relayed by an instance that holds them) and hold the slot back until they
+ * do; from then on it holds nobody back. */
+void net_slot_settle(int k, int32_t frame) {
+    static const WirePad neutral;
+    if (k < 0 || k >= s_nrem || s_rem_settle[k] >= -1) {
+        return;
+    }
+    s_rem_settle[k] = frame < -1 ? -1 : frame;
+    const int32_t upto = simulated_upto();
+    int32_t from = s_rem_settle[k] + 1;
+    if (from <= upto - RING) {
+        from = upto - RING + 1;
+    }
+    for (int32_t f = from; f <= upto; f++) {
+        if (memcmp(&s_rem_ring[k][f & (RING - 1)], &neutral, sizeof neutral) != 0) {
+            if (s_rb_frame < 0 || f < s_rb_frame) {
+                s_rb_frame = f;
+            }
+            break;
+        }
+    }
+    s_progress_ns = SDL_GetTicksNS();
+    remote_have_update();
+}
+
+int32_t net_slot_have(int k) {
+    return k >= 0 && k < s_nrem ? s_rem_have[k] : -1;
+}
+
+/* The real input slot k holds for frame f, which must be in (have - RING,
+ * have]. */
+const WirePad* net_slot_real(int k, int32_t f) {
+    return &s_rem_ring[k][f & (RING - 1)];
+}
+
+/* How far this simulation has run past slot k's input, as send_inputs
+ * measures the frame advantage; INT32_MIN once the slot holds nobody back. */
+int32_t net_slot_adv(int k) {
+    const int32_t have = slot_have_eff(k);
+    return have >= HAVE_ALL ? INT32_MIN : net.frame - 1 - have;
+}
+
+int32_t net_local_wrote(void) {
+    return s_wrote;
+}
+
+const WirePad* net_local_pad(int32_t f) {
+    return &s_local_ring[f & (RING - 1)];
+}
+
+int32_t net_confirmed(void) {
+    return confirmed_frame();
+}
+
+uint32_t net_ck_at(int32_t f) {
+    return s_ck_ring[f & (RING - 1)];
+}
+
+int32_t net_scene_first(void) {
+    return s_scene_first;
+}
+
+/* The game thread's half of a packet rx_input queued. rx_input's rule over
+ * the same packets in the same order, against a net.frame never behind the
+ * one it checked, so a drain leaves s_remote_have at or above s_rx_have. */
+static void on_inputs(const Packet* pk, bool reordered) {
+    int count = pk->count > REDUNDANCY ? REDUNDANCY : pk->count;
+    slot_take(0, pk->first, count, pk->pads);
     if (pk->ck_frame >= 0) {
         s_rck[pk->ck_frame & (RING - 1)].frame = pk->ck_frame;
         s_rck[pk->ck_frame & (RING - 1)].ck = pk->ck;
@@ -1241,7 +1395,9 @@ static uint64_t rx_heard_ns(void) {
  * turn: the gate, the ack and the RTT sample happen on arrival instead of at
  * the next tick, which kept a frame of processing in every ping sample. */
 void pc_net_web_rx_now(void) {
-    if (net.active && s_rx_thread == NULL) {
+    if (net.active && net.mesh) {
+        mesh_rx_now();
+    } else if (net.active && s_rx_thread == NULL) {
         atomic_store(&s_frame_pub, net.frame);
         rx_pump();
     }
@@ -1252,6 +1408,10 @@ void pc_net_web_rx_now(void) {
  * frame loop calls this once per fresh tick and wait_remote() once a turn. */
 void recv_inputs(void) {
     atomic_store(&s_frame_pub, net.frame);
+    if (net.mesh) {
+        mesh_recv(); /* the page's link, on this thread: no queue to apply */
+        return;
+    }
     if (s_rx_thread == NULL) {
         rx_pump();
     }
@@ -1313,7 +1473,7 @@ static void dump_rings_around(int32_t f) {
             continue;
         }
         const WirePad* m = &s_local_ring[i & (RING - 1)];
-        const WirePad* t = &s_remote_ring[i & (RING - 1)];
+        const WirePad* t = slot_pad(0, i);
         pc_log_line("net: ring f%d p%d %04x/%d,%d p%d %04x/%d,%d ck %08x x%u%s", i, net.local + 1,
             m->button, m->stickX, m->stickY, net.remote + 1, t->button, t->stickX, t->stickY,
             s_ck_ring[i & (RING - 1)], s_sim_n[i & (RING - 1)],
@@ -1347,6 +1507,10 @@ static void check_desync(void) {
     if (net.desync_reported || net.hs == HS_PENDING) {
         return;
     }
+    if (net.mesh) {
+        mesh_check_desync(); /* each phone's checksums against ours */
+        return;
+    }
     int32_t upto = confirmed_frame();
     int32_t from = s_ck_checked + 1 > net.ck_from ? s_ck_checked + 1 : net.ck_from;
     if (from <= net.frame - RING) {
@@ -1368,6 +1532,32 @@ static void check_desync(void) {
             return;
         }
     }
+}
+
+bool net_delay_announcer(void) {
+    return net.mesh ? mesh_announcer() : net.local == 0;
+}
+
+/* The mesh has let this instance go (settled away by the others): the
+ * session ends at the next look, as on a BYE. */
+void net_peer_gone(int status) {
+    if (!s_peer_left) {
+        s_peer_left = true;
+        s_status = status;
+    }
+}
+
+/* A mesh's comparison found frame f differs from the phone on `port`. */
+void net_desync_found(int32_t f, uint32_t mine, uint32_t theirs, int port) {
+    if (net.desync_reported) {
+        return;
+    }
+    net.desync_reported = true;
+    s_desync_frame = f;
+    pc_log_line(
+        "net: DESYNC at frame %d with port %d (local %08x remote %08x)", f, port + 1, mine, theirs);
+    dump_rings_around(f);
+    dump_states_around(f);
 }
 
 /* ---- resume after an interruption --------------------------------------
@@ -1603,9 +1793,19 @@ static bool wait_remote(int32_t need) {
         }
         net_watchdog_heartbeat();
         /* Before now, so no stamp the receive thread writes is later than it. */
-        uint64_t heard = rx_heard_ns();
+        uint64_t heard = net.mesh ? 0 : rx_heard_ns();
         uint64_t now = SDL_GetTicksNS();
-        if (s_rc != RSM_NONE) {
+        if (net.mesh) {
+            /* A silent phone is the mesh's to settle (net_mesh.c, run by the
+             * recv_inputs above), after which nothing waits on it. What ends
+             * a wait here is only a mesh that stopped moving altogether. */
+            uint64_t since = s_progress_ns ? s_progress_ns : t0;
+            if (now - since > NO_PROGRESS_TIMEOUT_MS * 1000000ull) {
+                s_no_progress = true;
+                s_status = PC_NET_PEER_TIMEOUT;
+                return false;
+            }
+        } else if (s_rc != RSM_NONE) {
             if (!resume_poll(now)) {
                 return false;
             }
@@ -1711,13 +1911,25 @@ void pc_net_disconnect(void);
  * releases immediately while the other is still waiting, and the sims part
  * on the frame that peer enters the next scene (measured tablet<->PC, "peer
  * 121" against an exit asked at 5775). */
-static uint32_t s_scene_seq;                     /* exits we have completed */
-static int32_t s_scene_exit_local = -1;          /* frame our scene asked to end on */
-static int32_t s_scene_exit_at = -1;             /* agreed frame, once both are in */
-static int32_t s_scene_wait_since = -1;          /* frame the incomplete wait began */
-static int32_t s_scene_exit_remote[SCENE_SLOTS]; /* the peer's, by its own seq */
+static uint32_t s_scene_seq;            /* exits we have completed */
+static int32_t s_scene_exit_local = -1; /* frame our scene asked to end on */
+static int32_t s_scene_exit_at = -1;    /* agreed frame, once both are in */
+static int32_t s_scene_wait_since = -1; /* frame the incomplete wait began */
+/* Each peer's, by its controller port and its own seq: the one peer of a
+ * plain session, or every other phone of a mesh, which all leave on the
+ * latest of everyone's frame plus the lead. */
+static int32_t s_scene_exit_remote[4][SCENE_SLOTS];
+
+/* The ports whose announcement this side waits for. */
+static uint8_t scene_peers(void) {
+    return net.mesh ? mesh_scene_peers() : (uint8_t)(1u << s_rem_port[0]);
+}
 
 void net_scene_rel(const void* payload, int len) {
+    net_scene_rel_from(s_rem_port[0], payload, len);
+}
+
+void net_scene_rel_from(int port, const void* payload, int len) {
     SceneMsg m;
     if (len != (int)sizeof m) {
         pc_log_line("net: REL_SCENE of %d bytes ignored", len);
@@ -1749,15 +1961,19 @@ void net_scene_rel(const void* payload, int len) {
         pc_log_line("net: REL_SCENE seq %u ignored (we are on %u)", seq, s_scene_seq);
         return;
     }
-    s_scene_exit_remote[seq % SCENE_SLOTS] = (int32_t)f;
+    if (port >= 0 && port < 4) {
+        s_scene_exit_remote[port][seq % SCENE_SLOTS] = (int32_t)f;
+    }
 }
 
 static void scene_handoff_reset(void) {
     s_scene_seq = 0;
     s_scene_exit_local = s_scene_exit_at = -1;
     s_scene_wait_since = -1;
-    for (int i = 0; i < SCENE_SLOTS; i++) {
-        s_scene_exit_remote[i] = -1;
+    for (int p = 0; p < 4; p++) {
+        for (int i = 0; i < SCENE_SLOTS; i++) {
+            s_scene_exit_remote[p][i] = -1;
+        }
     }
 }
 
@@ -1769,7 +1985,24 @@ bool pc_net_scene_hold(void) {
          * recorded pair agreed, not where this run's own code asks to. */
         return record_replay_scene_hold(net.frame);
     }
-    int32_t* remote = &s_scene_exit_remote[s_scene_seq % SCENE_SLOTS];
+    const int slot = (int)(s_scene_seq % SCENE_SLOTS);
+    /* The latest frame the peers announced, and the first peer still missing
+     * (-1: none). A mesh phone settled away mid-hand-off stops being waited
+     * for (scene_peers). */
+    const uint8_t peers = scene_peers();
+    int32_t latest = -1, missing = -1;
+    for (int p = 0; p < 4; p++) {
+        if ((peers & (1u << p)) == 0) {
+            continue;
+        }
+        const int32_t f = s_scene_exit_remote[p][slot];
+        if (f < 0 && missing < 0) {
+            missing = p;
+        } else if (f > latest) {
+            latest = f;
+        }
+    }
+    const int32_t shown = missing >= 0 ? -1 : latest; /* the log's "peer" */
     if (s_scene_exit_local < 0) {
         SceneMsg m = {htonl(s_scene_seq), htonl((uint32_t)net.frame)};
         /* Only latch the frame if the announcement actually went out. The
@@ -1790,7 +2023,7 @@ bool pc_net_scene_hold(void) {
      * eventually. The peer keeps sending inputs, so neither the stall timeout
      * nor the watchdog notices a peer that has simply stopped answering this
      * exchange, and the player is left in a scene they cannot leave. */
-    if (s_scene_exit_local < 0 || *remote < 0) {
+    if (s_scene_exit_local < 0 || missing >= 0) {
         static int32_t said;
         if (s_scene_wait_since < 0) {
             s_scene_wait_since = net.frame;
@@ -1798,7 +2031,7 @@ bool pc_net_scene_hold(void) {
         if (net.frame - s_scene_wait_since >= SCENE_HOLD_MAX) {
             pc_log_line("net: scene %u hand-off never completed in %d frames (ours %d, peer "
                         "%d); leaving netplay",
-                s_scene_seq, SCENE_HOLD_MAX, s_scene_exit_local, *remote);
+                s_scene_seq, SCENE_HOLD_MAX, s_scene_exit_local, shown);
             s_status = PC_NET_PEER_TIMEOUT;
             pc_net_disconnect();
             return false; /* the session is over: the scene ends here */
@@ -1806,13 +2039,13 @@ bool pc_net_scene_hold(void) {
         if (net.frame - said >= 60) {
             said = net.frame;
             pc_log_line("net: scene %u hand-off waiting at frame %d (ours %d, peer %d)",
-                s_scene_seq, net.frame, s_scene_exit_local, *remote);
+                s_scene_seq, net.frame, s_scene_exit_local, shown);
         }
         return true; /* the peer is still in the scene: wait for its frame */
     }
     s_scene_wait_since = -1;
     if (s_scene_exit_at < 0) {
-        int32_t later = *remote > s_scene_exit_local ? *remote : s_scene_exit_local;
+        int32_t later = latest > s_scene_exit_local ? latest : s_scene_exit_local;
         s_scene_exit_at = later + SCENE_HANDOFF;
         /* Nothing may still be predicted when the scene goes: the next
          * scene's first tick raises the barrier past every outstanding
@@ -1824,12 +2057,14 @@ bool pc_net_scene_hold(void) {
          * entry side does. */
         barrier_raise(s_scene_exit_at);
         pc_log_line("net: scene %u ends at frame %d (asked %d, peer %d)", s_scene_seq,
-            s_scene_exit_at, s_scene_exit_local, *remote);
+            s_scene_exit_at, s_scene_exit_local, latest);
     }
     if (net.frame < s_scene_exit_at) {
         return true;
     }
-    *remote = -1;
+    for (int p = 0; p < 4; p++) {
+        s_scene_exit_remote[p][slot] = -1;
+    }
     s_scene_exit_local = s_scene_exit_at = -1;
     s_scene_seq++;
     return false;
@@ -1861,7 +2096,7 @@ static void session_reset(void) {
     s_lockstep = snapshot_state_region_missing() != NULL;
     s_seen_remote = false;
     memset(s_local_ring, 0, sizeof s_local_ring);
-    memset(s_remote_ring, 0, sizeof s_remote_ring);
+    slots_reset();
     memset(s_ck_ring, 0, sizeof s_ck_ring);
     memset(s_sim_n, 0, sizeof s_sim_n);
     memset(s_rb_recent, 0, sizeof s_rb_recent);
@@ -1871,7 +2106,7 @@ static void session_reset(void) {
     net.frame = 0;
     net.tick_frame = -1;
     net.resim = false;
-    s_remote_have = s_remote_newest = s_last_acked = s_rb_frame = s_ck_checked = -1;
+    s_remote_newest = s_last_acked = s_rb_frame = s_ck_checked = -1;
     for (int i = 0; i < RING; i++) {
         s_rck[i].frame = -1;
     }
@@ -1932,12 +2167,14 @@ static void session_reset(void) {
     s_send_frame = -1;
     net.rb_barrier = -1;
     s_scene_last = -1;
+    s_scene_first = 0;
     s_rb_lost_logged = false;
     s_last_valid = false;
     rel_reset();
     net.hs = HS_IDLE;
     net.hs_host = false;
     net.direct = false; /* pc_net_init() sets it back for a MELEE_NET session */
+    net.mesh = false;   /* pc_net_mesh_connect() sets it after the reset */
     net.seed = 0;
     net.start_frame = -1;
     net.ck_from = 0;
@@ -1962,7 +2199,15 @@ void pc_net_disconnect(void) {
         s_rx_thread = NULL;
     }
     s_rxq_head = s_rxq_n = 0;
-    if (!s_peer_left) {
+    if (!s_peer_left && net.mesh) {
+        /* Every phone at once, from this thread: no burst spacing to wait
+         * out, since a phone that misses all of it settles this one away
+         * after a second and a half of silence anyway. */
+        mesh_bye(s_status == PC_NET_PEER_OK ? PC_NET_PEER_LEFT : (uint8_t)s_status);
+        if (s_status == PC_NET_PEER_OK) {
+            s_status = PC_NET_PEER_LEFT;
+        }
+    } else if (!s_peer_left) {
         /* Tell the peer why so it need not wait out the silence; sent
          * as a 5-packet burst so NAT/firewall drops are tolerated. */
         uint8_t why = s_status == PC_NET_PEER_OK ? PC_NET_PEER_LEFT : (uint8_t)s_status;
@@ -1983,6 +2228,7 @@ void pc_net_disconnect(void) {
     sock_close(net.sock);
     net.sock = SOCK_INVALID;
     net.hs = HS_IDLE;
+    net.mesh = false;
     /* After the BYE burst above, which still needed the key to be accepted:
      * the nonces it was derived from are dead with the session, so the key
      * does not outlive it in this process's memory either. */
@@ -2189,6 +2435,8 @@ static bool connect_impl(
     HSD_PadLibData.qtype = 2;
     net.local = player ? 1 : 0;
     net.remote = 1 - net.local;
+    s_local_port = s_port[net.local];
+    s_rem_port[0] = s_port[net.remote];
     /* A hand-typed address may be a peer the user has not started yet, so it
      * keeps the long wait. One handed over from matchmaking (pc_net_connect_
      * socket, the only caller that passes a socket) belongs to a peer that
@@ -2307,6 +2555,77 @@ bool pc_net_connect_socket(
     return connect_impl((sock_t)socket, ip, port, player, seed);
 }
 
+/* A mesh of two to four instances over the page's link (net_mesh.c). The
+ * same rollback session as connect_impl's from session_reset on, with the
+ * page's link instead of a socket and the mesh's transport instead of the
+ * two-peer one: no receive thread and no transmit timer, since the page and
+ * the game share one thread, and no RULES/READY handshake, since the caller
+ * has agreed the match (src/pc/eggy: every phone's config, hashed and
+ * compared) and names the seed and the first frame itself. */
+bool pc_net_mesh_connect(
+    uint8_t humans, int local_port, uint32_t session, uint32_t seed, int32_t start_frame) {
+#ifndef __EMSCRIPTEN__
+    (void)humans, (void)local_port, (void)session, (void)seed, (void)start_frame;
+    pc_log_line("net: a mesh runs over the page's link only");
+    return false;
+#else
+    int remote[4], n = 0, lowest = -1;
+    for (int p = 0; p < 4; p++) {
+        if (humans & (1u << p)) {
+            lowest = lowest < 0 ? p : lowest;
+            if (p != local_port) {
+                remote[n++] = p;
+            }
+        }
+    }
+    if (local_port < 0 || local_port > 3 || (humans & (1u << local_port)) == 0 || n < 1 ||
+        n > REMOTES || humans > 0x0F || start_frame < 0)
+    {
+        pc_log_line("net: mesh of ports %x from port %d refused", humans, local_port);
+        return false;
+    }
+    if (net.tx_lock == NULL) {
+        net.tx_lock = SDL_CreateMutex();
+        s_rx_lock = SDL_CreateMutex();
+        sock_startup();
+    }
+    pc_net_disconnect();
+    session_reset();
+    HSD_PadLibData.qtype = 2; /* connect_impl says why */
+    net.local = local_port == lowest ? 0 : 1;
+    net.remote = 1 - net.local;
+    net_slots_setup(local_port, remote, n);
+    net.connect_timeout_ms = MATCH_CONNECT_TIMEOUT_MS;
+    net.delay_auto = s_configured_delay < 0;
+    net.delay = net.delay_auto ? 2 : s_configured_delay;
+    net.delay_next = net.delay;
+    s_wrote = net.delay - 1; /* frames 0..delay-1 stay neutral on every phone */
+    s_rc_window_ms = 0;      /* nothing is resumed: a silent phone is settled away */
+    s_stall_ms = s_stall_want > 0 ? s_stall_want : STALL_TIMEOUT_MS;
+    net.session = session;
+    net.seed = seed;
+    if (seed != 0) {
+        *HSD_RandSeedPtr = seed;
+    }
+    /* What the handshake's hs_done() leaves behind (net_handshake.c). */
+    net.hs = HS_DONE;
+    net.hs_host = net.local == 0;
+    net.start_frame = start_frame;
+    net.ck_from = start_frame;
+    net.mesh = true;
+    mesh_open(humans, local_port);
+    SDL_LockMutex(net.tx_lock);
+    net.sock = NET_WEB_SOCK;
+    net.active = true;
+    SDL_UnlockMutex(net.tx_lock);
+    pc_log_line("net: mesh of ports %x, this phone port %d, delay %s%d, window %d, seed %u, "
+                "session %08x, mesh proto %d",
+        humans, local_port + 1, net.delay_auto ? "auto " : "", net.delay, WINDOW, seed, net.session,
+        MESH_VERSION);
+    return true;
+#endif
+}
+
 void pc_net_init(void) {
     s_game_thread = SDL_GetCurrentThreadID(); /* pc_platform_init runs on it */
     const char* peer = getenv("MELEE_NET");
@@ -2400,7 +2719,7 @@ void pc_net_poll_parked(void) {
         return;
     }
     SDL_LockMutex(net.tx_lock);
-    if (s_timer == 0) {
+    if (s_timer == 0 && !net.mesh) { /* a mesh sends from this thread only */
         s_timer = SDL_AddTimer(4, tx_timer, NULL);
     }
     SDL_UnlockMutex(net.tx_lock);
@@ -2419,6 +2738,9 @@ void pc_net_leave(void) {
 }
 
 int pc_net_quiet_ms(void) {
+    if (net.active && net.mesh) {
+        return mesh_quiet_ms();
+    }
     uint64_t heard = net.active ? rx_heard_ns() : 0;
     if (heard == 0) {
         return -1;
@@ -2644,10 +2966,16 @@ static bool wait_input(int32_t need, const char* reason) {
  * arrives and differs, that frame's snapshot is restored and every frame
  * since is ticked again from the input rings with the resim flag on. */
 
+/* "Repeat last" for every slot that has no real input for f yet. */
 static void predict(int32_t f) {
     static const WirePad neutral;
-    s_remote_ring[f & (RING - 1)] =
-        s_remote_have >= 0 ? s_remote_ring[s_remote_have & (RING - 1)] : neutral;
+    for (int k = 0; k < s_nrem; k++) {
+        if (slot_have_eff(k) >= f) {
+            continue;
+        }
+        const int32_t have = s_rem_have[k];
+        s_rem_ring[k][f & (RING - 1)] = have >= 0 ? s_rem_ring[k][have & (RING - 1)] : neutral;
+    }
 }
 
 /* Snapshot before a predicted frame. Behind the barrier nothing is taken
@@ -2769,8 +3097,8 @@ static void head_check(void) {
         return;
     }
     const PadLibData* p = &HSD_PadLibData;
-    for (int i = 0; i < 2; i++) {
-        int port = s_port[i == 0 ? net.local : net.remote];
+    for (int i = 0; i <= s_nrem; i++) {
+        int port = i == 0 ? s_local_port : s_rem_port[i - 1];
         /* HSD_PadADConvert ORs synthetic direction bits above 0xffff into
          * button (controller.c), so only the real pad bits can be compared. */
         uint32_t saw = HSD_PadMasterStatus[port].button & 0xffffu;
@@ -2833,29 +3161,34 @@ static void fight_reseed(int32_t f) {
 /* Ports 0-3 of the queue head become the synced inputs for frame f. */
 static void write_head(PADStatus* head, int32_t f) {
     static const WirePad neutral;
-    /* The two players' ports (pc_net_set_ports; 0 and 1 unless an embedder
-     * seats them elsewhere); every other port reports no controller. */
-    const int lp = s_port[net.local], rp = s_port[net.remote];
+    /* The players' ports (pc_net_set_ports, or a mesh's seats; 0 and 1 for a
+     * plain session); every other port reports no controller. */
     for (int i = 0; i < 4; i++) {
-        if (i != lp && i != rp) {
+        bool player = i == s_local_port;
+        for (int k = 0; k < s_nrem; k++) {
+            player = player || i == s_rem_port[k];
+        }
+        if (!player) {
             memset(&head[i], 0, sizeof head[i]);
             head[i].err = PAD_ERR_NO_CONTROLLER;
         }
     }
     const WirePad* mine = f >= net.delay ? &s_local_ring[f & (RING - 1)] : &neutral;
-    from_wire(&head[lp], mine);
-    const WirePad* theirs = &s_remote_ring[f & (RING - 1)];
-    WirePad wrong;
-    if (s_audit_poison) {
-        wrong = *theirs;
-        wrong.stickX = (int8_t)-wrong.stickX;
-        wrong.button ^= 0x0100; /* A */
-        theirs = &wrong;
-    }
-    from_wire(&head[rp], theirs);
-    if (!s_seen_remote && theirs->button != 0) {
-        s_seen_remote = true;
-        pc_log_line("net: first remote button press (%04x) at frame %d", theirs->button, f);
+    from_wire(&head[s_local_port], mine);
+    for (int k = 0; k < s_nrem; k++) {
+        const WirePad* theirs = slot_pad(k, f);
+        WirePad wrong;
+        if (s_audit_poison && k == 0) {
+            wrong = *theirs;
+            wrong.stickX = (int8_t)-wrong.stickX;
+            wrong.button ^= 0x0100; /* A */
+            theirs = &wrong;
+        }
+        from_wire(&head[s_rem_port[k]], theirs);
+        if (!s_seen_remote && theirs->button != 0) {
+            s_seen_remote = true;
+            pc_log_line("net: first remote button press (%04x) at frame %d", theirs->button, f);
+        }
     }
     head_note(head, f);
 }
@@ -3215,6 +3548,7 @@ static void fresh_tick(PADStatus* head, bool raw) {
              * is the measurement any fix for it has to move. */
             pc_log_line("net: scene %d -> %d at frame %d", s_scene_last, scene, net.frame);
             s_scene_last = scene;
+            s_scene_first = net.frame;
             int lead = in_fight() ? FIGHT_ENTRY_LEAD : IO_QUIET;
             barrier_raise(net.frame + lead);
         }
@@ -3437,7 +3771,7 @@ void pc_net_sync(void) {
     if (net.active && s_exit_after > 0 && net.frame >= s_exit_after) {
         exit_if_test_done();
     }
-    if (net.active) {
+    if (net.active && !net.mesh) { /* a mesh sends from this thread only */
         SDL_LockMutex(net.tx_lock);
         if (s_timer == 0) {
             s_timer = SDL_AddTimer(4, tx_timer, NULL);
