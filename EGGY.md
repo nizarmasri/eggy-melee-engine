@@ -485,6 +485,19 @@ scene (before that scene's first frames of its input), 120 s.
 - The acting leader settles it: the lowest human port not settled and not
   silent to that phone. If the leader itself goes silent, the next lowest phone
   still in takes over by the same rule.
+- Only with a quorum: a phone acts on its own view of who is silent only while
+  it hears a strict majority of the phones still in, itself included (2L > U).
+  A phone that has stopped receiving (a stall, a busy link) sees every other
+  phone go silent at once, and settles nobody. It does not lead either: it
+  sends no delay change, and does not lead the hold.
+  - U counts the phones not settled and not gone by their own word: a BYE, or a
+    link the page reported failed. L counts the ones of U it has heard from in
+    the last half of the limit (0.75 s in play), so that phones cut off
+    together are not settled one by one as each crosses the limit.
+  - Between two phones there is no majority, so each settles the other as
+    before. Three phones settle a third that is really gone. Four phones split
+    2-2 settle nobody, and wait (up to 120 s) for the links to come back or be
+    reported failed.
 - F, the last frame of its input the match uses, is the newest frame of it any
   live phone holds. Phones share what they hold of a quiet port (relays, and
   every packet's report of what it holds), and the leader waits until it holds
@@ -664,12 +677,15 @@ Tests:
   releases on GO, a phone settled away is not waited for, a leader settled
   away before its GO is replaced), roles, and the HELLO payload.
 - `tests/eggy/eggy_mesh_test.c`: the mesh's wire codec and the ring's port
-  byte (the 512 bytes include it), the M2 probe, the leader and settlement
-  rules, and a simulated mesh of three and four phones: one going silent, the
-  leader going (the next one settles it), two at once, a port only reachable
-  through relays (no false settle; F is the frame the others hold), a frozen
-  phone coming back (it is evicted, and what it decided is ignored), a BYE,
-  and a phone loading its scene (load_ms, not away_ms).
+  byte (the 512 bytes include it), the M2 probe, the leader, quorum and
+  settlement rules, and a simulated mesh of two to four phones: one going
+  silent, the leader going (the next one settles it), two of four at once
+  (nobody settles them until their links are reported failed), a port only
+  reachable through relays (no false settle; F is the frame the others hold), a
+  frozen phone coming back (it is evicted, and what it decided is ignored), a
+  BYE, a phone loading its scene (load_ms, not away_ms), a phone that hears
+  nobody (it settles nobody, and the match goes on once it hears again), a
+  2-2 split (nobody settled), and two phones (either settles the other).
 - `platforms/browser/tests/audio-worklet.test.mjs`:
   - the two worklet copies are one program;
   - the processor plays and resamples a ring;

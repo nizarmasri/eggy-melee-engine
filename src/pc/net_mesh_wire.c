@@ -252,6 +252,28 @@ int mesh_leader(uint8_t humans, uint8_t settled, uint8_t silent, int self) {
     return -1;
 }
 
+static int bits(uint8_t m) {
+    int n = 0;
+    for (; m != 0; m &= (uint8_t)(m - 1)) {
+        n++;
+    }
+    return n;
+}
+
+bool mesh_quorum(uint8_t humans, uint8_t settled, uint8_t unheard, uint8_t gone, int self) {
+    const uint8_t me = self >= 0 && self < MESH_PORTS ? (uint8_t)(1u << self) : 0;
+    const uint8_t in = (uint8_t)((humans & ~settled & ~gone) | me);
+    const uint8_t heard = (uint8_t)(in & (~unheard | me));
+    const int u = bits(in);
+    return u <= 2 || 2 * bits(heard) > u;
+}
+
+int mesh_acting_leader(
+    uint8_t humans, uint8_t settled, uint8_t silent, uint8_t unheard, uint8_t gone, int self) {
+    const bool trusted = mesh_quorum(humans, settled, unheard | silent, gone, self);
+    return mesh_leader(humans, settled, trusted ? silent : 0, self);
+}
+
 bool mesh_settle_ready(int32_t mine, const int32_t* reports, uint8_t live_mask, int32_t* frame) {
     int32_t most = mine;
     for (int q = 0; q < MESH_PORTS; q++) {
@@ -299,10 +321,33 @@ uint8_t mesh_silent_mask(const MeshAwayView* v) {
     return silent;
 }
 
+uint8_t mesh_unheard_mask(const MeshAwayView* v) {
+    uint8_t unheard = mesh_silent_mask(v);
+    for (int p = 0; p < MESH_PORTS; p++) {
+        const uint8_t bit = (uint8_t)(1u << p);
+        if (p == v->self || (v->humans & bit) == 0 || (v->settled & bit) != 0) {
+            continue;
+        }
+        const int32_t limit = v->loading[p] ? v->load_ms : v->away_ms;
+        if (v->quiet_ms[p] >= limit / 2) {
+            unheard |= bit;
+        }
+    }
+    return unheard;
+}
+
 int mesh_away_decide(const MeshAwayView* v, int32_t* frame) {
     const uint8_t silent = mesh_silent_mask(v);
-    if (silent == 0 || mesh_leader(v->humans, v->settled, silent, v->self) != v->self) {
-        return -1;
+    uint8_t gone = 0;
+    for (int p = 0; p < MESH_PORTS; p++) {
+        if (v->bye[p]) {
+            gone |= (uint8_t)(1u << p);
+        }
+    }
+    if (silent == 0 || !mesh_quorum(v->humans, v->settled, mesh_unheard_mask(v), gone, v->self) ||
+        mesh_leader(v->humans, v->settled, silent, v->self) != v->self)
+    {
+        return -1; /* nobody silent, a minority's view, or another phone leads */
     }
     const uint8_t live = (uint8_t)(v->humans & ~v->settled & ~silent & ~(1u << v->self));
     for (int p = 0; p < MESH_PORTS; p++) {

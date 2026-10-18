@@ -132,6 +132,21 @@ int mesh_away_accept(uint8_t settled, int self, int from, int port);
  * other phone gone it leads itself. -1 only for an empty set. */
 int mesh_leader(uint8_t humans, uint8_t settled, uint8_t silent, int self);
 
+/* Whether this phone may act on its own view of who is silent: it hears a
+ * strict majority of the phones still in, itself included. A phone that
+ * stops receiving (a stall, a busy link) sees every other phone go silent at
+ * once, and must not settle the ones that still hear each other. U is the
+ * phones not settled and not gone (a BYE, or a link the page reported failed:
+ * their own word, which no partition fakes), this one included; L is this one
+ * and those of U it hears (not in `unheard`, mesh_unheard_mask). A quorum is
+ * 2L > U, or U <= 2: between two phones neither side can be told from the
+ * other, and each settles the other as before. A 2-2 split settles nobody. */
+bool mesh_quorum(uint8_t humans, uint8_t settled, uint8_t unheard, uint8_t gone, int self);
+/* mesh_leader as it may act: without a quorum this phone's silence view does
+ * not count, and the lead is the lowest port still in, as if all were heard. */
+int mesh_acting_leader(
+    uint8_t humans, uint8_t settled, uint8_t silent, uint8_t unheard, uint8_t gone, int self);
+
 /* The leader's settlement of a silent port: F is the newest frame of its
  * input any live phone holds. reports[q] is what phone q last said it holds
  * of that port (live_mask names the phones whose reports count: live, not
@@ -173,9 +188,14 @@ typedef struct MeshAwayView {
  * that applies (load_ms while loading, away_ms otherwise). Never itself, never
  * one already settled. */
 uint8_t mesh_silent_mask(const MeshAwayView* v);
+/* The ports a quorum does not count as heard: the silent ones, and any quiet
+ * for half the limit that applies. Phones cut off together cross the limit a
+ * few milliseconds apart; counting the first as gone while the rest still
+ * count as heard would let a minority settle them one by one. */
+uint8_t mesh_unheard_mask(const MeshAwayView* v);
 
-/* The port this phone settles now, -1 for none, and *frame its F. Only the
- * acting leader (mesh_leader over the silent mask) settles, only a silent
+/* The port this phone settles now, -1 for none, and *frame its F. Only with
+ * a quorum (mesh_quorum), only the acting leader settles, only a silent
  * port, only once the newest frame of it has stopped moving for
  * stable_need_ms and this phone holds it (mesh_settle_ready). One per call:
  * the caller applies it and asks again. */

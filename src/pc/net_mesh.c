@@ -129,7 +129,8 @@ static struct {
     MeshPeer peer[MESH_PORTS]; /* by port: the other humans' */
     uint8_t settled;
     int32_t settle[MESH_PORTS];
-    uint8_t silent; /* as the last service saw it */
+    uint8_t silent;  /* as the last service saw it */
+    uint8_t unheard; /* the same, for the quorum (mesh_unheard_mask) */
     bool evicted;
     int32_t evicted_frame;
     int away_ms, load_ms;
@@ -231,8 +232,21 @@ static void away_view(MeshAwayView* v, uint64_t now) {
     }
 }
 
+/* Phones gone by their own word: a BYE, or a link the page reported failed. */
+static uint8_t gone_mask(void) {
+    uint8_t gone = 0;
+    for (int p = 0; p < MESH_PORTS; p++) {
+        if (is_peer(p) && m.peer[p].bye) {
+            gone |= (uint8_t)(1u << p);
+        }
+    }
+    return gone;
+}
+
+/* A phone that hears no majority does not lead on its own view: it would
+ * announce delays and settle phones the rest still hear (mesh_quorum). */
 static int leader_now(void) {
-    return mesh_leader(m.humans, m.settled, m.silent, m.self);
+    return mesh_acting_leader(m.humans, m.settled, m.silent, m.unheard, gone_mask(), m.self);
 }
 
 /* ---- reliable lane ------------------------------------------------------- */
@@ -400,6 +414,7 @@ static void service(uint64_t now) {
     MeshAwayView v;
     away_view(&v, now);
     m.silent = mesh_silent_mask(&v);
+    m.unheard = mesh_unheard_mask(&v);
     if (!m.armed || m.evicted || now < m.grace_until_ns) {
         return;
     }
@@ -412,6 +427,7 @@ static void service(uint64_t now) {
         settle_apply(p, frame, m.self);
         away_view(&v, now);
         m.silent = mesh_silent_mask(&v);
+        m.unheard = mesh_unheard_mask(&v);
     }
 }
 

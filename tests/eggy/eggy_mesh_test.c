@@ -215,6 +215,48 @@ static void test_leader(void) {
     CHECK(mesh_leader(0, 0, 0, -1) == -1);
 }
 
+/* Settling needs a strict majority of the phones still in (gone by a BYE not
+ * counted), except between two. */
+static void test_quorum(void) {
+    /* Three phones; this one, port 2, hears nobody (a stall, a deaf link):
+     * the two that hear each other must not be settled by it. */
+    CHECK(!mesh_quorum(0x07, 0, 0x03, 0, 2));
+    CHECK(mesh_acting_leader(0x07, 0, 0x03, 0x03, 0, 2) == 0); /* it does not lead */
+    /* It hears one of the two: two of three, it may settle the third. */
+    CHECK(mesh_quorum(0x07, 0, 0x02, 0, 2));
+    CHECK(mesh_quorum(0x07, 0, 0x04, 0, 0));
+    CHECK(mesh_acting_leader(0x07, 0, 0x01, 0x01, 0, 2) == 1);
+    /* Four phones split 2-2: neither half settles the other. */
+    CHECK(!mesh_quorum(0x0F, 0, 0x0C, 0, 0));
+    CHECK(!mesh_quorum(0x0F, 0, 0x03, 0, 3));
+    CHECK(mesh_acting_leader(0x0F, 0, 0x03, 0x03, 0, 3) == 0);
+    /* Four phones, one gone: three of four settle it. */
+    CHECK(mesh_quorum(0x0F, 0, 0x08, 0, 0));
+    CHECK(mesh_quorum(0x0F, 0, 0x01, 0, 1));
+    CHECK(mesh_acting_leader(0x0F, 0, 0x01, 0x01, 0, 2) == 1);
+    /* Two cut off together: the first to cross the limit is silent while
+     * the second is only quiet. The quorum counts it as unheard already, so
+     * neither is settled, and the lead does not move. */
+    CHECK(!mesh_quorum(0x0F, 0, 0x0C, 0, 0));
+    CHECK(mesh_acting_leader(0x0F, 0, 0x01, 0x05, 0, 1) == 0);
+    /* ...and once it is settled, the three that are left are three. */
+    CHECK(mesh_quorum(0x0F, 0x08, 0x04, 0, 0));
+    CHECK(!mesh_quorum(0x0F, 0x08, 0x06, 0, 0));
+    /* Two phones: no majority is possible, so each settles the other. */
+    CHECK(mesh_quorum(0x03, 0, 0x02, 0, 0));
+    CHECK(mesh_quorum(0x03, 0, 0x01, 0, 1));
+    CHECK(mesh_acting_leader(0x03, 0, 0x01, 0x01, 0, 1) == 1);
+    /* Three phones, as many as two once a third has left: a pair again. */
+    CHECK(mesh_quorum(0x07, 0x04, 0x02, 0, 0));
+    /* Phones that said BYE are out of the count: two of four leaving at once
+     * leaves a pair, which settles them, and one of three leaving lets a
+     * phone that hears nobody else settle the last. */
+    CHECK(mesh_quorum(0x0F, 0, 0x05, 0x05, 1));
+    CHECK(mesh_quorum(0x07, 0, 0x03, 0x01, 2));
+    CHECK(!mesh_quorum(0x0F, 0, 0x07, 0x01, 3)); /* one BYE, two silent: 1 of 3 */
+    CHECK(mesh_quorum(0x0F, 0x08, 0x07, 0x07, 3)); /* all the others gone */
+}
+
 static void test_settle_rules(void) {
     int32_t rep[MESH_PORTS] = {-1, 102, 99, -1};
     int32_t f = -9;
@@ -265,9 +307,12 @@ static void test_settle_rules(void) {
     CHECK(mesh_away_decide(&v, &f) == 2 && f == 52);
     v.self = 1; /* port 0 leads: port 1 does nothing */
     CHECK(mesh_away_decide(&v, &f) == -1);
-    v.quiet_ms[0] = 1500; /* until port 0 is silent too: then both are port 1's */
-    v.stable_ms[0] = 1500;
+    v.quiet_ms[0] = 1500; /* port 0 silent too: port 1 hears nobody, one of */
+    v.stable_ms[0] = 1500; /* three, and settles neither of the two */
+    CHECK(mesh_silent_mask(&v) == 0x05 && mesh_away_decide(&v, &f) == -1);
+    v.bye[0] = true; /* unless port 0 said BYE: then it is the last two */
     CHECK(mesh_away_decide(&v, &f) == 0 || mesh_away_decide(&v, &f) == 2);
+    v.bye[0] = false;
     v.self = 0;
     v.quiet_ms[0] = 0;
     v.bye[1] = true; /* a BYE is silent now, once the frame stops moving */
@@ -653,18 +698,90 @@ static void test_sim_leader_goes(void) {
             CHECK(sim.ph[q].settled_by[0] == 1);
         }
     }
-    /* The leader and another at once: the next one settles both. */
+    /* The leader and another of four at once: from the two left that is a
+     * 2-2 split, which settles nobody... */
     sim_init(4, 100);
     sim_run(2000);
     sim.ph[0].alive = false;
     sim.ph[2].alive = false;
     const int32_t l0 = sim.ph[0].wrote, l2 = sim.ph[2].wrote;
     sim_run(7000);
+    CHECK(sim_settled_any(1) == 0 && sim_settled_any(3) == 0);
+    /* ...until their links are reported failed (their BYE): then the pair
+     * left settles both, the next one leading. */
+    sim.ph[0].bye = true;
+    sim.ph[2].bye = true;
+    sim_run(9000);
     int32_t f0 = -2, f2 = -2;
     CHECK(sim_agree(0, &f0, 1) && f0 == l0);
     CHECK(sim_agree(2, &f2, 1) && f2 == l2);
     CHECK(sim.ph[1].settled == 0x05 && sim.ph[3].settled == 0x05);
     CHECK(sim.ph[3].settled_by[0] == 1 && sim.ph[3].settled_by[2] == 1);
+}
+
+/* The phone that hears nobody (Eggy's e2e: port 3's page stopped receiving
+ * for more than away_ms, its game thread still servicing, so no freeze
+ * grace): its own datagrams still land, the other two hear everyone, and it
+ * settles nobody. Once it hears again the match goes on, all three in. */
+static void test_sim_deaf_phone(void) {
+    sim_init(3, 100);
+    sim_run(2000);
+    sim.up[0][2] = false;
+    sim.up[1][2] = false;
+    sim_run(9000);
+    for (int q = 0; q < 3; q++) {
+        CHECK(sim_settled_any(q) == 0);
+        CHECK(sim.ph[q].alive && !sim.ph[q].evicted);
+    }
+    sim.up[0][2] = true;
+    sim.up[1][2] = true;
+    sim_run(12000);
+    for (int q = 0; q < 3; q++) {
+        CHECK(sim_settled_any(q) == 0);
+        CHECK(sim.ph[q].alive && !sim.ph[q].evicted);
+    }
+    /* Deaf for good, and then really gone: the two that hear each other
+     * settle it. */
+    sim.ph[2].alive = false;
+    const int32_t last = sim.ph[2].wrote;
+    sim_run(16000);
+    int32_t f = -2;
+    CHECK(sim_agree(2, &f, 0) && f == last);
+}
+
+/* Four phones cut into two pairs: neither pair settles the other, and the
+ * match is whole again when the links come back. */
+static void test_sim_split(void) {
+    sim_init(4, 100);
+    sim_run(2000);
+    for (int a = 0; a < 2; a++) {
+        for (int b = 2; b < 4; b++) {
+            sim.up[a][b] = false;
+            sim.up[b][a] = false;
+        }
+    }
+    sim_run(9000);
+    for (int a = 0; a < 2; a++) {
+        for (int b = 2; b < 4; b++) {
+            sim.up[a][b] = true;
+            sim.up[b][a] = true;
+        }
+    }
+    sim_run(12000);
+    for (int q = 0; q < 4; q++) {
+        CHECK(sim_settled_any(q) == 0);
+        CHECK(sim.ph[q].alive && !sim.ph[q].evicted);
+    }
+}
+
+/* Two phones: either side settles the other after away_ms, as before. */
+static void test_sim_pair(void) {
+    sim_init(2, 100);
+    sim_run(2000);
+    sim.ph[1].alive = false;
+    const int32_t last = sim.ph[1].wrote;
+    sim_run(5000);
+    CHECK(sim.ph[0].settled == 0x02 && sim.ph[0].settle[1] == last);
 }
 
 /* A phone frozen past away_ms comes back to find itself settled: it leaves,
@@ -710,6 +827,7 @@ int main(void) {
     test_rel_codec();
     test_addressing();
     test_leader();
+    test_quorum();
     test_settle_rules();
     test_sim_one_goes();
     test_sim_relay_first();
@@ -717,6 +835,9 @@ int main(void) {
     test_sim_evicted();
     test_sim_bye();
     test_sim_loading();
+    test_sim_deaf_phone();
+    test_sim_split();
+    test_sim_pair();
     if (failures != 0) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;
