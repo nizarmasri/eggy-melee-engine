@@ -112,6 +112,13 @@ keeping a view across frames.
 | `int eggy_costumes(int ckind)` | how many costumes | every costume the game has |
 | `int eggy_team_costume(int ckind, int team)` | the costume a team wears | what character select dresses a team in |
 | `const int32_t* eggy_net_stats(void)` | the netplay stats words | see Netplay |
+| `int eggy_snapshot_begin(void)` | 0 asked, -1 not | the acting leader asks for a resync as a desync would; see Resync |
+| `int eggy_snapshot_size(void)` | bytes | the leader's last snapshot, 0 none |
+| `const uint8_t* eggy_snapshot_buffer(void)` | its bytes | index `Module.HEAPU8`; NULL none |
+| `int32_t eggy_snapshot_frame(void)` | its session frame | -1 none |
+| `uint8_t* eggy_snapshot_reserve(int len)` | room for `len` bytes | a receiver writes the leader's snapshot there; NULL if it cannot |
+| `int eggy_snapshot_apply(const uint8_t* ptr, int len, int32_t frame)` | 0 taken, or a resync error | a receiver hands the snapshot over; `resync` follows once applied |
+| `int eggy_test_desync(void)` | 1 armed | `MELEE_EGGY_TEST=1` only: this phone's fighter takes 10% the others never see, so it desyncs |
 
 They are `Module._eggy_*` (EXPORTED_FUNCTIONS in `platforms/browser/CMakeLists.txt`).
 The pointers index `Module.HEAP32` as `ptr >> 2`.
@@ -127,7 +134,9 @@ The pointers index `Module.HEAP32` as `ptr >> 2`.
 | `ended` | outcome | serial | `eggy_results()` is filled |
 | `error` | error code | serial | the config was refused; still parked |
 | `net-error` | net error code | serial | netplay: no session, or it died before frame 0; `parked` follows |
-| `desync` | session frame | serial | netplay: this phone's checksum and another phone's disagreed there; play goes on |
+| `desync` | session frame | serial | netplay: this phone's checksum and another phone's disagreed there; play goes on, and the acting leader repairs it (Resync) |
+| `snapshot` | bytes | S, a session frame | netplay, the acting leader only: its state entering S is at `eggy_snapshot_buffer()`, for the page to send to every other phone; the game holds until they have it |
+| `resync` | S | serial | netplay: this phone plays on from the leader's state of frame S (a receiver once it applied it; the leader once its hold is over) |
 | `away` | port | F, a session frame | netplay: that port's phone was settled away; its fighter gets neutral input after frame F and the rest play on. This phone's own port: the others settled it; `ended` (outcome 4) follows |
 | `peer-lost` | match frame | serial | netplay: no other phone is left mid-match; `ended` (outcome 4) follows |
 
@@ -458,7 +467,8 @@ last match is dropped by the next.
 6. The match plays under rollback over every remote port. Input delay is auto
    from the worst phone's ping unless [53] fixes it; the leader decides it in
    the fight's first seconds (`net_sync.c`). Time sync slows each phone for the
-   one it runs furthest ahead of.
+   one it runs furthest ahead of. A desync is repaired from the acting leader's
+   state (Resync).
 7. At GAME! every phone has the same results, fires `ended`, shows the results
    screen for [15] s in lockstep, and leaves it on the same frame (the scene
    hand-off: the latest frame any phone asked for, plus 20). Each then says
@@ -518,8 +528,10 @@ scene (before that scene's first frames of its input), 120 s.
 - In the hold, a phone settled away is not waited for. One with no other phone
   left fails with net-error 5.
 
-A desync (each phone's checksums against every other's) is reported once per
-session as `desync(frame, serial)`, and play goes on.
+A desync (each phone's checksums against every other's) is reported as
+`desync(frame, serial)`, and play goes on while the acting leader repairs it
+(Resync, below). It is reported once until a resync, then again if the phones
+still disagree.
 
 ### Failures
 
@@ -544,7 +556,7 @@ version: it fails with 7 too (its page delivering it without the port byte).
 
 ### Stats
 
-`eggy_net_stats()`, 16 int32 words. They are refreshed every tick and every held
+`eggy_net_stats()`, 20 int32 words. They are refreshed every tick and every held
 frame, and kept after the session ends until the next netplay `eggy_load`.
 
 | Word | |
@@ -554,26 +566,147 @@ frame, and kept after the session ends until the next netplay `eggy_load`.
 | 2 | input delay, frames |
 | 3 | rollbacks so far |
 | 4 | deepest rollback, frames |
-| 5 | desyncs (0/1: the first is reported, then the session stops comparing) |
+| 5 | desyncs reported this match (each resync starts comparing again) |
 | 6 | frames stalled on the other phones' input |
 | 7 | link quality: 0 stable, 1 warning, 2 stalling |
 | 8 + port | that port's phone: 0 not a phone of the match, 1 this phone, 2 not heard from yet, 3 playing, 4 silent (about to be settled), 5 settled away, 6 another engine build |
 | 12 + port | ping to that port's phone, ms, -1 none |
+| 16 | resync: 0 none, 1 the leader waiting for a final frame, 2 the leader holding for the others, 3 a receiver told a snapshot is coming, or holding one to apply |
+| 17 | snapshots taken (the leader) or applied (a receiver) this match |
+| 18 | the last one's frame S, -1 none |
+| 19 | reserved, 0 |
 
 `eggy_checksum()` keeps working: it is the frame checksum of the newest
 simulated frame, the same on every phone once that frame is confirmed.
 
-### Desync resync: not done (M3b)
+### Resync
 
-A desync is reported, not repaired. Moving the leader's state to the others
-(`eggy_snapshot_size/write/read`, 60 KB pieces over a reliable bulk lane) is
-the next step.
+When the phones disagree, the acting leader's state wins. The leader moves its
+state to the other phones, and every phone plays on from it.
+
+**The game stalls while the snapshot is in transit. It does not roll forward.**
+The leader holds before frame S until every other phone has applied the
+snapshot. The leader has written its input up to S + delay when it holds.
+Each receiver goes on until it needs more of it, then waits. Every phone is
+therefore stopped within delay + 8 frames of S when the bytes land. Each one restores the snapshot and
+re-runs at most those few frames from inputs it already holds, which costs
+about the same as an ordinary rollback.
+
+Rolling forward would mean playing on during the transfer and then re-running
+everything since S. With a 5 to 8 MB snapshot on phone Wi-Fi, that is seconds
+of frames: far deeper than the 64-frame input rings, and a long hitch on
+arrival anyway. The stall is the transfer time, and nothing else.
+
+1. **The leader takes the snapshot.** The acting leader sees a desync, or the
+   page calls `_eggy_snapshot_begin()`. At the first fresh frame S where its
+   state is final, it snapshots exactly where rollback snapshots are taken.
+   Final means every input before S is real and nothing is waiting to be
+   rolled back.
+   - It tells the other engines over the mesh (their stats [16] become 3), and
+     fires `snapshot(size, S)`.
+   - It then holds inside the tick. It keeps the links alive and its watchdog
+     fed.
+2. **The leader's page sends it.**
+   - In the callback, copy `Module.HEAPU8.slice(ptr, ptr + size)`, with
+     `ptr = _eggy_snapshot_buffer()`.
+   - Send it in 60 KB pieces on the reliable bulk lane to every other phone
+     still in: stats [8 + port] 3 or 4.
+3. **The receivers play on, then wait.** They run to at most S + delay + 8,
+   then wait on the leader's next input. That wait is the stall.
+4. **Each receiver's page hands the snapshot over.** It reassembles the pieces,
+   then makes three calls in one go, inside the same JavaScript task:
+   - `ptr = _eggy_snapshot_reserve(size)`;
+   - `Module.HEAPU8.set(bytes, ptr)`. Read `Module.HEAPU8` after the reserve,
+     because the reserve can grow memory;
+   - `_eggy_snapshot_apply(ptr, size, S)`.
+
+   0 means taken. Anything else is an error from the table below.
+5. **The receiver applies it.** At S, it restores at once. Past S, it restores
+   after the tick it is in and re-runs the frames since. Short of S, it applies
+   on reaching S.
+   - It answers the leader as soon as it has restored, and fires `resync(S)`.
+   - The leader releases once every phone still in has answered, or after 30 s.
+     It then fires `resync(S)` too, and play goes on everywhere.
+6. **The phones compare again.** Checksums are compared again from
+   S + max(8, delay + 2); earlier ones may belong to the old timeline.
+   - A phone that still disagrees fires `desync` again, and the leader sends a
+     new snapshot.
+   - That happens at most three times a match: the first snapshot and two
+     resends.
+   - After the third, a desync is still reported but not repaired. The page
+     decides what to do: let the match play out, or end it.
+
+The receivers' engines learn of a snapshot from the leader's mesh message, not
+from the page. The bulk lane's format is the page's own, for example:
+- a first message `{frame, size, pieces}`;
+- the pieces, in order, on an ordered reliable channel.
+
+The page needs no checksum of its own. Compressing the snapshot with
+`CompressionStream('deflate-raw')` is optional; the heaps compress well.
+Decompress it before the reserve.
+
+**Integrity.** The snapshot carries:
+- magic, version, session id, S, the scene;
+- the RNG seed's address and value;
+- every region's address and length;
+- an FNV-1a 64 checksum of all of it.
+
+Apply refuses anything that does not fit this phone exactly:
+
+| error | |
+|---|---|
+| 1 | no netplay session is running |
+| 2 | not a snapshot, or a damaged one (its length or checksum) |
+| 3 | another session's |
+| 4 | `frame` is not the snapshot's |
+| 5 | another memory layout: another engine build, or this phone's heaps differ |
+| 6 | another scene |
+| 7 | this phone is more than 30 frames past S |
+| 8 | this phone took it (the leader) |
+
+For 2, 5, 6 and 7 the leader is told, and stops waiting for that phone. The
+phone stays on its own timeline: the next comparison reports `desync` again,
+and the leader resends.
+
+**What the page should allow for:**
+- **The leader's game is inside one tick for the whole transfer**, at most
+  30 s. The HUD stops, and so does every other phone shortly after. Treat it as
+  a resync, not a frozen engine, while stats [16] is not 0, or between
+  `snapshot` and `resync`.
+- **If the leader leaves mid-hold**, the others play on. The next leader
+  repairs the next desync.
+- **Nobody is settled away for standing still in a hold.** Frames stop moving
+  everywhere, and the transfer can starve the datagrams on the same links for
+  seconds. From the snapshot (on the leader) or its announcement (on the
+  others) until the leader moves on, a phone counts as silent only after 35 s
+  without a datagram; a BYE or a failed link still counts at once. After the
+  hold, every phone's silence is measured afresh, with 1.5 s of grace.
+
+**Testing it.** `_eggy_test_desync()` needs `MELEE_EGGY_TEST=1` in `ENV`. It
+returns 1 when armed. At the next fighting tick that no rollback can undo, this
+phone's own fighter takes 10% that no other phone sees. The checksums then
+disagree from the next frame, and the sequence is:
+1. `desync` on that phone and the leader;
+2. `snapshot` on the leader;
+3. `resync(S)` on every phone.
+
+Afterwards these hold:
+- the HUD's percents and `_eggy_checksum()` agree everywhere;
+- stats [17] is 1 on every phone;
+- no second `desync` arrives.
+
+If the test phone is the leader, every phone shows its +10%. If not, its +10%
+is gone.
+
+`_eggy_snapshot_begin()` on the leader runs the same repair with no desync at
+all: the state moved is the one every phone already has.
 
 ### Reused and changed
 
 Reused as is: rollback and snapshots, prediction, the rollback barrier, time
 sync and auto delay (`net_sync.c`), the scene hand-off, desync detection, the
-page's link (`net_web.c`), the stats.
+page's link (`net_web.c`), the stats. The resync (`net.c` "resync",
+`net_resync.c`) takes and restores the same snapshots rollback does.
 
 Changed in `src/pc/net.c`, behind `net.mesh`, which only `pc_net_mesh_connect`
 sets, so melee-web's two-peer sessions run exactly as before:
@@ -631,7 +764,8 @@ sets, so melee-web's two-peer sessions run exactly as before:
 If Asyncify is ever narrowed (`-sASYNCIFY_ONLY`), keep the paths that sleep
 through `VIWaitForRetrace`: the park, including its netplay connect and close,
 from `gm_801A4014` (the VS state's `on_enter`); the hold from `gm_801A4D34`;
-and net.c's `wait_remote`.
+and net.c's `wait_remote` and `resync_hold` (the leader's resync hold, inside
+`fresh_tick`).
 
 ## Not done
 
@@ -661,9 +795,11 @@ that keep their defaults unless `src/pc/eggy` sets them.
 | `platforms/browser/bundle/melee-audio.worklet.js` | new | the static worklet |
 | `tools/eggy/engine_release.py` | ships `melee-audio.worklet.js` | in `engine.json` with size and sha256 |
 | `.github/workflows/engine.yml` | only master publishes a release; other refs upload `engine-release-<sha>` | branch builds without releases |
-| `.github/workflows/ci.yml` | builds and runs `tests/eggy/eggy_config_test.c`, `tests/eggy/eggy_net_test.c` and `tests/eggy/eggy_mesh_test.c` | config validation, netplay rules |
+| `.github/workflows/ci.yml` | builds and runs `tests/eggy/eggy_config_test.c`, `tests/eggy/eggy_net_test.c`, `tests/eggy/eggy_mesh_test.c` and `tests/eggy/eggy_resync_test.c` | config validation, netplay rules |
 | `src/pc/net.c`, `src/pc/net.h` | the knobs under Netplay, "Reused and changed": remote slots, the mesh session (`pc_net_mesh_*`), the scene hand-off over every phone, the parked poll, counters, leave | two to four phones on any ports, one session per match |
 | `src/pc/net_mesh.c`, `src/pc/net_mesh_wire.c` | new | the mesh transport, its wire format and its away rules |
+| `src/pc/net_resync.c`, `src/pc/net_resync.h` | new | the resync's snapshot format, frame rules and resend budget |
+| `src/pc/net.c` "resync", `src/pc/net_snapshot.c` | the leader's snapshot and hold, a receiver's restore and re-run, `snapshot_regions_now` | Resync |
 | `src/pc/net_reliable.c`, `src/pc/net_sync.c` | a mesh's reliable messages go to every phone; its delay announcer is the acting leader | the same callers on a mesh |
 | `src/pc/net_web.c` | `Module.meleeNetLink.mesh` | the page tells an M3 engine from an M2 one |
 | `src/pc/net_handshake.c` | `pc_net_set_match_start` | a handshake run before any frame starts the match on frame 0 |
@@ -685,7 +821,18 @@ Tests:
   frozen phone coming back (it is evicted, and what it decided is ignored), a
   BYE, a phone loading its scene (load_ms, not away_ms), a phone that hears
   nobody (it settles nobody, and the match goes on once it hears again), a
-  2-2 split (nobody settled), and two phones (either settles the other).
+  2-2 split (nobody settled), two phones (either settles the other), and a
+  resync hold of two and three phones whose bytes take 10 s while the leader's
+  links carry nothing for 4 s at a time (nobody settled, the resync completes,
+  play goes on), with a phone dying or leaving mid-hold (settled once the
+  hold is over, or at once on its BYE).
+- `tests/eggy/eggy_resync_test.c`: the snapshot's round trip, every byte under
+  its checksum, bad magic, version, region count and lengths, the layout check
+  (heaps may differ in length, never in base; statics never), the frame the
+  leader takes it at, where a receiver applies it (a simulated mesh of two to
+  four phones at delays 1 to 16: every receiver lands within reach), and the
+  budget (a snapshot and two resends, answers for other frames ignored, the
+  hold ending on every answer, on a phone settled away, or at 30 s).
 - `platforms/browser/tests/audio-worklet.test.mjs`:
   - the two worklet copies are one program;
   - the processor plays and resamples a ring;

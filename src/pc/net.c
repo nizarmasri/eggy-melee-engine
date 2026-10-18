@@ -235,6 +235,11 @@ static bool s_timer_tried;      /* SDL_AddTimer attempted this session */
  * remain eligible for correction. */
 static int s_scene_last = -1; /* scene_kind() at the last fresh tick */
 static int32_t s_scene_first; /* the frame that scene began on */
+/* Desync resync (the "resync" section, below the rollback one). */
+static void resync_on_desync(int32_t f);
+static bool resync_behind(void);
+static void resync_service(void);
+static void resync_reset(void);
 /* Lockstep frames a fight's first loads get before it predicts. */
 #define FIGHT_ENTRY_LEAD 10
 static bool s_rb_lost_logged; /* rb_lost: one log per session */
@@ -1410,6 +1415,7 @@ void recv_inputs(void) {
     atomic_store(&s_frame_pub, net.frame);
     if (net.mesh) {
         mesh_recv(); /* the page's link, on this thread: no queue to apply */
+        resync_service();
         return;
     }
     if (s_rx_thread == NULL) {
@@ -1558,6 +1564,7 @@ void net_desync_found(int32_t f, uint32_t mine, uint32_t theirs, int port) {
         "net: DESYNC at frame %d with port %d (local %08x remote %08x)", f, port + 1, mine, theirs);
     dump_rings_around(f);
     dump_states_around(f);
+    resync_on_desync(f);
 }
 
 /* ---- resume after an interruption --------------------------------------
@@ -1783,6 +1790,12 @@ static bool wait_remote(int32_t need) {
         recv_inputs();
         if (s_remote_have >= need) {
             break;
+        }
+        if (resync_behind()) {
+            /* The leader's state has arrived for a frame this phone is past,
+             * and the leader holds until it is applied: the frame runs on what
+             * it has, and the rollback after it replaces all of it. */
+            return true;
         }
         if (s_peer_left) {
             return false;
@@ -2178,6 +2191,7 @@ static void session_reset(void) {
     net.seed = 0;
     net.start_frame = -1;
     net.ck_from = 0;
+    resync_reset();
     snaps_free();
 }
 
@@ -3298,6 +3312,485 @@ static bool rollback_to(int32_t f) {
     return resim_prepare(f);
 }
 
+/* ---- resync ------------------------------------------------------------
+ * A desync the leader of a mesh sees is repaired with its own state: at the
+ * first fresh frame S after it where that state is final (every input before
+ * S real, nothing waiting to be rolled back), it snapshots exactly where a
+ * rollback snapshot is taken, serialises it (net_resync.h), hands it to the
+ * page (the hook: Eggy's onState('snapshot')) and holds before S until every
+ * other phone still in has said it applied it, or RESYNC_HOLD_MS.
+ *
+ * Holding is what keeps the repair shallow. The leader wrote its input up to
+ * S + delay before it held; the others run on what they hold until they need
+ * more of it, so each is between S - delay and S + delay + WINDOW + 1 when
+ * the bytes land. One at S restores them
+ * where the leader took them and plays on; one past S restores them and
+ * re-runs the frames since from its input rings, as a rollback does (it has
+ * every input it ran them on, and nothing it ran before S matters any more);
+ * one short of S applies them when it gets there. Each answers the leader as
+ * soon as it has restored, before re-running, so a re-run that waits for the
+ * leader's next input cannot wait on the hold. A frame past S that was
+ * already confirmed on the old timeline is then simply run again.
+ *
+ * Checksums from before S + max(RESYNC_CK_SKIP, delay + 2) are not compared
+ * again: a phone may have reported frames of the old timeline up to S + delay
+ * (only confirmed frames are reported).
+ *
+ * Nobody's frames move during the hold, and the page's transfer shares the
+ * links with the datagrams: the mesh counts a phone silent only after
+ * MESH_RESYNC_SILENCE_MS meanwhile (mesh_resync_hold), and measures every
+ * silence afresh once the hold is over. A phone
+ * still disagreeing after that reports a desync again, and the leader sends
+ * another snapshot, RESYNC_SENDS_MAX in a match at most. */
+#define RESYNC_CK_SKIP 8 /* past S + the delay, 2..4 in Eggy (more if it is larger) */
+
+static struct {
+    ResyncPolicy pol;
+    Snapshot take; /* the leader's state at S */
+    uint8_t* out;  /* its image */
+    size_t out_len, out_cap;
+    int32_t out_frame;
+    bool announce; /* the RESYNC message is still to go out */
+    uint8_t* in;   /* a receiver's copy of an image (pc_net_resync_reserve) */
+    size_t in_cap;
+    size_t in_len;
+    bool ready; /* validated, waiting to be applied at `frame` */
+    int32_t frame;
+    bool answer; /* an answer is still to go out */
+    int32_t answer_frame;
+    uint8_t answer_result;
+    int count;    /* snapshots taken (leader) or applied (receiver) */
+    int32_t last; /* the frame of the last one, -1 none */
+    int32_t told; /* the leader's RESYNC, -1 none */
+} s_rs;
+
+static PcNetResyncHook s_rs_hook;
+
+void pc_net_set_resync_hook(PcNetResyncHook hook) {
+    s_rs_hook = hook;
+}
+
+static void resync_reset(void) {
+    resync_policy_init(&s_rs.pol);
+    /* The leader's image goes; a receiver's buffer stays, so a page still
+     * holding pc_net_resync_reserve's pointer writes into memory of ours. */
+    free(s_rs.out);
+    s_rs.out = NULL;
+    s_rs.out_cap = s_rs.out_len = 0;
+    s_rs.in_len = 0;
+    s_rs.out_frame = -1;
+    s_rs.announce = s_rs.ready = s_rs.answer = false;
+    s_rs.frame = -1;
+    s_rs.count = 0;
+    s_rs.last = -1;
+    s_rs.told = -1;
+}
+
+/* Every phone, once on the new timeline from S: compare again from S on. */
+static void resync_epoch(int32_t s) {
+    const int32_t skip = net.delay + 2 > RESYNC_CK_SKIP ? net.delay + 2 : RESYNC_CK_SKIP;
+    if (net.ck_from < s + skip) {
+        net.ck_from = s + skip;
+    }
+    net.desync_reported = false;
+    s_desync_frame = -1;
+    s_rs.count++;
+    s_rs.last = s;
+}
+
+static void resync_on_desync(int32_t f) {
+    if (net.mesh && mesh_announcer() && resync_policy_want(&s_rs.pol, f)) {
+        pc_log_line("net: resync wanted for the desync at frame %d (snapshot %d of at most %d)", f,
+            s_rs.pol.sent + 1, RESYNC_SENDS_MAX);
+    }
+}
+
+static void resync_send_announce(void) {
+    uint8_t msg[RESYNC_MSG_LEN];
+    resync_msg_encode(msg, s_rs.out_frame, (uint32_t)s_rs.out_len, (uint8_t)s_rs.pol.sent);
+    s_rs.announce = !mesh_send_reliable(MESH_REL_RESYNC, msg, sizeof msg);
+}
+
+static void resync_send_answer(void) {
+    uint8_t msg[RESYNC_ANSWER_LEN];
+    resync_answer_encode(msg, s_rs.answer_frame, s_rs.answer_result);
+    s_rs.answer = !mesh_send_reliable(MESH_REL_RESYNC_ANSWER, msg, sizeof msg);
+}
+
+static void resync_answer_out(int32_t s, uint8_t result) {
+    s_rs.answer_frame = s;
+    s_rs.answer_result = result;
+    if (result != 0 && s_rs.told == s) {
+        s_rs.told = -1; /* not waiting for it any more */
+    }
+    resync_send_answer();
+}
+
+/* A receiver refusing what the page handed over: the leader is told at the
+ * next receive (the game thread's), so it need not hold for the full 30 s. */
+static int resync_refuse(int32_t s, int code) {
+    if (s >= 0) {
+        s_rs.answer_frame = s;
+        s_rs.answer_result = (uint8_t)code;
+        s_rs.answer = true;
+        if (s_rs.told == s) {
+            s_rs.told = -1;
+        }
+    }
+    return code;
+}
+
+/* Messages a full lane refused, again (recv_inputs, game thread). */
+static void resync_service(void) {
+    if (s_rs.announce) {
+        resync_send_announce();
+    }
+    if (s_rs.answer) {
+        resync_send_answer();
+    }
+}
+
+void net_resync_announce(int from, const uint8_t* payload, int len) {
+    int32_t s;
+    uint32_t size;
+    uint8_t nth;
+    if (resync_msg_decode(payload, len, &s, &size, &nth)) {
+        s_rs.told = s;
+        /* The leader wrote its input up to S + delay, then held: until it
+         * moves past that, its stillness is the hold, not silence. */
+        mesh_resync_hold(from, s + net.delay);
+        pc_log_line("net: port %d is holding at frame %d for its snapshot %u (%u bytes); we are "
+                    "at %d",
+            from + 1, s, nth, size, net.frame);
+    }
+}
+
+void net_resync_answer(int from, const uint8_t* payload, int len) {
+    int32_t s;
+    uint8_t result;
+    if (resync_answer_decode(payload, len, &s, &result)) {
+        resync_policy_answer(&s_rs.pol, from, s, result == 0);
+        if (result != 0) {
+            pc_log_line("net: port %d refused the snapshot of frame %d (%u)", from + 1, s, result);
+        }
+    }
+}
+
+/* This build's regions, as an image names them. */
+static int resync_mine(ResyncRegion* mine) {
+    Region r[MAX_REGIONS];
+    const int n = snapshot_regions_now(r);
+    for (int i = 0; i < n; i++) {
+        mine[i].addr = (uint64_t)(uintptr_t)r[i].ptr;
+        mine[i].len = (uint32_t)r[i].len;
+    }
+    return n;
+}
+
+/* Why this phone cannot restore the image in `h` right now, NULL if it can. */
+static const char* resync_unusable(const ResyncHeader* h) {
+    if (h->scene != scene_kind()) {
+        return "another scene";
+    }
+    if (h->seed_addr != (uint64_t)(uintptr_t)HSD_RandSeedPtr) {
+        return "another memory layout (another engine build?)";
+    }
+    ResyncRegion mine[MAX_REGIONS];
+    const int n = resync_mine(mine);
+    return resync_layout_check(h, mine, n, SNAPSHOT_FIXED_REGIONS);
+}
+
+/* The leader: snapshot the state entering net.frame and serialise it. */
+static bool resync_take(void) {
+    if (!snapshot_take(&s_rs.take, net.frame)) {
+        return false; /* a transfer in flight, or no memory: the next frame tries again */
+    }
+    ResyncHeader h;
+    memset(&h, 0, sizeof h);
+    h.frame = net.frame;
+    h.session = net.session;
+    h.scene = s_rs.take.scene;
+    h.seed_addr = (uint64_t)(uintptr_t)s_rs.take.seed_ptr;
+    h.seed_val = s_rs.take.seed_val;
+    h.nregions = (uint32_t)s_rs.take.nregions;
+    for (int i = 0; i < s_rs.take.nregions; i++) {
+        h.region[i].addr = (uint64_t)(uintptr_t)s_rs.take.regions[i].ptr;
+        h.region[i].len = (uint32_t)s_rs.take.regions[i].len;
+    }
+    const size_t n = resync_image_size(&h);
+    if (n == 0) {
+        return false;
+    }
+    if (n > s_rs.out_cap) {
+        uint8_t* buf = realloc(s_rs.out, n);
+        if (buf == NULL) {
+            return false;
+        }
+        s_rs.out = buf;
+        s_rs.out_cap = n;
+    }
+    s_rs.out_len = resync_encode(&h, s_rs.take.buf, s_rs.out, s_rs.out_cap);
+    s_rs.out_frame = net.frame;
+    /* The image is the copy that stays; the snapshot was only its body. */
+    free(s_rs.take.buf);
+    s_rs.take.buf = NULL;
+    s_rs.take.cap = s_rs.take.used = s_rs.take.faulted = 0;
+    return s_rs.out_len > 0;
+}
+
+/* Restore the image waiting in s_rs.in, keeping the live pad queue as
+ * rollback_to does. False (and the leader told why) when it no longer fits:
+ * the regions are checked again, since allocation has gone on since the page
+ * handed it over. */
+static bool resync_restore(void) {
+    const int32_t s = s_rs.frame;
+    s_rs.ready = false;
+    ResyncHeader h;
+    const uint8_t* body = NULL;
+    const char* why = !resync_decode(s_rs.in, s_rs.in_len, &h, &body) ? "damaged" :
+                      h.frame != s                                    ? "another frame" :
+                                                                        resync_unusable(&h);
+    if (why != NULL) {
+        pc_log_line(
+            "net: cannot apply the snapshot of frame %d at frame %d: %s", s, net.frame, why);
+        resync_answer_out(s, PC_NET_RESYNC_ERR_LAYOUT);
+        return false;
+    }
+    static Snapshot ext; /* the image's regions, pointing into s_rs.in */
+    ext.frame = s;
+    ext.scene = h.scene;
+    ext.buf = (uint8_t*)body;
+    ext.nregions = (int)h.nregions;
+    for (uint32_t i = 0; i < h.nregions; i++) {
+        ext.regions[i].name = "resync";
+        ext.regions[i].ptr = (void*)(uintptr_t)h.region[i].addr;
+        ext.regions[i].len = h.region[i].len;
+    }
+    ext.seed_ptr = (u32*)(uintptr_t)h.seed_addr;
+    ext.seed_val = h.seed_val;
+    bool intr = OSDisableInterrupts();
+    PadLibData pad = HSD_PadLibData;
+    HSD_PadData queue[8];
+    int qn = pad.qnum > 8 ? 8 : pad.qnum;
+    memcpy(queue, pad.queue, qn * sizeof *queue);
+    snapshot_restore(&ext);
+    memcpy(pad.queue, queue, qn * sizeof *queue);
+    pad.rumble_info = HSD_PadLibData.rumble_info;
+    HSD_PadLibData = pad;
+    OSRestoreInterrupts(intr);
+    /* Every snapshot this phone holds is of the timeline just replaced, and
+     * nothing before S can be gone back to. */
+    for (int32_t f = 0; f < SNAPS; f++) {
+        snap_slot(f)->frame = -1;
+    }
+    barrier_raise(s - 1);
+    s_rb_frame = -1;
+    resync_epoch(s);
+    resync_answer_out(s, 0); /* before any re-run can wait on the leader */
+    pc_log_line("net: applied the leader's state at frame %d (now %d)", s, net.frame);
+    if (s_rs_hook != NULL) {
+        s_rs_hook(PC_NET_RESYNC_APPLIED, s, net.frame);
+    }
+    return true;
+}
+
+/* A receiver ahead of the snapshot's frame, with its bytes in. */
+static bool resync_behind(void) {
+    return s_rs.ready && resync_apply_when(s_rs.frame, net.frame) == RESYNC_ROLLBACK;
+}
+
+/* After a tick: restore S and re-run S .. net.frame - 1. */
+static bool resync_rollback(void) {
+    const int32_t s = s_rs.frame;
+    const int depth = net.frame - s;
+    if (!resync_restore()) {
+        return false;
+    }
+    s_rollbacks++;
+    if (depth > s_rb_depth_max) {
+        s_rb_depth_max = depth;
+    }
+    net.resim = true;
+    return resim_prepare(s);
+}
+
+/* The leader holds at S until every receiver has answered. */
+static void resync_hold(void) {
+    const uint64_t t0 = SDL_GetTicksNS();
+    uint64_t last_send = t0;
+    bool released = false;
+    for (;;) {
+        recv_inputs();
+        const uint64_t now = SDL_GetTicksNS();
+        if (resync_policy_release(
+                &s_rs.pol, mesh_scene_peers(), (int32_t)((now - t0) / 1000000ull)))
+        {
+            released = true;
+            break;
+        }
+        if (s_peer_left || atomic_load(&s_leave)) {
+            s_rs.pol.state = RESYNC_IDLE; /* the session is ending: nothing to hold for */
+            break;
+        }
+        net_watchdog_heartbeat();
+        if (now - last_send > 16000000ull) {
+            send_inputs(); /* keepalives: the others are waiting on us, not gone */
+            last_send = now;
+        }
+        SDL_DelayNS(500000);
+    }
+    const uint64_t held = SDL_GetTicksNS() - t0;
+    net.waited_ns += held; /* waiting, not lateness: nothing to catch up */
+    s_progress_ns = SDL_GetTicksNS();
+    pc_log_line("net: resync hold at frame %d over after %.0f ms (applied by %x, unanswered %x)",
+        net.frame, held / 1e6, s_rs.pol.applied, s_rs.pol.waiting);
+    if (released && s_rs_hook != NULL) {
+        s_rs_hook(PC_NET_RESYNC_RELEASED, net.frame, (int32_t)s_rs.pol.applied);
+    }
+}
+
+/* fresh_tick, where rollback snapshots are taken. False: the session ended. */
+static bool resync_point(void) {
+    if (s_rs.ready) {
+        const int when = resync_apply_when(s_rs.frame, net.frame);
+        if (when == RESYNC_AT_FRESH) {
+            resync_restore();
+        } else if (when == RESYNC_TOO_LATE) {
+            pc_log_line("net: the snapshot of frame %d came too late (we are at %d)", s_rs.frame,
+                net.frame);
+            s_rs.ready = false;
+            resync_answer_out(s_rs.frame, PC_NET_RESYNC_ERR_LATE);
+        }
+    }
+    if (s_rs.pol.state != RESYNC_WANT) {
+        return true;
+    }
+    /* Final here: every input before this frame real, so wait for them --
+     * a hold follows anyway -- and nothing left to roll back. */
+    if (net.frame > 0 && !wait_input(net.frame - 1, "resync")) {
+        return false;
+    }
+    if (!resync_frame_final(net.frame, s_remote_have, s_rb_frame) || !resync_take()) {
+        return true; /* the next frame, once the rollback has run */
+    }
+    resync_policy_taken(&s_rs.pol, net.frame, mesh_scene_peers());
+    resync_epoch(net.frame);
+    mesh_resync_hold(s_local_port, net.frame + net.delay);
+    resync_send_announce();
+    pc_log_line("net: resync snapshot %d of frame %d, %zu bytes, for ports %x", s_rs.pol.sent,
+        net.frame, s_rs.out_len, s_rs.pol.waiting);
+    if (s_rs_hook != NULL) {
+        s_rs_hook(PC_NET_RESYNC_SNAPSHOT, (int32_t)s_rs.out_len, net.frame);
+    }
+    resync_hold();
+    mesh_resync_release(); /* every phone's silence measured afresh from here */
+    return net.active;
+}
+
+/* ---- resync, public (pc/net.h) ---- */
+
+int pc_net_resync_request(void) {
+    if (!net.active || !net.mesh || !mesh_announcer()) {
+        return -1;
+    }
+    if (resync_policy_want(&s_rs.pol, net.frame)) {
+        pc_log_line("net: resync asked for at frame %d", net.frame);
+        return 0;
+    }
+    return s_rs.pol.state == RESYNC_IDLE ? -1 : 0; /* spent, or one is coming */
+}
+
+const uint8_t* pc_net_resync_image(size_t* len, int32_t* frame) {
+    if (len != NULL) {
+        *len = s_rs.out_len;
+    }
+    if (frame != NULL) {
+        *frame = s_rs.out_frame;
+    }
+    return s_rs.out_len > 0 ? s_rs.out : NULL;
+}
+
+uint8_t* pc_net_resync_reserve(size_t len) {
+    if (len == 0 || len > RESYNC_BYTES_MAX) {
+        return NULL;
+    }
+    if (len > s_rs.in_cap) {
+        uint8_t* buf = realloc(s_rs.in, len);
+        if (buf == NULL) {
+            return NULL;
+        }
+        s_rs.in = buf;
+        s_rs.in_cap = len;
+    }
+    s_rs.ready = false; /* the page is writing a new one over it */
+    return s_rs.in;
+}
+
+int pc_net_resync_offer(const uint8_t* bytes, size_t len, int32_t frame) {
+    if (!net.active || !net.mesh) {
+        return PC_NET_RESYNC_ERR_SESSION;
+    }
+    if (s_rs.out_frame == frame && s_rs.out_len > 0) {
+        return PC_NET_RESYNC_ERR_OURS;
+    }
+    if (bytes != s_rs.in) {
+        uint8_t* in = pc_net_resync_reserve(len);
+        if (in == NULL || bytes == NULL) {
+            return resync_refuse(frame, PC_NET_RESYNC_ERR_IMAGE);
+        }
+        memmove(in, bytes, len);
+    }
+    s_rs.ready = false;
+    ResyncHeader h;
+    const uint8_t* body;
+    if (len > s_rs.in_cap || !resync_decode(s_rs.in, len, &h, &body)) {
+        pc_log_line("net: the snapshot of frame %d is damaged (%zu bytes)", frame, len);
+        return resync_refuse(frame, PC_NET_RESYNC_ERR_IMAGE);
+    }
+    (void)body;
+    if (h.session != net.session) {
+        return PC_NET_RESYNC_ERR_SESSION_ID; /* another session's: nobody here to tell */
+    }
+    if (h.frame != frame) {
+        return PC_NET_RESYNC_ERR_FRAME; /* the page's mistake: the image is fine */
+    }
+    const char* why = resync_unusable(&h);
+    if (why != NULL) {
+        pc_log_line("net: the snapshot of frame %d does not fit this phone: %s", frame, why);
+        return resync_refuse(
+            frame, h.scene != scene_kind() ? PC_NET_RESYNC_ERR_SCENE : PC_NET_RESYNC_ERR_LAYOUT);
+    }
+    if (resync_apply_when(frame, net.frame) == RESYNC_TOO_LATE) {
+        pc_log_line("net: the snapshot of frame %d came too late (we are at %d)", frame, net.frame);
+        return resync_refuse(frame, PC_NET_RESYNC_ERR_LATE);
+    }
+    s_rs.in_len = len;
+    s_rs.frame = frame;
+    s_rs.ready = true;
+    pc_log_line("net: the leader's state at frame %d is in (%zu bytes, we are at %d)", frame, len,
+        net.frame);
+    return 0;
+}
+
+bool pc_net_frame_final(int32_t f) {
+    return net.active && !net.resim && s_remote_have >= f && s_rb_frame < 0;
+}
+
+void pc_net_resync_counts(int* state, int* count, int32_t* last) {
+    if (state != NULL) {
+        *state = s_rs.pol.state == RESYNC_WANT                           ? 1 :
+                 s_rs.pol.state == RESYNC_HOLD                           ? 2 :
+                 s_rs.ready || (s_rs.told >= 0 && s_rs.told > s_rs.last) ? 3 :
+                                                                           0;
+    }
+    if (count != NULL) {
+        *count = s_rs.count;
+    }
+    if (last != NULL) {
+        *last = s_rs.last;
+    }
+}
+
 /* ---- per-tick entry --------------------------------------------------- */
 
 /* Draws of random.c's LCG between two seeds, -1 past the bound. A
@@ -3584,6 +4077,11 @@ static void fresh_tick(PADStatus* head, bool raw) {
         }
         if ((net.frame % SYNC_INTERVAL) == 0 && net.frame > 0) {
             time_sync();
+        }
+        /* Where rollback snapshots are taken: the leader's resync snapshot
+         * too, and a receiver's restore of one taken here. */
+        if (net.mesh && !resync_point()) {
+            return;
         }
         if (s_remote_have < net.frame) {
             if (!snap_predicted(net.frame) && !wait_input(net.frame, "snapshot fallback")) {
@@ -3963,6 +4461,13 @@ bool pc_net_after_tick(bool scene_ending) {
         return false;
     }
     recv_inputs();
+    if (resync_behind()) {
+        /* Ahead of the leader's snapshot: back to it, and re-run since. */
+        if (resync_rollback()) {
+            s_resim_run = 0;
+            return true;
+        }
+    }
     if (s_rb_frame >= 0) {
         int32_t f = s_rb_frame;
         s_rb_frame = -1;

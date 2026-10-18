@@ -583,7 +583,7 @@ const char* snapshot_state_region_missing(void) {
 
 /* The first regions are fixed; the rest are one per live heap. Only the
  * fixed ones have a length a snapshot may compare, because a heap grows. */
-#define FIXED_REGIONS 4
+#define FIXED_REGIONS SNAPSHOT_FIXED_REGIONS
 
 /* Everything a snapshot covers, as it stands right now. */
 static int regions_now(Region* r) {
@@ -621,6 +621,10 @@ static int regions_now(Region* r) {
         r[n++] = (Region){names[h], lo, (size_t)((char*)hi - (char*)lo)};
     }
     return n;
+}
+
+int snapshot_regions_now(Region* r) {
+    return regions_now(r);
 }
 
 /* Cost of every take/restore and the re-simulation load per present, for

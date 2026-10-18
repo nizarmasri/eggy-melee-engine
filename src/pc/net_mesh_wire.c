@@ -306,6 +306,17 @@ bool mesh_away_decode(const uint8_t* in, int len, uint8_t* port, int32_t* frame)
     return *frame >= -1;
 }
 
+/* The silence limit that applies to port p. */
+static int32_t silence_limit(const MeshAwayView* v, int p) {
+    const int32_t limit = v->loading[p] ? v->load_ms : v->away_ms;
+    return v->resync && limit < MESH_RESYNC_SILENCE_MS ? MESH_RESYNC_SILENCE_MS : limit;
+}
+
+bool mesh_resync_over(
+    bool leader_in, int32_t leader_newest, int32_t release_after, int32_t since_ms) {
+    return !leader_in || leader_newest > release_after || since_ms >= MESH_RESYNC_WINDOW_MS;
+}
+
 uint8_t mesh_silent_mask(const MeshAwayView* v) {
     uint8_t silent = 0;
     for (int p = 0; p < MESH_PORTS; p++) {
@@ -313,7 +324,7 @@ uint8_t mesh_silent_mask(const MeshAwayView* v) {
         if (p == v->self || (v->humans & bit) == 0 || (v->settled & bit) != 0) {
             continue;
         }
-        const int32_t limit = v->loading[p] ? v->load_ms : v->away_ms;
+        const int32_t limit = silence_limit(v, p);
         if (v->bye[p] || v->quiet_ms[p] >= limit) {
             silent |= bit;
         }
@@ -328,8 +339,7 @@ uint8_t mesh_unheard_mask(const MeshAwayView* v) {
         if (p == v->self || (v->humans & bit) == 0 || (v->settled & bit) != 0) {
             continue;
         }
-        const int32_t limit = v->loading[p] ? v->load_ms : v->away_ms;
-        if (v->quiet_ms[p] >= limit / 2) {
+        if (v->quiet_ms[p] >= silence_limit(v, p) / 2) {
             unheard |= bit;
         }
     }
