@@ -123,6 +123,17 @@ static uint64_t s_rc_ns; /* when the phase opened */
 static bool s_rc_sent;   /* our RESUME is out for this phase */
 static int32_t s_rc_window_ms = RECONNECT_MS;
 
+/* Embedder knobs (pc_net_set_ports and the rest, src/pc/eggy): kept across
+ * sessions until changed; nothing in melee-web sets them, so its sessions
+ * run on the defaults. */
+static int s_port[2] = {0, 1};                /* controller port of player 0 (host) and 1 */
+static uint32_t s_session_preset;             /* 0: the host draws the session id */
+static int32_t s_stall_want;                  /* <= 0: STALL_TIMEOUT_MS */
+static int32_t s_reconnect_want;              /* <= 0: RECONNECT_MS */
+static int32_t s_stall_ms = STALL_TIMEOUT_MS; /* this session's */
+static int32_t s_desync_frame = -1;           /* frame check_desync reported, -1 none */
+static atomic_bool s_leave;                   /* pc_net_leave: stop waiting on the peer */
+
 static int32_t s_wrote = -1; /* newest local frame written to s_local_ring */
 static uint64_t s_send_ns;   /* when the newest local frame first went out */
 static int32_t s_send_frame = -1;
@@ -1349,6 +1360,7 @@ static void check_desync(void) {
         s_ck_checked = f;
         if (s_ck_ring[i] != s_rck[i].ck) {
             net.desync_reported = true;
+            s_desync_frame = f;
             pc_log_line(
                 "net: DESYNC at frame %d (local %08x remote %08x)", f, s_ck_ring[i], s_rck[i].ck);
             dump_rings_around(f);
@@ -1517,7 +1529,7 @@ static bool resume_begin(uint64_t now) {
     s_rc_ns = now;
     s_rc_sent = false;
     pc_log_line("net: interrupted at frame %d (peer silent %d ms), reconnecting for up to %d ms",
-        net.frame, STALL_TIMEOUT_MS, s_rc_window_ms);
+        net.frame, s_stall_ms, s_rc_window_ms);
     resume_send();
     return true;
 }
@@ -1585,6 +1597,10 @@ static bool wait_remote(int32_t need) {
         if (s_peer_left) {
             return false;
         }
+        if (atomic_load(&s_leave)) {
+            pc_log_line("net: leaving the session at frame %d (asked to)", net.frame);
+            return false;
+        }
         net_watchdog_heartbeat();
         /* Before now, so no stamp the receive thread writes is later than it. */
         uint64_t heard = rx_heard_ns();
@@ -1597,7 +1613,7 @@ static bool wait_remote(int32_t need) {
             /* Before the first packet there is no rx clock, so the connect
              * wait is still measured from t0. */
             uint64_t quiet = heard ? now - heard : now - t0;
-            uint64_t limit = (heard ? STALL_TIMEOUT_MS : connect_timeout_ms()) * 1000000ull;
+            uint64_t limit = (uint64_t)(heard ? s_stall_ms : connect_timeout_ms()) * 1000000ull;
             /* Measured from the last forward progress, not from the start of
              * this wait: t0 restarts with every wait_remote() call, so a peer
              * that advanced the contiguous mark one frame just under the bound
@@ -1860,6 +1876,8 @@ static void session_reset(void) {
         s_rck[i].frame = -1;
     }
     net.desync_reported = s_heard = s_peer_left = s_no_progress = false;
+    s_desync_frame = -1;
+    atomic_store(&s_leave, false);
     s_last_rx_ns = 0;
     s_progress_ns = 0;
     s_warn_src = s_warn_sess = s_warn_bad = s_warn_mac = false;
@@ -2209,11 +2227,18 @@ static bool connect_impl(
     bool rc_bad =
         rc_ms != NULL && (rc_end == rc_ms || *rc_end != '\0' || rc_want < 0 || rc_want > INT32_MAX);
     s_rc_window_ms = rc_bad ? RECONNECT_MS : (int32_t)rc_want;
+    if (rc_ms == NULL && s_reconnect_want > 0) {
+        s_rc_window_ms = s_reconnect_want; /* pc_net_set_timeouts; the env knob wins */
+    }
+    s_stall_ms = s_stall_want > 0 ? s_stall_want : STALL_TIMEOUT_MS;
     sim_env(bind_port);
-    /* The host names the session; the guest takes it from the first packet. */
-    net.session = net.local == 0 ?
-                      (uint32_t)(SDL_GetPerformanceCounter() ^ (uint64_t)getpid() << 20) | 1u :
-                      0;
+    /* The host names the session; the guest takes it from the first packet.
+     * An embedder whose two peers already share an id (pc_net_set_session_id)
+     * gives it to both, so neither accepts a datagram of any other session. */
+    net.session =
+        s_session_preset != 0 ? s_session_preset :
+        net.local == 0 ? (uint32_t)(SDL_GetPerformanceCounter() ^ (uint64_t)getpid() << 20) | 1u :
+                         0;
     net.seed = seed;
     if (seed != 0) {
         *HSD_RandSeedPtr = seed;
@@ -2341,6 +2366,80 @@ void pc_net_poll(void) {
 
 int32_t pc_net_frame(void) {
     return net.tick_frame;
+}
+
+/* ---- embedder knobs (pc/net.h) ---------------------------------------- */
+
+void pc_net_set_ports(int host_port, int guest_port) {
+    if (host_port < 0 || host_port > 3 || guest_port < 0 || guest_port > 3 ||
+        host_port == guest_port)
+    {
+        host_port = 0;
+        guest_port = 1;
+    }
+    s_port[0] = host_port;
+    s_port[1] = guest_port;
+}
+
+void pc_net_set_session_id(uint32_t id) {
+    s_session_preset = id;
+}
+
+void pc_net_set_timeouts(int stall_ms, int reconnect_ms) {
+    s_stall_want = stall_ms;
+    s_reconnect_want = reconnect_ms;
+}
+
+/* pc_net_poll for a game thread that is parked by agreement with the peer
+ * (both sides hold before a match's first tick): the transmit timer runs
+ * from here rather than from the first tick, so a long load still sends
+ * keepalives, and the hold counts as progress, so the no-progress bound in
+ * wait_remote() starts when the peers release rather than when they parked. */
+void pc_net_poll_parked(void) {
+    if (!net.active) {
+        return;
+    }
+    SDL_LockMutex(net.tx_lock);
+    if (s_timer == 0) {
+        s_timer = SDL_AddTimer(4, tx_timer, NULL);
+    }
+    SDL_UnlockMutex(net.tx_lock);
+    pc_net_poll();
+    if (net.active) {
+        s_progress_ns = SDL_GetTicksNS();
+    }
+}
+
+/* Any thread, e.g. the page between frames while the game thread is parked
+ * in wait_remote() through a long stall or resume: the wait returns at once
+ * and the session closes with a BYE (wait_input), so the player's "leave"
+ * does not wait out the windows. */
+void pc_net_leave(void) {
+    atomic_store(&s_leave, true);
+}
+
+int pc_net_quiet_ms(void) {
+    uint64_t heard = net.active ? rx_heard_ns() : 0;
+    if (heard == 0) {
+        return -1;
+    }
+    uint64_t now = SDL_GetTicksNS();
+    return now > heard ? (int)((now - heard) / 1000000ull) : 0;
+}
+
+bool pc_net_counters(PcNetCounters* c) {
+    if (!net.active || c == NULL) {
+        return false;
+    }
+    c->ping_ms = (int)(net.ping_us / 1000);
+    c->delay = net.delay;
+    c->rollbacks = s_rollbacks;
+    c->rollback_depth_max = s_rb_depth_max;
+    c->stalls = s_stalls;
+    c->desync_frame = s_desync_frame;
+    c->quality = pc_net_quality();
+    c->frame = net.frame;
+    return true;
 }
 
 bool pc_net_stats(int* ping_ms, int* delay_frames, unsigned* rollbacks) {
@@ -2518,13 +2617,13 @@ static bool wait_input(int32_t need, const char* reason) {
     }
     /* A refused resume logged its own reason, and the peer was not
      * silent at all: its answer was simply unusable. */
-    if (!s_peer_left && s_rc != RSM_FAILED) {
+    if (!s_peer_left && s_rc != RSM_FAILED && !atomic_load(&s_leave)) {
         if (s_no_progress) {
             pc_log_line("net: peer still sending but stuck at frame %d for %d ms, leaving netplay",
                 s_remote_newest, NO_PROGRESS_TIMEOUT_MS);
         } else {
             pc_log_line("net: peer silent for %d ms at frame %d, leaving netplay",
-                rx_heard_ns() ? STALL_TIMEOUT_MS : connect_timeout_ms(), net.frame);
+                rx_heard_ns() ? s_stall_ms : connect_timeout_ms(), net.frame);
         }
     }
     /* The BYE can arrive while the game thread is parked in
@@ -2671,7 +2770,7 @@ static void head_check(void) {
     }
     const PadLibData* p = &HSD_PadLibData;
     for (int i = 0; i < 2; i++) {
-        int port = i == 0 ? net.local : net.remote;
+        int port = s_port[i == 0 ? net.local : net.remote];
         /* HSD_PadADConvert ORs synthetic direction bits above 0xffff into
          * button (controller.c), so only the real pad bits can be compared. */
         uint32_t saw = HSD_PadMasterStatus[port].button & 0xffffu;
@@ -2734,8 +2833,17 @@ static void fight_reseed(int32_t f) {
 /* Ports 0-3 of the queue head become the synced inputs for frame f. */
 static void write_head(PADStatus* head, int32_t f) {
     static const WirePad neutral;
+    /* The two players' ports (pc_net_set_ports; 0 and 1 unless an embedder
+     * seats them elsewhere); every other port reports no controller. */
+    const int lp = s_port[net.local], rp = s_port[net.remote];
+    for (int i = 0; i < 4; i++) {
+        if (i != lp && i != rp) {
+            memset(&head[i], 0, sizeof head[i]);
+            head[i].err = PAD_ERR_NO_CONTROLLER;
+        }
+    }
     const WirePad* mine = f >= net.delay ? &s_local_ring[f & (RING - 1)] : &neutral;
-    from_wire(&head[net.local], mine);
+    from_wire(&head[lp], mine);
     const WirePad* theirs = &s_remote_ring[f & (RING - 1)];
     WirePad wrong;
     if (s_audit_poison) {
@@ -2744,14 +2852,10 @@ static void write_head(PADStatus* head, int32_t f) {
         wrong.button ^= 0x0100; /* A */
         theirs = &wrong;
     }
-    from_wire(&head[net.remote], theirs);
+    from_wire(&head[rp], theirs);
     if (!s_seen_remote && theirs->button != 0) {
         s_seen_remote = true;
         pc_log_line("net: first remote button press (%04x) at frame %d", theirs->button, f);
-    }
-    for (int i = 2; i < 4; i++) {
-        memset(&head[i], 0, sizeof head[i]);
-        head[i].err = PAD_ERR_NO_CONTROLLER;
     }
     head_note(head, f);
 }

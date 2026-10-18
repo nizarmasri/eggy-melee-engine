@@ -33,7 +33,27 @@
  *        +4 CPU level: 1..9 for a CPU, 0..9 (ignored) for a human
  *        +5 handicap: 0 off, 1..9 Melee's handicap levels
  *        +6, +7 reserved, 0
- * Two fighters at least; with teams on, two teams at least.
+ *   [48] netplay 0/1: 0 plays on this phone alone and words 49..63 are not
+ *        read; 1 plays two phones over the page's link (src/pc/eggy/eggy_net.c)
+ *   [49] this phone's port: one of the two human ports
+ *   [50] phones in the match: 2 (nothing else yet)
+ *   [51] the mesh leader's port: the lowest human port. Its phone hosts the
+ *        session; the other human's is the guest
+ *   [52] session id (uint32), distinct per match: datagrams of any other
+ *        session are dropped
+ *   [53] input delay in frames: 0 auto (from ping), 1..4 fixed
+ *   [54..63] reserved, 0
+ * Two fighters at least; with teams on, two teams at least. Netplay: exactly
+ * two humans, one per phone; CPUs are simulated identically on both.
+ * Both phones' configs must agree on every word but 12..14 and 49
+ * (eggy_config_hash), or the session is refused.
+ *
+ * Netplay stats (int32 words at eggy_net_stats(), kept after a session ends):
+ *   [0] state: 0 none, 1 waiting for the page's link, 2 handshaking, 3 loading
+ *       and holding, 4 playing, 5 closing, 6 closed, 7 failed
+ *   [1] ping ms, [2] input delay, [3] rollbacks, [4] deepest rollback,
+ *   [5] desyncs (0/1: the first one is reported), [6] frames stalled on the
+ *   peer, [7] link quality 0 stable .. 3 reconnecting
  *
  * HUD (int32 words at eggy_hud(), current at every tick):
  *   [0] state: 0 parked, 1 loading, 2 loaded (held at frame 0), 3 fighting,
@@ -45,7 +65,8 @@
  *
  * Results (int32 words at eggy_results(), filled before onState('ended')):
  *   [0] end frame: the match frame on which GAME! or TIME! came
- *   [1] outcome: 0 normal, 1 time out, 2 sudden death then decided, 3 aborted
+ *   [1] outcome: 0 normal, 1 time out, 2 sudden death then decided, 3 aborted,
+ *       4 disconnected (the netplay peer was lost mid-match)
  *   [2 + 8 * port]: present, placement (1..4, teammates share it), stocks
  *       left, KOs, falls, self-destructs, damage dealt, damage taken
  *   From Melee's own match end (MatchEnd.player_standings).
@@ -61,7 +82,7 @@ extern "C" {
 #endif
 
 #define EGGY_CONFIG_VERSION 1
-#define EGGY_CONFIG_WORDS 48
+#define EGGY_CONFIG_WORDS 64
 #define EGGY_CONFIG_PORT_BASE 16
 #define EGGY_CONFIG_PORT_WORDS 8
 #define EGGY_PORTS 4
@@ -69,6 +90,8 @@ extern "C" {
 #define EGGY_HUD_PORT_BASE 3
 #define EGGY_RESULTS_WORDS (2 + 8 * EGGY_PORTS)
 #define EGGY_RESULTS_PORT_BASE 2
+#define EGGY_NET_STATS_WORDS 8
+#define EGGY_NET_PHONES 2
 
 /* CharacterKind 0..25, Sheik included. */
 #define EGGY_CKIND_COUNT 26
@@ -98,15 +121,41 @@ enum EggyOutcome {
     EGGY_OUTCOME_TIME_OUT = 1,
     EGGY_OUTCOME_SUDDEN_DEATH = 2,
     EGGY_OUTCOME_ABORTED = 3,
+    EGGY_OUTCOME_DISCONNECTED = 4,
 };
 
-/* eggy_load's errors (also onState('error', code, serial)): 1..48 name the
+/* eggy_net_stats()[0]. */
+enum EggyNetState {
+    EGGY_NET_NONE = 0,
+    EGGY_NET_LINK = 1,
+    EGGY_NET_HANDSHAKE = 2,
+    EGGY_NET_HOLD = 3,
+    EGGY_NET_LIVE = 4,
+    EGGY_NET_CLOSING = 5,
+    EGGY_NET_CLOSED = 6,
+    EGGY_NET_FAILED = 7,
+};
+
+/* onState('net-error', code, serial): the session could not be set up or was
+ * lost before the match's first frame. The engine parks ('parked' follows). */
+enum EggyNetError {
+    EGGY_NET_ERR_LINK = 1,         /* the page's link did not open (status) */
+    EGGY_NET_ERR_CONNECT = 2,      /* the session could not be opened */
+    EGGY_NET_ERR_HANDSHAKE = 3,    /* RULES/READY failed or timed out */
+    EGGY_NET_ERR_MISMATCH = 4,     /* the other phone's config is another match */
+    EGGY_NET_ERR_PEER_LEFT = 5,    /* the other phone left or went silent */
+    EGGY_NET_ERR_TIMEOUT = 6,      /* it never finished loading */
+    EGGY_NET_ERR_INCOMPATIBLE = 7, /* another wire protocol (engine build) */
+};
+
+/* eggy_load's errors (also onState('error', code, serial)): 1..64 name the
  * first invalid word, (index + 1); the rest are whole-config conditions. */
 #define EGGY_ERR_FIELD(index) ((index) + 1)
-#define EGGY_ERR_BUSY 100     /* not parked: a match is loading or running */
-#define EGGY_ERR_FIGHTERS 101 /* fewer than two fighters */
-#define EGGY_ERR_TEAMS 102    /* teams on, every fighter on one team */
-#define EGGY_ERR_DISABLED 103 /* the engine was not started with MELEE_EGGY */
+#define EGGY_ERR_BUSY 100       /* not parked: a match is loading or running */
+#define EGGY_ERR_FIGHTERS 101   /* fewer than two fighters */
+#define EGGY_ERR_TEAMS 102      /* teams on, every fighter on one team */
+#define EGGY_ERR_DISABLED 103   /* the engine was not started with MELEE_EGGY */
+#define EGGY_ERR_NET_HUMANS 104 /* netplay without exactly two humans */
 
 typedef struct EggyPort {
     int32_t kind; /* enum EggyPortKind */
@@ -133,6 +182,14 @@ typedef struct EggyConfig {
     int32_t sfx_volume;
     int32_t results_seconds;
     EggyPort ports[EGGY_PORTS];
+    /* netplay, words 48..53 */
+    bool netplay;
+    int32_t local_port;
+    int32_t leader_port;
+    int32_t guest_port; /* the other human's */
+    uint32_t session;
+    int32_t input_delay; /* 0 auto */
+    uint32_t hash;       /* eggy_config_hash() of the words */
 } EggyConfig;
 
 /* Validate a v1 config (src/pc/eggy/eggy_config.c; pure, no game state).
@@ -141,6 +198,9 @@ typedef struct EggyConfig {
 int eggy_config_parse(const int32_t* words, const uint8_t* costumes, EggyConfig* out);
 /* A StKind VS matches can be played on. */
 bool eggy_stage_valid(int32_t stkind);
+/* FNV-1a over every word both phones of a netplay match must agree on: all
+ * 64 but 12..14 (this device's sound) and 49 (this phone's port). */
+uint32_t eggy_config_hash(const int32_t* words);
 
 /* ---- exports (Module._eggy_*; src/pc/eggy/eggy.c) ---------------------- */
 
@@ -156,6 +216,7 @@ uint32_t eggy_checksum(void);
 void eggy_audio(int music_volume, int sfx_volume);
 int eggy_costumes(int ckind);
 int eggy_team_costume(int ckind, int team);
+const int32_t* eggy_net_stats(void);
 
 /* ---- hooks the engine calls -------------------------------------------- */
 

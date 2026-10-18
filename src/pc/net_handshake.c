@@ -118,6 +118,7 @@ static bool csprng(void* out, size_t n) {
 #define HS_LEAD_MAX 200    /* inside rules_invalid's RING * 4 with room for tick skew */
 
 static uint64_t s_hs_t0;
+static int32_t s_match_start = -1; /* pc_net_set_match_start; -1: hs_lead() */
 /* Host: the RULES in force, host order, kept so a stale one can be re-issued
  * with a fresh start_frame, and the start_frame it replaced -- a READY for
  * that one may already be on its way. */
@@ -632,6 +633,10 @@ static bool hs_poll(int32_t* start_frame) {
     return true;
 }
 
+void pc_net_set_match_start(int32_t frame) {
+    s_match_start = frame;
+}
+
 bool pc_net_host_match(uint32_t seed, int32_t* start_frame) {
     if (net.hs == HS_IDLE) {
         if (!net.active) {
@@ -648,7 +653,11 @@ bool pc_net_host_match(uint32_t seed, int32_t* start_frame) {
         s_hs_t0 = SDL_GetTicksNS();
         net.seed = seed;
         seed_apply();
-        net.start_frame = net.tick_frame + hs_lead();
+        /* A caller that handshakes before simulating anything (src/pc/eggy)
+         * names the start itself: no frame can go by before the READY. */
+        net.start_frame = s_match_start >= 0 && s_match_start > net.tick_frame ?
+                              s_match_start :
+                              net.tick_frame + hs_lead();
         s_hs_prev_start = -1;
         Rules ru = {0};
         ru.seed = seed;

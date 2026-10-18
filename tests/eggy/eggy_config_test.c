@@ -244,6 +244,127 @@ static void test_fighters_and_teams(void) {
     CHECK(parse(w, &c) == 0);
 }
 
+/* Netplay: Fox on port 1 (this phone, the leader), the CPU Falco on port 2
+ * and a human Captain Falcon on port 3, the other phone. */
+static void net_base(int32_t* w) {
+    base(w);
+    int32_t* p2 = &w[EGGY_CONFIG_PORT_BASE + 2 * EGGY_CONFIG_PORT_WORDS];
+    p2[0] = EGGY_PORT_HUMAN;
+    p2[1] = 0;
+    p2[2] = 2;
+    p2[3] = 2;
+    w[48] = 1;
+    w[49] = 0;
+    w[50] = 2;
+    w[51] = 0;
+    w[52] = (int32_t)0xC0FFEE01u;
+    w[53] = 0;
+}
+
+static void net_expect(int index, int32_t value, int code) {
+    int32_t w[EGGY_CONFIG_WORDS];
+    EggyConfig c;
+    net_base(w);
+    w[index] = value;
+    const int got = parse(w, &c);
+    if (got != code) {
+        fprintf(stderr, "netplay word %d = %d: expected %d, got %d\n", index, value, code, got);
+        failures++;
+    }
+}
+
+static void test_netplay(void) {
+    int32_t w[EGGY_CONFIG_WORDS];
+    EggyConfig c;
+    net_base(w);
+    CHECK(parse(w, &c) == 0);
+    CHECK(c.netplay && c.local_port == 0 && c.leader_port == 0 && c.guest_port == 2);
+    CHECK(c.session == 0xC0FFEE01u && c.input_delay == 0);
+    w[49] = 2; /* the other phone's view of the same match */
+    CHECK(parse(w, &c) == 0);
+    CHECK(c.local_port == 2 && c.leader_port == 0 && c.guest_port == 2);
+
+    net_expect(48, 2, EGGY_ERR_FIELD(48));
+    net_expect(48, -1, EGGY_ERR_FIELD(48));
+    net_expect(49, 1, EGGY_ERR_FIELD(49)); /* the CPU's port */
+    net_expect(49, 3, EGGY_ERR_FIELD(49)); /* nobody's */
+    net_expect(49, 4, EGGY_ERR_FIELD(49));
+    net_expect(49, -1, EGGY_ERR_FIELD(49));
+    net_expect(50, 1, EGGY_ERR_FIELD(50));
+    net_expect(50, 3, EGGY_ERR_FIELD(50));
+    net_expect(51, 2, EGGY_ERR_FIELD(51)); /* the leader is the lowest human */
+    net_expect(51, 1, EGGY_ERR_FIELD(51));
+    net_expect(52, 0, 0);
+    net_expect(52, -1, 0);
+    for (int32_t d = -1; d <= 5; d++) {
+        net_expect(53, d, d >= 0 && d <= 4 ? 0 : EGGY_ERR_FIELD(53));
+    }
+    for (int i = 54; i < EGGY_CONFIG_WORDS; i++) {
+        net_expect(i, 1, EGGY_ERR_FIELD(i));
+    }
+
+    /* Exactly two humans, one per phone. */
+    net_base(w);
+    w[EGGY_CONFIG_PORT_BASE + EGGY_CONFIG_PORT_WORDS] = EGGY_PORT_HUMAN; /* Falco too */
+    w[EGGY_CONFIG_PORT_BASE + EGGY_CONFIG_PORT_WORDS + 4] = 0;
+    CHECK(parse(w, &c) == EGGY_ERR_NET_HUMANS);
+    net_base(w);
+    w[EGGY_CONFIG_PORT_BASE + 2 * EGGY_CONFIG_PORT_WORDS] = EGGY_PORT_CPU;
+    w[EGGY_CONFIG_PORT_BASE + 2 * EGGY_CONFIG_PORT_WORDS + 4] = 5;
+    CHECK(parse(w, &c) == EGGY_ERR_NET_HUMANS);
+
+    /* Solo never reads words 49..63. */
+    base(w);
+    for (int i = 49; i < EGGY_CONFIG_WORDS; i++) {
+        w[i] = -7;
+    }
+    CHECK(parse(w, &c) == 0);
+    CHECK(!c.netplay);
+}
+
+static void test_hash(void) {
+    int32_t a[EGGY_CONFIG_WORDS], b[EGGY_CONFIG_WORDS];
+    net_base(a);
+    memcpy(b, a, sizeof a);
+    const uint32_t h = eggy_config_hash(a);
+    CHECK(h == eggy_config_hash(b));
+    /* What each phone may set for itself. */
+    b[12] = 0;
+    b[13] = 3;
+    b[14] = 99;
+    b[49] = 2;
+    CHECK(eggy_config_hash(b) == h);
+    /* Every other word is the match. */
+    for (int i = 0; i < EGGY_CONFIG_WORDS; i++) {
+        if ((i >= 12 && i <= 14) || i == 49) {
+            continue;
+        }
+        memcpy(b, a, sizeof a);
+        b[i] ^= 0x100;
+        if (eggy_config_hash(b) == h) {
+            fprintf(stderr, "hash ignores word %d\n", i);
+            failures++;
+        }
+    }
+    /* FNV-1a over the bytes low first: one word of 1, the rest 0, is pinned
+     * so both phones' engines (and any page-side check) agree on it. */
+    int32_t one[EGGY_CONFIG_WORDS] = {1};
+    uint32_t want = 2166136261u;
+    for (int i = 0; i < EGGY_CONFIG_WORDS; i++) {
+        if ((i >= 12 && i <= 14) || i == 49) {
+            continue;
+        }
+        for (int byte = 0; byte < 4; byte++) {
+            want ^= (uint32_t)((uint32_t)one[i] >> (8 * byte)) & 0xFFu;
+            want *= 16777619u;
+        }
+    }
+    CHECK(eggy_config_hash(one) == want);
+    /* The parse carries it. */
+    EggyConfig c;
+    CHECK(parse(a, &c) == 0 && c.hash == h);
+}
+
 int main(void) {
     memset(costumes, 5, sizeof costumes);
     costumes[25] = 3;
@@ -253,6 +374,8 @@ int main(void) {
     test_item_mask();
     test_ports();
     test_fighters_and_teams();
+    test_netplay();
+    test_hash();
     if (failures != 0) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

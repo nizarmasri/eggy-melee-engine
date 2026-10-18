@@ -24,6 +24,61 @@ static bool is_flag(int32_t v) {
     return v == 0 || v == 1;
 }
 
+uint32_t eggy_config_hash(const int32_t* w) {
+    uint32_t h = 2166136261u; /* FNV-1a, each word's bytes low first */
+    for (int i = 0; i < EGGY_CONFIG_WORDS; i++) {
+        if ((i >= 12 && i <= 14) || i == 49) {
+            continue; /* this device's sound, this phone's port */
+        }
+        const uint32_t v = (uint32_t)w[i];
+        for (int b = 0; b < 4; b++) {
+            h ^= (v >> (8 * b)) & 0xFFu;
+            h *= 16777619u;
+        }
+    }
+    return h;
+}
+
+/* Words 48..63 with netplay on: two humans, one per phone. */
+static int parse_netplay(const int32_t* w, EggyConfig* c) {
+    int humans[EGGY_PORTS];
+    int n = 0;
+    for (int port = 0; port < EGGY_PORTS; port++) {
+        if (c->ports[port].kind == EGGY_PORT_HUMAN) {
+            humans[n++] = port;
+        }
+    }
+    if (!in_range(w[49], 0, EGGY_PORTS - 1)) {
+        return EGGY_ERR_FIELD(49);
+    }
+    if (w[50] != EGGY_NET_PHONES) {
+        return EGGY_ERR_FIELD(50);
+    }
+    if (n != EGGY_NET_PHONES) {
+        return EGGY_ERR_NET_HUMANS;
+    }
+    if (w[49] != humans[0] && w[49] != humans[1]) {
+        return EGGY_ERR_FIELD(49); /* this phone's port must be one of the humans */
+    }
+    if (w[51] != humans[0]) {
+        return EGGY_ERR_FIELD(51); /* the leader is the lowest human port */
+    }
+    if (!in_range(w[53], 0, 4)) {
+        return EGGY_ERR_FIELD(53);
+    }
+    for (int i = 54; i < EGGY_CONFIG_WORDS; i++) {
+        if (w[i] != 0) {
+            return EGGY_ERR_FIELD(i);
+        }
+    }
+    c->local_port = w[49];
+    c->leader_port = humans[0];
+    c->guest_port = humans[1];
+    c->session = (uint32_t)w[52];
+    c->input_delay = w[53];
+    return 0;
+}
+
 int eggy_config_parse(const int32_t* w, const uint8_t* costumes, EggyConfig* out) {
     EggyConfig c = {0};
     int fighters = 0;
@@ -120,6 +175,17 @@ int eggy_config_parse(const int32_t* w, const uint8_t* costumes, EggyConfig* out
     if (c.teams && (teams_seen & (teams_seen - 1)) == 0) {
         return EGGY_ERR_TEAMS;
     }
+    if (!is_flag(w[48])) {
+        return EGGY_ERR_FIELD(48);
+    }
+    c.netplay = w[48] != 0;
+    if (c.netplay) {
+        const int err = parse_netplay(w, &c); /* solo: words 49..63 are not read */
+        if (err != 0) {
+            return err;
+        }
+    }
+    c.hash = eggy_config_hash(w);
     *out = c;
     return 0;
 }

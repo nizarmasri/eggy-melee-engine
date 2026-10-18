@@ -175,6 +175,49 @@ int pc_net_quality(void);
  * only one of them was playing. */
 bool pc_net_desync(void);
 
+/* Embedder knobs (src/pc/eggy, EGGY.md "Netplay"). Each is read when a
+ * session connects and lasts until it is changed again; melee-web sets none
+ * of them, so its sessions keep the defaults below.
+ *
+ * pc_net_set_ports: the controller ports the host (player 0) and the guest
+ * drive; every other port reports no controller. Default 0 and 1.
+ * pc_net_set_session_id: a nonzero id both peers already share, used as the
+ * session id on both instead of the host drawing one for the guest to learn,
+ * so a datagram of any other session is dropped from the first one. 0 (the
+ * default) draws it.
+ * pc_net_set_timeouts: the stall timeout (default 3000 ms) and the resume
+ * window after it (default 3000 ms, MELEE_NET_RECONNECT_MS wins); <= 0 keeps
+ * the default. */
+void pc_net_set_ports(int host_port, int guest_port);
+void pc_net_set_session_id(uint32_t id);
+void pc_net_set_timeouts(int stall_ms, int reconnect_ms);
+/* The frame the next pc_net_host_match() starts the match on, for a caller
+ * that runs the handshake before any frame is simulated; -1 (the default)
+ * leads the host's frame by a few round trips. */
+void pc_net_set_match_start(int32_t frame);
+/* pc_net_poll() for a game thread that is parked by agreement with the peer:
+ * also runs the transmit timer and counts the wait as progress. */
+void pc_net_poll_parked(void);
+/* Milliseconds since the peer's last datagram, -1 before its first or with
+ * no session. */
+int pc_net_quiet_ms(void);
+/* Leave the session from any thread: a wait for the peer's input returns at
+ * once and the session closes (BYE). Cleared by the next connect. */
+void pc_net_leave(void);
+
+typedef struct PcNetCounters {
+    int ping_ms;            /* smoothed round trip */
+    int delay;              /* input delay in frames */
+    unsigned rollbacks;     /* this session */
+    int rollback_depth_max; /* frames, this session */
+    unsigned stalls;        /* frames that waited for the peer's input */
+    int32_t desync_frame;   /* first frame the checksums disagreed, -1 none */
+    int quality;            /* pc_net_quality() */
+    int32_t frame;          /* next frame to simulate */
+} PcNetCounters;
+/* False when no session is up. */
+bool pc_net_counters(PcNetCounters* out);
+
 /* Why the last session ended (kept until the next connect): 0 still up /
  * never broke, 1 the peer left (BYE), 2 timeout, 3 desync, 4 incompatible
  * protocol version, 5 an interruption could not be resumed (the input gap
