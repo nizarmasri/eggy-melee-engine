@@ -72,6 +72,7 @@
 #include "pc/net.h"
 #include "pc/net_lan.h"
 #include "pc/net_mesh_wire.h"
+#include "pc/net_resync.h"
 #include "pc/pc.h"
 
 #include <dolphin/pad.h>
@@ -562,6 +563,13 @@ int mesh_quiet_ms(void);
 bool mesh_send_reliable(uint8_t type, const void* payload, int len);
 int mesh_recv_reliable(int* from, uint8_t* type, void* payload, int max);
 
+/* The resync's two mesh messages (net.c "resync"): the leader's announcement
+ * of a snapshot, and a receiver's answer once it has applied or refused it. */
+#define MESH_REL_RESYNC 0x06
+#define MESH_REL_RESYNC_ANSWER 0x07
+void net_resync_announce(int from, const uint8_t* payload, int len);
+void net_resync_answer(int from, const uint8_t* payload, int len);
+
 /* A silent freeze: the transmit timer notices the game thread has stopped
  * ticking and asks it for a stack (src/pc/net_watchdog.c). */
 void net_watchdog_arm(void);
@@ -580,6 +588,11 @@ void snapshot_restore(const Snapshot* s);
 /* Non-NULL for missing/invalid simulation ranges. Normal builds provide
  * validated ELF, PE or Mach-O sections; fixtures can exercise the fallback. */
 const char* snapshot_state_region_missing(void);
+/* Everything a snapshot covers right now, in a snapshot's order: the first
+ * SNAPSHOT_FIXED_REGIONS are fixed (heap descriptors, statics), then one per
+ * live heap. */
+#define SNAPSHOT_FIXED_REGIONS 4
+int snapshot_regions_now(Region* r);
 Snapshot* snap_slot(int32_t f); /* rollback ring entry for frame f */
 /* Size and page in every rollback slot for the state as it stands, so the
  * first predicted frame pays neither the allocation nor the faults. */

@@ -243,6 +243,46 @@ uint8_t pc_net_mesh_live(void); /* human ports still in, this one included */
 int pc_net_mesh_recv(int* from, uint8_t* type, void* payload, int max);
 bool pc_net_mesh_send_to(int port, uint8_t type, const void* payload, int len);
 
+/* Desync resync over a mesh (net.c "resync", net_resync.h). When the acting
+ * leader sees a desync it snapshots its own state at a frame S that is final
+ * there, calls the hook with PC_NET_RESYNC_SNAPSHOT (size, S), and holds
+ * before S until every other phone has applied it (or 30 s). The caller moves
+ * the image (pc_net_resync_image) to the others, which hand it over with
+ * pc_net_resync_offer; each restores it, re-runs what it had simulated past
+ * S, and calls the hook with PC_NET_RESYNC_APPLIED (S, its frame); the leader
+ * calls it with PC_NET_RESYNC_RELEASED (S, the ports that applied it) when its
+ * hold ends. At most three snapshots a session. */
+enum { PC_NET_RESYNC_SNAPSHOT = 1, PC_NET_RESYNC_APPLIED = 2, PC_NET_RESYNC_RELEASED = 3 };
+typedef void (*PcNetResyncHook)(int event, int32_t a, int32_t b);
+void pc_net_set_resync_hook(PcNetResyncHook hook);
+/* The leader asks for a snapshot as a desync would: 0 asked (or one is
+ * coming), -1 not the acting leader of a mesh, or none left. */
+int pc_net_resync_request(void);
+/* The leader's last image, NULL none; valid until the next one or session. */
+const uint8_t* pc_net_resync_image(size_t* len, int32_t* frame);
+/* A receiver: room for an image of len bytes, to write and then offer. */
+uint8_t* pc_net_resync_reserve(size_t len);
+/* A receiver: an image the leader took at `frame`. 0 taken (applied at the
+ * right point; the hook says when), or why not: */
+enum {
+    PC_NET_RESYNC_ERR_SESSION = 1,    /* no mesh session */
+    PC_NET_RESYNC_ERR_IMAGE = 2,      /* not an image, or a damaged one (checksum) */
+    PC_NET_RESYNC_ERR_SESSION_ID = 3, /* another session's */
+    PC_NET_RESYNC_ERR_FRAME = 4,      /* its frame is not `frame` */
+    PC_NET_RESYNC_ERR_LAYOUT = 5,     /* another memory layout: another build, or heaps */
+    PC_NET_RESYNC_ERR_SCENE = 6,      /* another scene */
+    PC_NET_RESYNC_ERR_LATE = 7,       /* this phone is too far past the frame */
+    PC_NET_RESYNC_ERR_OURS = 8,       /* this phone took it */
+};
+int pc_net_resync_offer(const uint8_t* bytes, size_t len, int32_t frame);
+/* state: 0 none, 1 the leader waiting for a final frame, 2 the leader holding,
+ * 3 a receiver waiting for the bytes or to apply them; count: snapshots taken
+ * (leader) or applied (receiver); last: the frame of the last, -1 none. */
+void pc_net_resync_counts(int* state, int* count, int32_t* last);
+/* Frame f is final here: every remote input for it real, nothing waiting to
+ * be rolled back, not inside a re-run. */
+bool pc_net_frame_final(int32_t f);
+
 typedef struct PcNetCounters {
     int ping_ms;            /* smoothed round trip */
     int delay;              /* input delay in frames */

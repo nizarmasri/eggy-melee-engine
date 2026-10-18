@@ -39,8 +39,10 @@
 #include <SDL3/SDL_hints.h>
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wscalar-storage-order" /* disc-struct unions in lb/types.h */
+#include <melee/ft/fighter.h>
 #include <melee/ft/forward.h>
 #include <melee/ft/ftlib.h>
+#include <melee/ft/inlines.h>
 #include <melee/gm/gm_1601.h>
 #include <melee/gm/gm_1A3F.h>
 #include <melee/gm/gm_1B03.h>
@@ -80,11 +82,14 @@ enum {
     JS_DESYNC = 5,
     JS_PEER_LOST = 6,
     JS_AWAY = 7,
+    JS_SNAPSHOT = 8,
+    JS_RESYNC = 9,
 };
 
 // clang-format off
 EM_JS(void, eggy_js_state, (int kind, int a, int b), {
-  const names = ['parked', 'loaded', 'ended', 'error', 'net-error', 'desync', 'peer-lost', 'away'];
+  const names = ['parked', 'loaded', 'ended', 'error', 'net-error', 'desync', 'peer-lost', 'away',
+                 'snapshot', 'resync'];
   const eggy = Module['eggy'];
   if (eggy && typeof eggy.onState === 'function') {
     try {
@@ -119,6 +124,7 @@ static int32_t s_results_ticks;
 static int s_matches;
 static StartMeleeData s_start;            /* as built, for sudden death */
 static PADStatus s_pads[EGGY_PORTS];      /* the page's, for the next pad samples */
+static bool s_test_desync;                /* eggy_test_desync, waiting for a safe tick */
 static PADStatus s_tick_pads[EGGY_PORTS]; /* as the last tick simulated them */
 
 bool pc_eggy_enabled(void) {
@@ -348,10 +354,14 @@ static void build_match(StartMeleeData* start) {
     s_start = *start;
 }
 
+static void net_resync_event(int event, int32_t a, int32_t b);
+
 /* Netplay: open the session for the config just taken (eggy_net.c), the
  * game thread yielding every frame. 0 when it is up, -1 when the page
  * aborted, else the EggyNetError (the session is closed either way). */
 static int net_open(void) {
+    pc_net_set_resync_hook(net_resync_event);
+    s_test_desync = false;
     eggy_net_begin(&s_cfg);
     for (;;) {
         if (s_abort) {
@@ -457,6 +467,18 @@ static void net_away_report(void) {
     }
 }
 
+/* The netcode's resync events (net.c "resync"): the leader's snapshot is
+ * ready for the page to send; this phone has applied the leader's; or, on the
+ * leader, the hold for it is over. 'resync' says this phone plays on from the
+ * leader's state of that frame. */
+static void net_resync_event(int event, int32_t a, int32_t b) {
+    if (event == PC_NET_RESYNC_SNAPSHOT) {
+        eggy_js_state(JS_SNAPSHOT, a, b); /* size, frame */
+    } else if (event == PC_NET_RESYNC_APPLIED || event == PC_NET_RESYNC_RELEASED) {
+        eggy_js_state(JS_RESYNC, a, s_serial); /* frame */
+    }
+}
+
 /* Netplay's hold: until every phone is loaded and every page said go
  * (eggy_net.c). A failure unwinds the loaded scene as an abort does. */
 static void net_hold(void) {
@@ -536,6 +558,25 @@ void pc_eggy_scene_begin(int scene_kind) {
     set_state(EGGY_STATE_FIGHTING);
 }
 
+/* eggy_test_desync (MELEE_EGGY_TEST=1): this phone's own fighter takes 10%
+ * the other phones never simulate, on a tick no rollback can undo, so this
+ * phone's match parts from theirs from here on: a real desync for the resync
+ * to repair, on demand. */
+static void test_desync_apply(void) {
+    if (!s_test_desync || !s_scene_live || !pc_net_frame_final(pc_net_frame())) {
+        return;
+    }
+    HSD_GObj* gobj = Player_GetEntity(s_cfg.local_port);
+    if (gobj == NULL || gobj->classifier != HSD_GOBJ_CLASS_FIGHTER) {
+        return;
+    }
+    Fighter* fp = GET_FIGHTER(gobj);
+    fp->dmg.x1830_percent += 10.0f;
+    s_test_desync = false;
+    pc_log_line("eggy: test desync, port %d's percent moved on this phone alone at frame %d",
+        s_cfg.local_port, pc_net_frame());
+}
+
 void pc_eggy_after_tick(void) {
     if (!pc_eggy_enabled()) {
         return;
@@ -553,6 +594,7 @@ void pc_eggy_after_tick(void) {
         }
         if (s_cfg.netplay && fresh) {
             net_tick();
+            test_desync_apply();
         }
         if (s_abort && fresh) {
             if (s_cfg.netplay) {
@@ -808,6 +850,59 @@ EMSCRIPTEN_KEEPALIVE uint32_t eggy_checksum(void) {
 
 EMSCRIPTEN_KEEPALIVE const int32_t* eggy_net_stats(void) {
     return eggy_net_stats_words();
+}
+
+/* ---- resync (EGGY.md "Resync") ---- */
+
+static bool netplay_running(void) {
+    return pc_eggy_enabled() && s_cfg.netplay && pc_net_active();
+}
+
+/* The leader: a snapshot as a desync would ask for one. 0 asked ('snapshot'
+ * follows at the next frame that is final), -1 not the acting leader of a
+ * running match, or the match's three are spent. */
+EMSCRIPTEN_KEEPALIVE int eggy_snapshot_begin(void) {
+    return netplay_running() ? pc_net_resync_request() : -1;
+}
+
+EMSCRIPTEN_KEEPALIVE int eggy_snapshot_size(void) {
+    size_t len = 0;
+    pc_net_resync_image(&len, NULL);
+    return (int)len;
+}
+
+EMSCRIPTEN_KEEPALIVE const uint8_t* eggy_snapshot_buffer(void) {
+    return pc_net_resync_image(NULL, NULL);
+}
+
+EMSCRIPTEN_KEEPALIVE int32_t eggy_snapshot_frame(void) {
+    int32_t frame = -1;
+    pc_net_resync_image(NULL, &frame);
+    return frame;
+}
+
+/* A receiver: room for len bytes of the leader's image, NULL if none. */
+EMSCRIPTEN_KEEPALIVE uint8_t* eggy_snapshot_reserve(int len) {
+    return len > 0 ? pc_net_resync_reserve((size_t)len) : NULL;
+}
+
+/* A receiver: the reassembled image of `frame`. 0 taken ('resync' follows
+ * once it is applied), or a PC_NET_RESYNC_ERR_* (EGGY.md). */
+EMSCRIPTEN_KEEPALIVE int eggy_snapshot_apply(const uint8_t* ptr, int len, int32_t frame) {
+    if (!netplay_running()) {
+        return PC_NET_RESYNC_ERR_SESSION;
+    }
+    return len > 0 ? pc_net_resync_offer(ptr, (size_t)len, frame) : PC_NET_RESYNC_ERR_IMAGE;
+}
+
+/* MELEE_EGGY_TEST=1 only: make this phone desync (test_desync_apply). */
+EMSCRIPTEN_KEEPALIVE int eggy_test_desync(void) {
+    const char* on = getenv("MELEE_EGGY_TEST");
+    if (on == NULL || on[0] != '1' || !netplay_running() || s_state != EGGY_STATE_FIGHTING) {
+        return 0;
+    }
+    s_test_desync = true;
+    return 1;
 }
 
 EMSCRIPTEN_KEEPALIVE void eggy_audio(int music_volume, int sfx_volume) {

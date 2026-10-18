@@ -54,13 +54,17 @@
  *   [0] state: 0 none, 1 waiting for the page's links, 2 handshaking, 3 loading
  *       and holding, 4 playing, 5 closing, 6 closed, 7 failed
  *   [1] ping ms (the worst phone's), [2] input delay, [3] rollbacks,
- *   [4] deepest rollback, [5] desyncs (0/1: the first one is reported),
+ *   [4] deepest rollback, [5] desyncs reported (each resync re-arms it),
  *   [6] frames stalled on the other phones, [7] link quality 0 stable ..
  *   2 stalling
  *   [8 + port] that port's phone: 0 not a phone of the match, 1 this phone,
  *       2 not heard from yet, 3 playing, 4 silent (about to be settled away),
  *       5 settled away, 6 another engine build (net-error 7)
  *   [12 + port] ping ms to that port's phone, -1 none
+ *   [16] resync: 0 none, 1 the leader waiting for a final frame, 2 the leader
+ *        holding for the others, 3 waiting for the leader's snapshot
+ *   [17] snapshots taken (the leader) or applied, [18] the last one's frame
+ *        (-1 none), [19] reserved, 0
  *
  * HUD (int32 words at eggy_hud(), current at every tick):
  *   [0] state: 0 parked, 1 loading, 2 loaded (held at frame 0), 3 fighting,
@@ -97,7 +101,7 @@ extern "C" {
 #define EGGY_HUD_PORT_BASE 3
 #define EGGY_RESULTS_WORDS (2 + 8 * EGGY_PORTS)
 #define EGGY_RESULTS_PORT_BASE 2
-#define EGGY_NET_STATS_WORDS 16
+#define EGGY_NET_STATS_WORDS 20
 #define EGGY_NET_PHONES_MIN 2
 #define EGGY_NET_PHONES_MAX 4
 
@@ -226,6 +230,13 @@ void eggy_audio(int music_volume, int sfx_volume);
 int eggy_costumes(int ckind);
 int eggy_team_costume(int ckind, int team);
 const int32_t* eggy_net_stats(void);
+int eggy_snapshot_begin(void);
+int eggy_snapshot_size(void);
+const uint8_t* eggy_snapshot_buffer(void);
+int32_t eggy_snapshot_frame(void);
+uint8_t* eggy_snapshot_reserve(int len);
+int eggy_snapshot_apply(const uint8_t* ptr, int len, int32_t frame);
+int eggy_test_desync(void);
 
 /* ---- hooks the engine calls -------------------------------------------- */
 

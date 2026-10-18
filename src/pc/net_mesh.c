@@ -639,6 +639,12 @@ static bool deliver(int from, const MeshRel* r) {
     case MESH_REL_AWAY:
         on_away(from, r->payload, r->len);
         return true;
+    case MESH_REL_RESYNC:
+        net_resync_announce(from, r->payload, r->len);
+        return true;
+    case MESH_REL_RESYNC_ANSWER:
+        net_resync_answer(from, r->payload, r->len);
+        return true;
     case REL_DELAY:
         net_delay_rel(r->payload, r->len);
         return true;

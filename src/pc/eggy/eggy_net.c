@@ -77,8 +77,9 @@ static struct {
     uint64_t hold_t0;
     bool done_sent;
     uint8_t done_got;
-    bool desync_seen;
-    uint8_t away_told; /* ports whose 'away' was reported */
+    int32_t desync_told; /* the desync frame last reported, -1 none */
+    int desyncs;         /* reported this match */
+    uint8_t away_told;   /* ports whose 'away' was reported */
     int32_t stats[EGGY_NET_STATS_WORDS];
 } s;
 
@@ -93,7 +94,7 @@ static void stats_refresh(void) {
         s.stats[2] = c.delay;
         s.stats[3] = (int32_t)c.rollbacks;
         s.stats[4] = c.rollback_depth_max;
-        s.stats[5] = c.desync_frame >= 0 ? 1 : 0;
+        s.stats[5] = s.desyncs;
         s.stats[6] = (int32_t)c.stalls;
         s.stats[7] = c.quality;
     }
@@ -102,6 +103,12 @@ static void stats_refresh(void) {
         s.stats[8 + port] = pc_net_mesh_link(port);
         s.stats[12 + port] = pc_net_mesh_ping_ms(port);
     }
+    int state, count;
+    int32_t last;
+    pc_net_resync_counts(&state, &count, &last);
+    s.stats[16] = state;
+    s.stats[17] = count;
+    s.stats[18] = last;
 }
 
 static void set_state(int state) {
@@ -198,6 +205,8 @@ void eggy_net_begin(const EggyConfig* c) {
     for (int port = 0; port < EGGY_PORTS; port++) {
         s.stats[12 + port] = -1;
     }
+    s.stats[18] = -1;
+    s.desync_told = -1;
     set_state(EGGY_NET_LINK);
     pc_log_line("eggy: netplay on port %d of ports %x (%d phones, leader %d), session %08x, "
                 "delay %d",
@@ -356,8 +365,10 @@ int eggy_net_tick(int32_t* frame) {
     drain();
     stats_refresh();
     PcNetCounters c;
-    if (!s.desync_seen && pc_net_counters(&c) && c.desync_frame >= 0) {
-        s.desync_seen = true;
+    /* Once per desync: a resync clears it, and a new one is reported again. */
+    if (pc_net_counters(&c) && c.desync_frame >= 0 && c.desync_frame != s.desync_told) {
+        s.desync_told = c.desync_frame;
+        s.desyncs++;
         *frame = c.desync_frame;
         return 1;
     }

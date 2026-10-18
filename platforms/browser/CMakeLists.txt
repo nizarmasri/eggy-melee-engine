@@ -34,7 +34,7 @@ set(BROWSER_PC_SOURCES
  eggy/eggy.c eggy/eggy_config.c eggy/eggy_hold.c eggy/eggy_net.c
  android_compat.cpp music_stream.cpp textures.cpp
  net.c net_chat.c net_dht.c net_dht_item.c net_handshake.c net_identity.c net_lan.c net_match_web.c net_rank.c
- net_mesh.c net_mesh_wire.c net_rank_session.c net_rank_store.c net_reliable.c net_sfx.c net_sim.c net_snapshot.c net_sync.c net_watchdog.c net_web.c net_wire.c
+ net_mesh.c net_mesh_wire.c net_rank_session.c net_resync.c net_rank_store.c net_reliable.c net_sfx.c net_sim.c net_snapshot.c net_sync.c net_watchdog.c net_web.c net_wire.c
  libm/pc_atanf.c libm/pc_cosdf.c libm/pc_cosf.c libm/pc_perturb.c libm/pc_rank_exp.c libm/pc_rank_sqrt.c
  libm/pc_rem_pio2_large.c libm/pc_rem_pio2f.c libm/pc_sindf.c libm/pc_sinf.c libm/pc_tandf.c libm/pc_tanf.c)
 list(TRANSFORM BROWSER_PC_SOURCES PREPEND ${CMAKE_SOURCE_DIR}/src/pc/)
@@ -53,7 +53,9 @@ target_link_libraries(melee_browser PRIVATE aurora::core aurora::gx aurora::gd a
 # below, for its buffers), and every PADRead routed through src/pc/eggy/eggy.c
 # so the page owns input under MELEE_EGGY.
 set(EGGY_EXPORTS _eggy_config_buffer _eggy_load _eggy_go _eggy_pad _eggy_hud _eggy_results _eggy_abort
- _eggy_checksum _eggy_audio _eggy_costumes _eggy_team_costume _eggy_net_stats)
+ _eggy_checksum _eggy_audio _eggy_costumes _eggy_team_costume _eggy_net_stats
+ _eggy_snapshot_begin _eggy_snapshot_size _eggy_snapshot_buffer _eggy_snapshot_frame
+ _eggy_snapshot_reserve _eggy_snapshot_apply _eggy_test_desync)
 list(JOIN EGGY_EXPORTS "," EGGY_EXPORTS)
 # MELEE_STATE_SECTIONS: the netplay snapshot ranges (tools/browser/wasm_state_sections.py).
 target_compile_definitions(melee_browser PRIVATE TARGET_PC=1 MELEE_PC=1 MELEE_USE_BUILTIN_SHA1 MELEE_STATE_SECTIONS=1)

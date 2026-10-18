@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      # src/pc/eggy/eggy_config.c, eggy_hold.c and src/pc/net_mesh_wire.c are
+      # src/pc/eggy/eggy_config.c, eggy_hold.c, src/pc/net_mesh_wire.c and net_resync.c are
       # pure C (no game or session state), so the host compiler builds them
       # against their tests.
       - run: |
@@ -49,6 +49,9 @@ jobs:
           gcc -std=c11 -O1 -Wall -Wextra -Werror -Isrc tests/eggy/eggy_mesh_test.c \
             src/pc/net_mesh_wire.c -o build/eggy_mesh_test
           build/eggy_mesh_test
+          gcc -std=c11 -O1 -Wall -Wextra -Werror -Isrc tests/eggy/eggy_resync_test.c \
+            src/pc/net_resync.c -o build/eggy_resync_test
+          build/eggy_resync_test
 
   web-unit:
     name: Web app unit tests
