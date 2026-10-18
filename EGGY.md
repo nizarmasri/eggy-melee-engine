@@ -477,9 +477,10 @@ settle it away (below) and play on; with no other phone left, a phone gets
 ### Away
 
 From the hold on, a phone that goes silent is settled away. Silent means: its
-BYE arrived, or nothing has been heard from it and nothing new of its input has
-reached anyone (relayed, or in another phone's report) for 1.5 s; while it is
-still loading a scene (before that scene's first frames of its input), 120 s.
+BYE arrived, or `status(port)` says -1 (the link failed for good), or nothing
+has been heard from it and nothing new of its input has reached anyone
+(relayed, or in another phone's report) for 1.5 s; while it is still loading a
+scene (before that scene's first frames of its input), 120 s.
 
 - The acting leader settles it: the lowest human port not settled and not
   silent to that phone. If the leader itself goes silent, the next lowest phone

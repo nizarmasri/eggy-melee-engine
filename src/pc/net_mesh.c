@@ -970,6 +970,13 @@ uint8_t pc_net_mesh_live(void) {
     return (uint8_t)(mask | mesh_scene_peers());
 }
 
+void pc_net_mesh_gone(int port) {
+    if (m.open && is_peer(port) && !m.peer[port].bye) {
+        m.peer[port].bye = true; /* as its BYE: settled once its last frames stop moving */
+        pc_log_line("net: the link to port %d failed at frame %d", port + 1, net.frame);
+    }
+}
+
 int pc_net_mesh_recv(int* from, uint8_t* type, void* payload, int max) {
     return mesh_recv_reliable(from, type, payload, max);
 }

@@ -136,6 +136,16 @@ static uint8_t others_live(void) {
     return (uint8_t)(pc_net_mesh_live() & s.others);
 }
 
+/* A link the page reports failed is that phone gone: no 1.5 s (or, while
+ * it loads, 120 s) of silence to wait out first. */
+static void links_check(void) {
+    for (int port = 0; port < EGGY_PORTS; port++) {
+        if ((s.others & (1u << port)) && eggy_link_status(port) == LINK_FAILED) {
+            pc_net_mesh_gone(port);
+        }
+    }
+}
+
 static uint8_t away_mask(void) {
     uint8_t away = 0;
     for (int port = 0; port < EGGY_PORTS; port++) {
@@ -289,6 +299,7 @@ int eggy_net_hold_step(bool go, bool* loaded) {
         s.hold_t0 = now;
         pc_net_mesh_arm(); /* a phone silent from here on is settled away */
     }
+    links_check();
     pc_net_poll_parked();
     if (!pc_net_active()) {
         return fail(peer_error());
@@ -341,6 +352,7 @@ int eggy_net_tick(int32_t* frame) {
         set_state(EGGY_NET_FAILED);
         return -1;
     }
+    links_check();
     drain();
     stats_refresh();
     PcNetCounters c;

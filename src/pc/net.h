@@ -235,7 +235,10 @@ int pc_net_mesh_ping_ms(int port); /* -1 none yet */
  * this phone's own port: the others settled it, and it has left. Kept after
  * the session closes, until the next connect. */
 bool pc_net_mesh_away(int port, int32_t* frame);
-int pc_net_mesh_leader(void);   /* the acting leader's port */
+int pc_net_mesh_leader(void); /* the acting leader's port */
+/* The caller's link to that port's phone has failed for good: the phone is
+ * treated as having said BYE. */
+void pc_net_mesh_gone(int port);
 uint8_t pc_net_mesh_live(void); /* human ports still in, this one included */
 int pc_net_mesh_recv(int* from, uint8_t* type, void* payload, int max);
 bool pc_net_mesh_send_to(int port, uint8_t type, const void* payload, int len);
