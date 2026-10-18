@@ -75,9 +75,13 @@ jobs:
       - name: Install the pinned Emscripten SDK
         run: python3 tools/browser/setup_sdk.py 2>&1 | tee "$LOGS/setup_sdk.log"
 
-      # Public runners have 4 cores.
+      # __DATE__ and __TIME__ (aurora's card.cpp logs them) come from the
+      # commit instead of the clock, so one commit always builds the same
+      # bytes. Public runners have 4 cores.
       - name: Build the engine
-        run: python3 tools/browser/build.py --jobs 4 2>&1 | tee "$LOGS/build.log"
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          python3 tools/browser/build.py --jobs 4 2>&1 | tee "$LOGS/build.log"
 
       - name: Collect the release and engine.json
         run: |
@@ -85,7 +89,8 @@ jobs:
             --out build/eggy-release --logs "$LOGS" 2>&1 | tee "$LOGS/release.log"
           ls -l build/eggy-release | tee -a "$LOGS/release.log"
 
-      # A re-run of the same commit replaces the assets in place.
+      # A release is never replaced: Eggy pins its files by sha256. A re-run of
+      # the same commit only reports whether it rebuilt the same bytes.
       - name: Publish the release engine-<shortsha>
         env:
           GH_TOKEN: ${{ github.token }}
@@ -93,13 +98,18 @@ jobs:
         run: |
           tag="engine-${GITHUB_SHA::7}"
           if gh release view "$tag" > /dev/null 2>&1; then
-            gh release upload "$tag" build/eggy-release/* --clobber
+            gh release download "$tag" -p engine.json -O build/published-engine.json --clobber
+            if diff <(jq -S .files build/published-engine.json) <(jq -S .files build/eggy-release/engine.json); then
+              echo "$tag exists; this rebuild produced the same files, nothing to publish." | tee -a "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::warning::$tag exists and this rebuild differs from it (diff above); the published release is kept."
+            fi
           else
             gh release create "$tag" build/eggy-release/* --target "$GITHUB_SHA" \
               --title "$tag" --notes-file build/eggy-release-notes.md
+            cat build/eggy-release-notes.md >> "$GITHUB_STEP_SUMMARY"
           fi
           echo "https://github.com/$GH_REPO/releases/tag/$tag" | tee -a "$GITHUB_STEP_SUMMARY"
-          cat build/eggy-release-notes.md >> "$GITHUB_STEP_SUMMARY"
 
       # compile_game.py writes one log per game unit; only the non-empty ones
       # say anything.
