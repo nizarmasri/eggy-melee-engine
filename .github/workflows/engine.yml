@@ -1,0 +1,119 @@
+name: Engine
+
+# The browser engine for Eggy, built with no disc anywhere and published as the
+# GitHub release engine-<shortsha>. It is melee-web's own build
+# (tools/browser/build.py: the lowering oracle tests, the game, aurora, the
+# link and the node tests), then tools/eggy/engine_release.py, which collects
+# what bundle.py would ship minus melee.pak and writes engine.json. bundle.py
+# itself is never run: it needs a disc. Modelled on upstream melee-pc's
+# pages.yml, which builds the same target.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write # the release
+
+# A started build runs to its release; a newer push waits behind it.
+concurrency:
+  group: engine
+  cancel-in-progress: false
+
+defaults:
+  run:
+    # Explicit bash adds -o pipefail, so `| tee` cannot hide a failed build.
+    shell: bash
+
+jobs:
+  engine:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      # tools/browser/common.py: disc_lower is built against LLVM 22's
+      # LibTooling from here, and its clang preprocesses the game.
+      LLVM_ROOT: /usr/lib/llvm-22
+      LOGS: ${{ github.workspace }}/logs
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      # build_lower.py links disc_lower.cpp with -lclang-cpp -lLLVM against the
+      # clang/ and llvm/ headers. test_disc_lower.py takes the newest gcc-NN
+      # (12+) on PATH as its scalar_storage_order oracle; gcc-14 is named so a
+      # runner image change cannot drop it.
+      - name: Install LLVM 22 with LibTooling, GCC 14, Ninja and brotli
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh
+          sudo bash llvm.sh 22
+          sudo apt-get install -y --no-install-recommends \
+            clang-22 libclang-22-dev libclang-cpp22-dev llvm-22-dev gcc-14 ninja-build brotli
+
+      - name: Show the toolchain
+        run: |
+          mkdir -p "$LOGS"
+          {
+            "$LLVM_ROOT/bin/clang" --version
+            ls -l "$LLVM_ROOT"/lib/libclang-cpp.so "$LLVM_ROOT"/lib/libLLVM.so
+            gcc-14 --version | head -1
+            cmake --version | head -1
+            echo "ninja $(ninja --version)"
+            python3 --version
+            brotli --version
+          } 2>&1 | tee "$LOGS/toolchain.txt"
+
+      # The SDK is about a gigabyte, and the first build adds the compiled
+      # system libraries and the emdawnwebgpu port to its cache folder, so
+      # caching it keyed on the pin skips both on every later run.
+      - name: Read the pinned Emscripten version
+        id: emsdk
+        run: echo "version=$(cd tools/browser && python3 -c 'import common; print(common.EMSCRIPTEN_VERSION)')" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: build/browser/emsdk
+          key: emsdk-${{ runner.os }}-${{ steps.emsdk.outputs.version }}
+      - name: Install the pinned Emscripten SDK
+        run: python3 tools/browser/setup_sdk.py 2>&1 | tee "$LOGS/setup_sdk.log"
+
+      # Public runners have 4 cores.
+      - name: Build the engine
+        run: python3 tools/browser/build.py --jobs 4 2>&1 | tee "$LOGS/build.log"
+
+      - name: Collect the release and engine.json
+        run: |
+          python3 tools/eggy/engine_release.py --commit "$GITHUB_SHA" \
+            --out build/eggy-release --logs "$LOGS" 2>&1 | tee "$LOGS/release.log"
+          ls -l build/eggy-release | tee -a "$LOGS/release.log"
+
+      # A re-run of the same commit replaces the assets in place.
+      - name: Publish the release engine-<shortsha>
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="engine-${GITHUB_SHA::7}"
+          if gh release view "$tag" > /dev/null 2>&1; then
+            gh release upload "$tag" build/eggy-release/* --clobber
+          else
+            gh release create "$tag" build/eggy-release/* --target "$GITHUB_SHA" \
+              --title "$tag" --notes-file build/eggy-release-notes.md
+          fi
+          echo "https://github.com/$GH_REPO/releases/tag/$tag" | tee -a "$GITHUB_STEP_SUMMARY"
+          cat build/eggy-release-notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      # compile_game.py writes one log per game unit; only the non-empty ones
+      # say anything.
+      - name: Keep the compile logs
+        if: always()
+        run: |
+          mkdir -p "$LOGS/game"
+          if [ -d build/browser/game ]; then
+            cp build/browser/game/report*.json "$LOGS/game/" 2>/dev/null || true
+            (cd build/browser/game && find . -name '*.log' -size +0c -exec cp --parents {} "$LOGS/game/" \;)
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: engine-logs-${{ github.sha }}
+          path: logs
+          if-no-files-found: warn
