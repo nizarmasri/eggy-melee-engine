@@ -163,8 +163,8 @@ int eggy_team_costume(int ckind, int team);
 bool pc_eggy_enabled(void);
 /* platforms/browser/main.c, before aurora_initialize: SDL listens to no key. */
 void pc_eggy_preinit(void);
-/* src/pc/vi.c: parked, loading or held, the frame boundary presents the last
- * picture again instead of a new one. */
+/* src/pc/vi.c: parked, the frame boundary presents the last picture again
+ * instead of clearing it. */
 bool pc_eggy_hold_frame(void);
 /* gmscene.c gm_801A4D34, before the first tick of a scene: a match being
  * loaded holds here, at frame 0, until eggy_go(). */

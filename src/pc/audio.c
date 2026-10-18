@@ -848,7 +848,7 @@ EM_JS(int, web_audio_start, (float* ring, unsigned frames, void* write_idx, void
   const inline = () => ctx.audioWorklet.addModule(
     URL.createObjectURL(new Blob([source], { type: 'text/javascript' })));
   const file = Module.meleeAudioWorkletUrl || (typeof Module.locateFile === 'function' ?
-    Module.locateFile('melee-audio.worklet.js', typeof scriptDirectory === 'string' ? scriptDirectory : '') : '');
+    Module.locateFile('melee-audio.worklet.js', typeof scriptDirectory === 'string' ? scriptDirectory : "") : "");
   const loaded = file ? ctx.audioWorklet.addModule(file).catch((e) => {
     err('audio: ' + file + ' did not load (' + e + '); trying the inline worklet');
     return inline();

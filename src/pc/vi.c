@@ -243,7 +243,7 @@ void pc_frame_boundary(void) {
     pc_menu_update();
     /* Nothing draws while the overlay pauses the game, so hold the last
      * frame instead of clearing the EFB to black underneath the menu. The
-     * same while MELEE_EGGY parks or holds a match at frame 0 (src/pc/eggy). */
+     * same while MELEE_EGGY is parked between matches (src/pc/eggy). */
     aurora_preserve_frame_buffer(pc_menu_is_open() || pc_eggy_hold_frame());
     pc_keyboard_apply();
 #ifdef __EMSCRIPTEN__

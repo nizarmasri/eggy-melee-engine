@@ -135,8 +135,10 @@ static bool fighting(void) {
 }
 
 bool pc_eggy_hold_frame(void) {
-    return pc_eggy_enabled() && (s_state == EGGY_STATE_PARKED || s_state == EGGY_STATE_ERROR ||
-                                    s_state == EGGY_STATE_LOADING || s_state == EGGY_STATE_LOADED);
+    /* Parked, the last picture (GAME! or the results screen) stays up. Not
+     * while a match loads or holds: those frames clear to black, so frame 0
+     * draws into a cleared colour and depth buffer, not over the last one. */
+    return pc_eggy_enabled() && (s_state == EGGY_STATE_PARKED || s_state == EGGY_STATE_ERROR);
 }
 
 bool pc_eggy_music_off(void) {
@@ -452,6 +454,9 @@ static void finish(const MatchEnd* end) {
     int outcome = s_sudden_death                  ? EGGY_OUTCOME_SUDDEN_DEATH :
                   end->outcome == OUTCOME_TIMEOUT ? EGGY_OUTCOME_TIME_OUT :
                                                     EGGY_OUTCOME_NORMAL;
+    if (s_end_frame == 0) {
+        s_end_frame = s_frame_base; /* no GAME! was called: the last tick */
+    }
     fill_results(end, outcome);
     set_state(EGGY_STATE_ENDED);
     hud_update();
@@ -485,6 +490,10 @@ static void enter_sudden_death(GameModeState* state) {
      * VS mode's saved data. */
     StartMeleeData* start = gm_GetGameModeStateEnterData(state);
     *start = s_start;
+    /* VS mode sets these two on the VS scene's copy only (gmVsMelee_EnterVs),
+     * so its sudden death runs without them. */
+    start->rules.is_vs = false;
+    start->rules.is_stock = false;
     gm_SetupSuddenDeath(start, &gmVsMelee_VsExitInfo.match_end);
 }
 

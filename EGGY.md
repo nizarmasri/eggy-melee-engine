@@ -31,8 +31,9 @@ worklet loads from a same-origin file (see Sound).
 
 ## Call order
 
-1. `callMain([])`. The engine boots and parks: it renders nothing new, yields
-   to the browser every frame, and calls `onState('parked', 0, 0)`.
+1. `callMain([])`. The engine boots and parks: it renders nothing new (the
+   last picture stays up), yields to the browser every frame, and calls
+   `onState('parked', 0, 0)`.
 2. The page writes a config (layout below) at `HEAP32[_eggy_config_buffer() >> 2]`
    and calls `_eggy_load(serial)`.
    - It returns 0 if the config is accepted. Otherwise it returns an error code
@@ -40,8 +41,9 @@ worklet loads from a same-origin file (see Sound).
    - The page may load before the first `parked`. The engine takes the config
      when it gets there.
 3. The engine loads the stage and fighters (`readDisc`) and enters the VS
-   scene. With the first tick of the match next, it holds, still yielding every
-   frame and presenting nothing new, and calls `onState('loaded', serial, 0)`.
+   scene. With the first tick of the match next, it holds: it still yields
+   every frame, the simulation does not advance and nothing is drawn (the
+   canvas shows black), and it calls `onState('loaded', serial, 0)`.
 4. `_eggy_go()` releases it. Melee's own READY... GO! plays. `eggy_go` is
    latched: called while loading, it takes effect the moment the match is
    loaded (`loaded` is still reported first).
@@ -62,6 +64,37 @@ All exports latch requests. The game thread acts on them at its next frame
 boundary or tick, so any of them may be called whenever the engine has
 yielded, including from inside `onState`.
 
+A minimal driver: Fox (human, port 1) against a level 9 Falco on Final
+Destination, 4 stocks, 8 minutes, items off.
+
+```js
+let serial = 0;
+Module.eggy = {
+  onState(name, a, b) {
+    if (name === 'parked') {
+      const w = new Int32Array(48);
+      w.set([1, 12345, 32, 0, 4, 8, -1, -1, -1, 0, 1, 1, 1, 100, 127, 0]);
+      w.set([1, 2, 0, 0, 0, 0, 0, 0], 16);  // port 1: human Fox, costume 0
+      w.set([3, 20, 0, 0, 9, 0, 0, 0], 24); // port 2: CPU Falco, level 9
+      Module.HEAP32.set(w, Module._eggy_config_buffer() >> 2);
+      Module._eggy_load(++serial);
+    } else if (name === 'loaded') {
+      Module._eggy_go();
+    } else if (name === 'ended') {
+      const r = new Int32Array(Module.HEAP32.buffer, Module._eggy_results(), 34);
+      console.log('outcome', a, 'end frame', r[0], 'P1 placement', r[3]);
+    } else if (name === 'error') {
+      console.log('config refused at word', a - 1);
+    }
+  },
+};
+// Each frame: Module._eggy_pad(0, buttons, sx, sy, cx, cy, l, r);
+```
+
+`Module.HEAP32` and `Module.HEAPU8` are exported runtime views. Emscripten
+replaces them when memory grows, so take them fresh at each use rather than
+keeping a view across frames.
+
 ## Exports
 
 | Function | Returns | |
@@ -79,6 +112,7 @@ yielded, including from inside `onState`.
 | `int eggy_team_costume(int ckind, int team)` | the costume a team wears | what character select dresses a team in |
 
 They are `Module._eggy_*` (EXPORTED_FUNCTIONS in `platforms/browser/CMakeLists.txt`).
+The pointers index `Module.HEAP32` as `ptr >> 2`.
 
 ## onState
 
@@ -326,7 +360,7 @@ unless all three environment variables are set.
 | `src/melee/gm/gmvs.c` | Zelda/Sheik hold-A swap off | the config names her outright |
 | `src/melee/gm/gm_1601.c` | `gm_GetNumCostumesForCKind` uncapped | every costume |
 | `src/melee/lb/lbaudio_ax.c` | `lbAudioAx_80023F28` returns early with music off | no music file read on that device |
-| `src/pc/vi.c` | the frame buffer is preserved while parked, loading or held | present nothing new |
+| `src/pc/vi.c` | the frame buffer is preserved while parked | the last picture stays up; a load or hold clears to black, so frame 0 draws into cleared buffers |
 | `src/pc/audio.c` | the worklet loads from a static file first; the page's AudioContext is used | Eggy's CSP; iOS's unlocked context (any page, not only `MELEE_EGGY`) |
 | `platforms/browser/main.c` | `pc_eggy_preinit()` before `aurora_initialize`; no memory card | SDL keyboard off; one card-absent save everywhere |
 | `platforms/browser/pc_stubs.c` | frozen stadium from the config, UCF forced on, wide HUD | fixed rules |

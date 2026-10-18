@@ -49,15 +49,16 @@ add_executable(melee_browser ${GAME_OBJECTS}
  ${BROWSER_PC_SOURCES})
 target_include_directories(melee_browser PRIVATE ${CMAKE_SOURCE_DIR}/extern/aurora/include ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/sdk_include ${CMAKE_SOURCE_DIR}/extern/monocypher)
 target_link_libraries(melee_browser PRIVATE aurora::core aurora::gx aurora::gd aurora::vi aurora::pad aurora::si aurora::mtx aurora::os aurora::card aurora::thp)
-# The Eggy host API (src/pc/eggy, EGGY.md): the page's calls, and every PADRead
-# routed through src/pc/eggy/eggy.c so the page owns input under MELEE_EGGY.
+# The Eggy host API (src/pc/eggy, EGGY.md): the page's calls (and HEAPU8/HEAP32,
+# below, for its buffers), and every PADRead routed through src/pc/eggy/eggy.c
+# so the page owns input under MELEE_EGGY.
 set(EGGY_EXPORTS _eggy_config_buffer _eggy_load _eggy_go _eggy_pad _eggy_hud _eggy_results _eggy_abort
  _eggy_checksum _eggy_audio _eggy_costumes _eggy_team_costume)
 list(JOIN EGGY_EXPORTS "," EGGY_EXPORTS)
 # MELEE_STATE_SECTIONS: the netplay snapshot ranges (tools/browser/wasm_state_sections.py).
 target_compile_definitions(melee_browser PRIVATE TARGET_PC=1 MELEE_PC=1 MELEE_USE_BUILTIN_SHA1 MELEE_STATE_SECTIONS=1)
 target_compile_options(melee_browser PRIVATE -Wno-incompatible-pointer-types -Wno-int-conversion ${MELEE_FP_FLAGS})
-target_link_options(melee_browser PRIVATE -O1 --profiling-funcs -sEMULATE_FUNCTION_POINTER_CASTS=1 -sSTACK_SIZE=8388608 -sINITIAL_MEMORY=268435456 -sMAXIMUM_MEMORY=2147483648 -sPTHREAD_POOL_SIZE=4 -sEXIT_RUNTIME=0 -sASSERTIONS=0 -lidbfs.js -sFORCE_FILESYSTEM=1 -Wl,--wrap=clock_gettime -Wl,--wrap=PADRead -sEXPORTED_FUNCTIONS=_main,_net_web_pump,${EGGY_EXPORTS} -sEXPORTED_RUNTIME_METHODS=callMain,FS,ENV -sINVOKE_RUN=0 -sASYNCIFY_IMPORTS=browser_disc_read -sASYNCIFY_STACK_SIZE=1048576 -sERROR_ON_UNDEFINED_SYMBOLS=1 -Wl,--error-limit=0)
+target_link_options(melee_browser PRIVATE -O1 --profiling-funcs -sEMULATE_FUNCTION_POINTER_CASTS=1 -sSTACK_SIZE=8388608 -sINITIAL_MEMORY=268435456 -sMAXIMUM_MEMORY=2147483648 -sPTHREAD_POOL_SIZE=4 -sEXIT_RUNTIME=0 -sASSERTIONS=0 -lidbfs.js -sFORCE_FILESYSTEM=1 -Wl,--wrap=clock_gettime -Wl,--wrap=PADRead -sEXPORTED_FUNCTIONS=_main,_net_web_pump,${EGGY_EXPORTS} -sEXPORTED_RUNTIME_METHODS=callMain,FS,ENV,HEAPU8,HEAP32 -sINVOKE_RUN=0 -sASYNCIFY_IMPORTS=browser_disc_read -sASYNCIFY_STACK_SIZE=1048576 -sERROR_ON_UNDEFINED_SYMBOLS=1 -Wl,--error-limit=0)
 set_target_properties(melee_browser PROPERTIES SUFFIX ".js")
 # emcc's single-pass link fails validation at -O2/-O3 when --fpcast-emu runs
 # ahead of the optimizer (direct calls into cast thunks keep the original
