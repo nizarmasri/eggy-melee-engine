@@ -36,7 +36,7 @@ jobs:
       LOGS: ${{ github.workspace }}/logs
       PYTHONUNBUFFERED: '1'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # build_lower.py links disc_lower.cpp with -lclang-cpp -lLLVM against the
       # clang/ and llvm/ headers. test_disc_lower.py takes the newest gcc-NN
@@ -68,7 +68,7 @@ jobs:
       - name: Read the pinned Emscripten version
         id: emsdk
         run: echo "version=$(cd tools/browser && python3 -c 'import common; print(common.EMSCRIPTEN_VERSION)')" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: build/browser/emsdk
           key: emsdk-${{ runner.os }}-${{ steps.emsdk.outputs.version }}
@@ -111,7 +111,7 @@ jobs:
             cp build/browser/game/report*.json "$LOGS/game/" 2>/dev/null || true
             (cd build/browser/game && find . -name '*.log' -size +0c -exec cp --parents {} "$LOGS/game/" \;)
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: engine-logs-${{ github.sha }}
