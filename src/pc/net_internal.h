@@ -559,6 +559,12 @@ void mesh_check_desync(void);
 void mesh_bye(uint8_t reason);
 bool mesh_announcer(void);
 uint8_t mesh_scene_peers(void);
+/* A resync holds the match (net_mesh_wire.h MESH_RESYNC_SILENCE_MS): on the
+ * leader from its snapshot until its hold ends (mesh_resync_release); on the
+ * others from its announcement until the leader's input moves past
+ * release_after, the newest frame it had written when it held. */
+void mesh_resync_hold(int leader, int32_t release_after);
+void mesh_resync_release(void);
 int mesh_quiet_ms(void);
 bool mesh_send_reliable(uint8_t type, const void* payload, int len);
 int mesh_recv_reliable(int* from, uint8_t* type, void* payload, int max);

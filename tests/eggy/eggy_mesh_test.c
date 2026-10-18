@@ -352,12 +352,24 @@ typedef struct SimPhone {
     int32_t evicted_frame;
     uint8_t away_owed[MESH_PORTS]; /* per destination: ports it still has to be told */
     int64_t last_decide, grace_until;
+    /* A resync (net.c "resync", net_mesh.c mesh_resync_hold): the leader
+     * holds, writing no frame, until every receiver has answered; each
+     * receiver's window runs from the announcement until the leader's input
+     * moves past rs_release. */
+    bool hold, rs_on, answered;
+    int rs_leader;
+    int32_t rs_release;
+    int64_t rs_since;
+    uint8_t rs_owed;  /* the leader: receivers not yet told */
+    bool answer_owed; /* a receiver: its answer not yet delivered */
+    uint8_t answers;  /* the leader: receivers that answered */
 } SimPhone;
 
 typedef struct SimEvent {
     int64_t at;
     int from, to;
     bool away;
+    int rs; /* 1 the resync announcement (frame: rs_release), 2 an answer */
     int port;      /* away */
     int32_t frame; /* away */
     int32_t have[MESH_PORTS];
@@ -374,6 +386,8 @@ static struct {
     int64_t now;
     int away_ms, load_ms;
     int32_t scene_lead; /* frames a phone needs before away_ms applies */
+    int window;         /* frames a phone runs past what it holds of the others; 0 any */
+    int64_t bytes_at;   /* when the snapshot's bytes reach the receivers, -1 never */
 } sim;
 
 static void sim_init(int n, int32_t start) {
@@ -383,6 +397,7 @@ static void sim_init(int n, int32_t start) {
     sim.away_ms = 1500;
     sim.load_ms = 8000;
     sim.scene_lead = 12;
+    sim.bytes_at = -1;
     for (int p = 0; p < n; p++) {
         SimPhone* ph = &sim.ph[p];
         ph->alive = true;
@@ -489,9 +504,45 @@ static void sim_send_aways(int a) {
     }
 }
 
+/* The resync's two reliable messages, resent every 200 ms until they land. */
+static void sim_send_resync(int a) {
+    SimPhone* pa = &sim.ph[a];
+    for (int b = 0; b < sim.n; b++) {
+        const bool announce = (pa->rs_owed >> b) & 1u;
+        const bool answer = b == pa->rs_leader && pa->answer_owed;
+        if (b == a || (!announce && !answer)) {
+            continue;
+        }
+        SimEvent e;
+        memset(&e, 0, sizeof e);
+        e.from = a;
+        e.to = b;
+        e.rs = announce ? 1 : 2;
+        e.frame = pa->rs_release;
+        sim_post(e);
+    }
+}
+
 static void sim_receive(const SimEvent* e) {
     SimPhone* pb = &sim.ph[e->to];
     if (!pb->alive) {
+        return;
+    }
+    if (e->rs == 1) { /* net.c net_resync_announce -> mesh_resync_hold */
+        pb->heard[e->from] = sim.now;
+        sim.ph[e->from].rs_owed &= (uint8_t) ~(1u << e->to);
+        if (!pb->rs_on || pb->rs_leader != e->from || pb->rs_release != e->frame) {
+            pb->rs_on = true;
+            pb->rs_leader = e->from;
+            pb->rs_release = e->frame;
+            pb->rs_since = sim.now;
+        }
+        return;
+    }
+    if (e->rs == 2) { /* net.c net_resync_answer */
+        pb->heard[e->from] = sim.now;
+        sim.ph[e->from].answer_owed = false;
+        pb->answers |= (uint8_t)(1u << e->from);
         return;
     }
     if (e->away) {
@@ -532,9 +583,6 @@ static void sim_decide(int self) {
         ph->grace_until = sim.now + sim.away_ms;
     }
     ph->last_decide = sim.now;
-    if (sim.now < ph->grace_until) {
-        return;
-    }
     /* net_mesh.c track_max */
     for (int p = 0; p < sim.n; p++) {
         if (p == self) {
@@ -551,6 +599,22 @@ static void sim_decide(int self) {
             ph->moved[p] = sim.now;
         }
     }
+    /* net_mesh.c service(): a resync's window ends once its leader has moved
+     * on (or is gone), and every silence is measured afresh from there. */
+    if (ph->rs_on) {
+        const int lead = ph->rs_leader;
+        const int32_t since = (int32_t)(sim.now - ph->rs_since);
+        const bool in = !sim_settled(ph, lead) && !(sim.ph[lead].bye && ph->heard[lead] >= 0);
+        if (lead == self ? since >= MESH_RESYNC_WINDOW_MS :
+                           mesh_resync_over(in, ph->last_max[lead], ph->rs_release, since))
+        {
+            ph->rs_on = false;
+            ph->grace_until = sim.now + sim.away_ms;
+        }
+    }
+    if (sim.now < ph->grace_until) {
+        return;
+    }
     for (int i = 0; i < MESH_PORTS; i++) {
         MeshAwayView v;
         memset(&v, 0, sizeof v);
@@ -560,6 +624,7 @@ static void sim_decide(int self) {
         v.away_ms = sim.away_ms;
         v.load_ms = sim.load_ms;
         v.stable_need_ms = 250;
+        v.resync = ph->rs_on;
         for (int p = 0; p < MESH_PORTS; p++) {
             v.have[p] = ph->have[p];
             for (int q = 0; q < MESH_PORTS; q++) {
@@ -582,6 +647,54 @@ static void sim_decide(int self) {
     }
 }
 
+/* With sim.window, a phone runs a frame only while it holds every other
+ * phone still in to within that many frames: rollback's window, so a phone
+ * that hears nothing of another stalls, as it does. */
+static bool sim_may_run(int p) {
+    const SimPhone* ph = &sim.ph[p];
+    if (sim.window == 0) {
+        return true;
+    }
+    for (int q = 0; q < sim.n; q++) {
+        if (q != p && !sim_settled(ph, q) && ph->have[q] < ph->wrote + 1 - sim.window) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The leader takes a snapshot and holds (net.c resync_point). */
+static void sim_resync_begin(int lead) {
+    SimPhone* ph = &sim.ph[lead];
+    ph->hold = true;
+    ph->rs_on = true;
+    ph->rs_leader = lead;
+    ph->rs_release = ph->wrote;
+    ph->rs_since = sim.now;
+    ph->rs_owed = (uint8_t)(sim.humans & ~ph->settled & ~(1u << lead));
+    ph->answers = 0;
+}
+
+/* The resync's progress each ms: a receiver answers once the bytes are in;
+ * the leader lets go once every phone still in has answered, or at 30 s. */
+static void sim_resync_step(int p) {
+    SimPhone* ph = &sim.ph[p];
+    if (ph->rs_on && ph->rs_leader != p && !ph->answered && sim.bytes_at >= 0 &&
+        sim.now >= sim.bytes_at)
+    {
+        ph->answered = true;
+        ph->answer_owed = true;
+    }
+    if (ph->hold) {
+        const uint8_t in = (uint8_t)(sim.humans & ~ph->settled & ~(1u << p));
+        if ((in & ~ph->answers) == 0 || sim.now - ph->rs_since >= 30000) {
+            ph->hold = false;
+            ph->rs_on = false; /* mesh_resync_release */
+            ph->grace_until = sim.now + sim.away_ms;
+        }
+    }
+}
+
 /* Run until `until` ms: phones make a frame and send every 16 ms. */
 static void sim_run(int64_t until) {
     for (; sim.now < until; sim.now++) {
@@ -599,15 +712,17 @@ static void sim_run(int64_t until) {
             if (!ph->alive) {
                 continue;
             }
+            sim_resync_step(p);
             if (sim.now % 16 == p) { /* the phones' frames are not in phase */
-                if (!ph->bye) {
+                if (!ph->bye && !ph->hold && sim_may_run(p)) {
                     ph->wrote++;
                     ph->have[p] = ph->wrote;
                 }
-                sim_send(p);
+                sim_send(p); /* every 16 ms, held or stalled: keepalives */
             }
             if (sim.now % 200 == 0) {
                 sim_send_aways(p);
+                sim_send_resync(p);
             }
             sim_decide(p);
         }
@@ -774,6 +889,88 @@ static void test_sim_split(void) {
     }
 }
 
+/* Cut every link of port p both ways, or mend them. */
+static void sim_cut(int p, bool cut) {
+    for (int q = 0; q < sim.n; q++) {
+        if (q != p) {
+            sim.up[p][q] = !cut;
+            sim.up[q][p] = !cut;
+        }
+    }
+}
+
+/* Eggy's e2e (two phones, a starved Mac): the leader held for its snapshot
+ * while the page moved 4 MB, its datagrams starved for seconds, and the
+ * other phone settled it away 2.3 s in. Here the bytes take 10 s, and the
+ * leader's links carry nothing for 4 s at a time meanwhile: nobody is
+ * settled, the resync completes, and the match goes on. */
+static void test_sim_resync_hold(void) {
+    for (int n = 2; n <= 3; n++) {
+        sim_init(n, 100);
+        sim.window = 8;
+        sim_run(2000);
+        sim_resync_begin(0);
+        const int32_t held = sim.ph[0].wrote;
+        sim_run(2100);
+        for (int r = 1; r < n; r++) {
+            CHECK(sim.ph[r].rs_on && sim.ph[r].rs_leader == 0 && sim.ph[r].rs_release == held);
+        }
+        sim_cut(0, true);
+        sim_run(6100);
+        sim_cut(0, false);
+        sim_run(6300);
+        sim_cut(0, true);
+        sim_run(10300);
+        sim_cut(0, false);
+        sim_run(10400);
+        sim_cut(0, true);
+        sim.bytes_at = 12000;
+        sim_run(12000);
+        sim_cut(0, false);
+        for (int q = 0; q < n; q++) {
+            CHECK(sim.ph[q].wrote <= held + sim.window); /* all held up meanwhile */
+        }
+        sim_run(18000);
+        for (int q = 0; q < n; q++) {
+            CHECK(sim.ph[q].alive && !sim.ph[q].evicted);
+            CHECK(sim_settled_any(q) == 0);
+            CHECK(!sim.ph[q].hold && !sim.ph[q].rs_on); /* the resync is over everywhere */
+            CHECK(sim.ph[q].wrote > held + 200);         /* and the match goes on */
+        }
+        CHECK(sim.ph[0].answers == (uint8_t)(sim.humans & ~1u));
+    }
+}
+
+/* A phone really gone during a resync is still settled: silent, once the
+ * hold is over (the leader lets go at 30 s without its answer), or at once
+ * on a BYE. */
+static void test_sim_resync_gone(void) {
+    sim_init(3, 100);
+    sim.window = 8;
+    sim_run(2000);
+    sim_resync_begin(0);
+    sim_run(2100);
+    sim.ph[2].alive = false; /* dies mid-transfer, silently */
+    sim_run(2000 + 30000 - 100);
+    CHECK(sim_settled_any(0) == 0 && sim_settled_any(1) == 0);
+    CHECK(sim.ph[0].hold);
+    sim_run(2000 + 30000 + sim.away_ms + 1000);
+    int32_t f = -2;
+    CHECK(!sim.ph[0].hold);
+    CHECK(sim_agree(2, &f, 0));
+    CHECK(sim.ph[1].alive && !sim.ph[1].evicted && sim_settled_any(1) == 0x04);
+
+    sim_init(3, 100);
+    sim.window = 8;
+    sim_run(2000);
+    sim_resync_begin(0);
+    sim_run(2100);
+    sim.ph[2].bye = true; /* its link reported failed: settled once still */
+    sim.ph[2].alive = false;
+    sim_run(3000);
+    CHECK(sim_agree(2, &f, 0));
+}
+
 /* Two phones: either side settles the other after away_ms, as before. */
 static void test_sim_pair(void) {
     sim_init(2, 100);
@@ -838,6 +1035,8 @@ int main(void) {
     test_sim_deaf_phone();
     test_sim_split();
     test_sim_pair();
+    test_sim_resync_hold();
+    test_sim_resync_gone();
     if (failures != 0) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

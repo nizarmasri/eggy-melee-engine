@@ -3320,9 +3320,10 @@ static bool rollback_to(int32_t f) {
  * page (the hook: Eggy's onState('snapshot')) and holds before S until every
  * other phone still in has said it applied it, or RESYNC_HOLD_MS.
  *
- * Holding is what keeps the repair shallow. The others run on what they hold
- * until they need the leader's input past S - 1 + delay, so each is between
- * S - delay and S + delay + WINDOW when the bytes land. One at S restores them
+ * Holding is what keeps the repair shallow. The leader wrote its input up to
+ * S + delay before it held; the others run on what they hold until they need
+ * more of it, so each is between S - delay and S + delay + WINDOW + 1 when
+ * the bytes land. One at S restores them
  * where the leader took them and plays on; one past S restores them and
  * re-runs the frames since from its input rings, as a rollback does (it has
  * every input it ran them on, and nothing it ran before S matters any more);
@@ -3332,11 +3333,16 @@ static bool rollback_to(int32_t f) {
  * already confirmed on the old timeline is then simply run again.
  *
  * Checksums from before S + max(RESYNC_CK_SKIP, delay + 2) are not compared
- * again: a phone may have reported frames of the old timeline up to
- * S - 1 + delay (only confirmed frames are reported). A phone
+ * again: a phone may have reported frames of the old timeline up to S + delay
+ * (only confirmed frames are reported).
+ *
+ * Nobody's frames move during the hold, and the page's transfer shares the
+ * links with the datagrams: the mesh counts a phone silent only after
+ * MESH_RESYNC_SILENCE_MS meanwhile (mesh_resync_hold), and measures every
+ * silence afresh once the hold is over. A phone
  * still disagreeing after that reports a desync again, and the leader sends
  * another snapshot, RESYNC_SENDS_MAX in a match at most. */
-#define RESYNC_CK_SKIP 8 /* past S - 1 + the delay, 2..4 in Eggy (more if it is larger) */
+#define RESYNC_CK_SKIP 8 /* past S + the delay, 2..4 in Eggy (more if it is larger) */
 
 static struct {
     ResyncPolicy pol;
@@ -3450,6 +3456,9 @@ void net_resync_announce(int from, const uint8_t* payload, int len) {
     uint8_t nth;
     if (resync_msg_decode(payload, len, &s, &size, &nth)) {
         s_rs.told = s;
+        /* The leader wrote its input up to S + delay, then held: until it
+         * moves past that, its stillness is the hold, not silence. */
+        mesh_resync_hold(from, s + net.delay);
         pc_log_line("net: port %d is holding at frame %d for its snapshot %u (%u bytes); we are "
                     "at %d",
             from + 1, s, nth, size, net.frame);
@@ -3666,6 +3675,7 @@ static bool resync_point(void) {
     }
     resync_policy_taken(&s_rs.pol, net.frame, mesh_scene_peers());
     resync_epoch(net.frame);
+    mesh_resync_hold(s_local_port, net.frame + net.delay);
     resync_send_announce();
     pc_log_line("net: resync snapshot %d of frame %d, %zu bytes, for ports %x", s_rs.pol.sent,
         net.frame, s_rs.out_len, s_rs.pol.waiting);
@@ -3673,6 +3683,7 @@ static bool resync_point(void) {
         s_rs_hook(PC_NET_RESYNC_SNAPSHOT, (int32_t)s_rs.out_len, net.frame);
     }
     resync_hold();
+    mesh_resync_release(); /* every phone's silence measured afresh from here */
     return net.active;
 }
 

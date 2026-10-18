@@ -143,6 +143,12 @@ static struct {
     int call_head, call_n;
     unsigned rx_bad, rx_full;
     bool warned_conflict;
+    /* A resync holding the match (mesh_resync_hold): its leader, the newest
+     * frame the leader had written when it held, and since when. */
+    bool rs_on;
+    int rs_leader;
+    int32_t rs_release_after;
+    uint64_t rs_since_ns;
 } m;
 
 /* ---- the page's link ----------------------------------------------------- */
@@ -217,6 +223,7 @@ static void away_view(MeshAwayView* v, uint64_t now) {
     v->away_ms = m.away_ms;
     v->load_ms = m.load_ms;
     v->stable_need_ms = MESH_STABLE_MS;
+    v->resync = m.rs_on;
     for (int p = 0; p < MESH_PORTS; p++) {
         v->have[p] = have_of(p);
         for (int q = 0; q < MESH_PORTS; q++) {
@@ -402,6 +409,17 @@ static void track_max(uint64_t now) {
     }
 }
 
+/* The resync's hold is over here: every silence is measured afresh. */
+static void resync_window_end(uint64_t now, const char* why) {
+    if (!m.rs_on) {
+        return;
+    }
+    m.rs_on = false;
+    m.grace_until_ns = now + (uint64_t)m.away_ms * 1000000ull;
+    pc_log_line("net: the resync hold by port %d is over here after %d ms (%s) at frame %d",
+        m.rs_leader + 1, ms_since(now, m.rs_since_ns), why, net.frame);
+}
+
 static void service(uint64_t now) {
     if (m.last_service_ns != 0 && now - m.last_service_ns > MESH_FREEZE_NS) {
         /* This phone was the one stopped (a load, the tab hidden): everyone's
@@ -410,6 +428,18 @@ static void service(uint64_t now) {
     }
     m.last_service_ns = now;
     track_max(now);
+    if (m.rs_on) {
+        const int lead = m.rs_leader;
+        const int32_t since = ms_since(now, m.rs_since_ns);
+        if (lead == m.self ?
+                since >= MESH_RESYNC_WINDOW_MS :
+                mesh_resync_over(live(lead), m.last_max[lead], m.rs_release_after, since))
+        {
+            resync_window_end(now, lead == m.self || since >= MESH_RESYNC_WINDOW_MS ? "timed out" :
+                                   live(lead) ? "the leader moved on" :
+                                                "the leader is gone");
+        }
+    }
     lane_service(now);
     MeshAwayView v;
     away_view(&v, now);
@@ -863,6 +893,27 @@ void mesh_bye(uint8_t reason) {
                 send_small(p, MESH_BYE, reason);
             }
         }
+    }
+}
+
+void mesh_resync_hold(int leader, int32_t release_after) {
+    if (!m.open) {
+        return;
+    }
+    const uint64_t now = SDL_GetTicksNS();
+    if (!m.rs_on || m.rs_leader != leader || m.rs_release_after != release_after) {
+        pc_log_line("net: a resync holds the match (leader port %d); silence is %d s now",
+            leader + 1, MESH_RESYNC_SILENCE_MS / 1000);
+    }
+    m.rs_on = true;
+    m.rs_leader = leader;
+    m.rs_release_after = release_after;
+    m.rs_since_ns = now;
+}
+
+void mesh_resync_release(void) {
+    if (m.open) {
+        resync_window_end(SDL_GetTicksNS(), "released");
     }
 }
 

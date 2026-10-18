@@ -182,7 +182,24 @@ typedef struct MeshAwayView {
     int32_t have[MESH_PORTS];                 /* this phone's contiguous have of each */
     int32_t reports[MESH_PORTS][MESH_PORTS];  /* [q][p]: what phone q says it holds of p */
     int32_t away_ms, load_ms, stable_need_ms; /* the limits */
+    bool resync; /* a resync is holding the match here (MESH_RESYNC_SILENCE_MS) */
 } MeshAwayView;
+
+/* A resync (net.c "resync") holds the match: the leader before its snapshot's
+ * frame until every other phone has applied it, the others waiting on the
+ * leader's input meanwhile, while the page moves megabytes over the same
+ * links the datagrams take. No phone's frames move, and on a starved link no
+ * datagram may get through for seconds. While one is in progress here, a
+ * phone is silent only after MESH_RESYNC_SILENCE_MS without a word (a BYE
+ * still counts at once), and once it is over every silence is measured afresh
+ * (a grace of away_ms, as after this phone's own freeze). */
+#define MESH_RESYNC_SILENCE_MS 35000 /* past net_resync.h's 30 s hold */
+#define MESH_RESYNC_WINDOW_MS 40000  /* a window nothing closes ends here */
+/* Whether a receiver's window is over: the leader is no longer in, its input
+ * has moved past `release_after` (the newest frame it had written when it
+ * held: it has let go), or the window has lasted MESH_RESYNC_WINDOW_MS. */
+bool mesh_resync_over(
+    bool leader_in, int32_t leader_newest, int32_t release_after, int32_t since_ms);
 
 /* The ports this phone counts silent: gone (BYE), or quiet past the limit
  * that applies (load_ms while loading, away_ms otherwise). Never itself, never

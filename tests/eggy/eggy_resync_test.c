@@ -231,8 +231,8 @@ static void test_apply_when(void) {
 /* A mesh where the leader holds before S: how far each receiver can have got
  * when the bytes land, at every delay Eggy uses and well past it. A receiver
  * runs a fresh frame f once every remote input up to f - WINDOW is real; the
- * leader's are real up to S - 1 + delay (it holds before writing S + delay),
- * and a receiver's own up to its frame - 1 + delay. So the receivers run
+ * leader's are real up to S + delay (written at the start of its tick S,
+ * before it held), and a receiver's own up to its frame + delay. So the receivers run
  * ahead until they wait on the leader, and the furthest is its next fresh
  * frame. The lowest is the one the leader waited for before taking S. Each
  * must land where it can apply, never past the rings. */
@@ -250,7 +250,7 @@ static void test_mesh_positions(void) {
             for (int moved = 1; moved;) {
                 moved = 0;
                 for (int r = 1; r < phones; r++) {
-                    int32_t have = s - 1 + delay; /* the leader's */
+                    int32_t have = s + delay; /* the leader's */
                     for (int o = 1; o < phones; o++) {
                         if (o != r && next[o] - 1 + delay < have) {
                             have = next[o] - 1 + delay;
@@ -263,7 +263,7 @@ static void test_mesh_positions(void) {
                 }
             }
             for (int r = 1; r < phones; r++) {
-                CHECK(next[r] == s + delay + WINDOW);
+                CHECK(next[r] == s + delay + WINDOW + 1);
                 const int when = resync_apply_when(s, next[r]);
                 CHECK(when == RESYNC_ROLLBACK);
                 /* Any receiver short of that (bytes in early) applies too. */
@@ -273,8 +273,8 @@ static void test_mesh_positions(void) {
             }
         }
     }
-    /* RESYNC_REPLAY_MAX holds every delay up to 23 at WINDOW 7. */
-    CHECK(resync_apply_when(1000, 1000 + 23 + WINDOW) == RESYNC_ROLLBACK);
+    /* RESYNC_REPLAY_MAX holds every delay up to 22 at WINDOW 7. */
+    CHECK(resync_apply_when(1000, 1000 + 22 + WINDOW + 1) == RESYNC_ROLLBACK);
 }
 
 /* ---- the leader's budget ------------------------------------------------------ */

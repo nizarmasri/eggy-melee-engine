@@ -586,9 +586,9 @@ state to the other phones, and every phone plays on from it.
 
 **The game stalls while the snapshot is in transit. It does not roll forward.**
 The leader holds before frame S until every other phone has applied the
-snapshot. Each receiver goes on until it needs the leader's input past
-S - 1 + delay, then waits for it. Every phone is therefore stopped within
-delay + 7 frames of S when the bytes land. Each one restores the snapshot and
+snapshot. The leader has written its input up to S + delay when it holds.
+Each receiver goes on until it needs more of it, then waits. Every phone is
+therefore stopped within delay + 8 frames of S when the bytes land. Each one restores the snapshot and
 re-runs at most those few frames from inputs it already holds, which costs
 about the same as an ordinary rollback.
 
@@ -611,7 +611,7 @@ arrival anyway. The stall is the transfer time, and nothing else.
      `ptr = _eggy_snapshot_buffer()`.
    - Send it in 60 KB pieces on the reliable bulk lane to every other phone
      still in: stats [8 + port] 3 or 4.
-3. **The receivers play on, then wait.** They run to at most S + delay + 7,
+3. **The receivers play on, then wait.** They run to at most S + delay + 8,
    then wait on the leader's next input. That wait is the stall.
 4. **Each receiver's page hands the snapshot over.** It reassembles the pieces,
    then makes three calls in one go, inside the same JavaScript task:
@@ -675,6 +675,12 @@ and the leader resends.
   `snapshot` and `resync`.
 - **If the leader leaves mid-hold**, the others play on. The next leader
   repairs the next desync.
+- **Nobody is settled away for standing still in a hold.** Frames stop moving
+  everywhere, and the transfer can starve the datagrams on the same links for
+  seconds. From the snapshot (on the leader) or its announcement (on the
+  others) until the leader moves on, a phone counts as silent only after 35 s
+  without a datagram; a BYE or a failed link still counts at once. After the
+  hold, every phone's silence is measured afresh, with 1.5 s of grace.
 
 **Testing it.** `_eggy_test_desync()` needs `MELEE_EGGY_TEST=1` in `ENV`. It
 returns 1 when armed. At the next fighting tick that no rollback can undo, this
@@ -815,7 +821,11 @@ Tests:
   frozen phone coming back (it is evicted, and what it decided is ignored), a
   BYE, a phone loading its scene (load_ms, not away_ms), a phone that hears
   nobody (it settles nobody, and the match goes on once it hears again), a
-  2-2 split (nobody settled), and two phones (either settles the other).
+  2-2 split (nobody settled), two phones (either settles the other), and a
+  resync hold of two and three phones whose bytes take 10 s while the leader's
+  links carry nothing for 4 s at a time (nobody settled, the resync completes,
+  play goes on), with a phone dying or leaving mid-hold (settled once the
+  hold is over, or at once on its BYE).
 - `tests/eggy/eggy_resync_test.c`: the snapshot's round trip, every byte under
   its checksum, bad magic, version, region count and lengths, the layout check
   (heaps may differ in length, never in base; statics never), the frame the
