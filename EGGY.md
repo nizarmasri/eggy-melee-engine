@@ -391,10 +391,16 @@ Module.meleeNetLinkReady = () => {
   const link = Module.meleeNetLink;
   tx = datagramRing(link, link.tx);
   rx = datagramRing(link, link.rx);
+  // netplay.mjs attach()'s loop: drain, then sleep until the engine queues more.
   const pump = () => {
     tx.drain((bytes) => channel?.readyState === 'open' && channel.send(bytes));
     const seen = Atomics.load(tx.i32, tx.head);
-    Atomics.waitAsync(tx.i32, tx.head, seen).value.then(pump);
+    if (Atomics.waitAsync) {
+      const r = Atomics.waitAsync(tx.i32, tx.head, seen);
+      (r.async ? r.value : Promise.resolve()).then(pump);
+    } else {
+      setTimeout(pump, 2);
+    }
   };
   pump();
 };
