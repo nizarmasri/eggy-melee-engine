@@ -104,6 +104,7 @@ keeping a view across frames.
 | `int eggy_load(int serial)` | 0 or an error code | `serial` comes back in `onState` |
 | `int eggy_go(void)` | 1 if taken | |
 | `void eggy_pad(int port, int buttons, int stickX, int stickY, int substickX, int substickY, int triggerL, int triggerR)` | | port 0..3; PADStatus semantics: GameCube button bits (mask 0x1F7F), int8 sticks, uint8 triggers |
+| `void eggy_tap(int port, int buttons)` | | buttons pressed for exactly one simulated tick, on top of `eggy_pad`'s, whatever the frame rate (a short hop) |
 | `const int32_t* eggy_hud(void)` | the HUD words | updated every tick; also refreshed by the call |
 | `const int32_t* eggy_results(void)` | the results words | |
 | `int eggy_abort(void)` | 1 if there was something to abort | |
@@ -792,6 +793,7 @@ that keep their defaults unless `src/pc/eggy` sets them.
 | `src/melee/gm/gmvs.c` | Zelda/Sheik hold-A swap off | the config names her outright |
 | `src/melee/gm/gm_1601.c` | `gm_GetNumCostumesForCKind` uncapped | every costume |
 | `src/melee/lb/lbaudio_ax.c` | `lbAudioAx_80023F28` returns early with music off | no music file read on that device |
+| `src/pc/net.c` | `capture_local_sample` brackets its `PADRead` with `pc_eggy_sampling` | the session's local sample takes `eggy_tap`'s one-tick presses |
 | `src/pc/vi.c` | the frame buffer is preserved while parked; `pc_eggy_frame_end()` after each presented frame | the last picture stays up; a load or hold clears to black, so frame 0 draws into cleared buffers; the page's picture size is taken between two frames |
 | `src/pc/audio.c` | the worklet loads from a static file first; the page's AudioContext is used | Eggy's CSP; iOS's unlocked context (any page, not only `MELEE_EGGY`) |
 | `platforms/browser/main.c` | `pc_eggy_preinit()` before `aurora_initialize`; no memory card | SDL keyboard off; one card-absent save everywhere |

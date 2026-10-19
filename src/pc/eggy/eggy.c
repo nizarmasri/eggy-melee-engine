@@ -195,16 +195,38 @@ u32 __wrap_PADRead(PADStatus* status) {
     }
     const bool live = s_state == EGGY_STATE_LOADED || s_state == EGGY_STATE_FIGHTING;
     const bool net = s_cfg.netplay && pc_net_active();
+    const bool takes_taps = net ? s_sampling : true;
     for (int i = 0; i < EGGY_PORTS; i++) {
         const int from = net ? (i == 0 ? s_cfg.local_port : -1) : i;
         if (live && from >= 0) {
             status[i] = s_pads[from];
+            if (takes_taps) {
+                status[i].button |= s_taps[from];
+                s_taps[from] = 0;
+            }
         } else {
             memset(&status[i], 0, sizeof status[i]);
         }
         status[i].err = PAD_ERR_NONE;
     }
+    if (!live) {
+        memset(s_taps, 0, sizeof s_taps);
+    }
     return 0; /* no rumble */
+}
+
+/* Presses for one simulated tick only (eggy_tap), whatever the frame rate: a
+ * phone that renders a frame in two ticks would hold a one-frame press for
+ * both, and a short hop needs jump up again before the jump squat ends (3
+ * ticks at the quickest). Taken by the sample a tick simulates: the pad
+ * alarm's alone, or in netplay the session's local sample (net.c
+ * capture_local_sample, between pc_eggy_sampling(true) and (false)), never
+ * the alarm's, whose samples the session overwrites. */
+static u16 s_taps[EGGY_PORTS];
+static bool s_sampling;
+
+void pc_eggy_sampling(bool on) {
+    s_sampling = on;
 }
 
 static int8_t clamp_s8(int v) {
@@ -333,6 +355,13 @@ EMSCRIPTEN_KEEPALIVE const int32_t* eggy_fighter(int port) {
     memset(s_seen[port], 0, sizeof s_seen[port]);
     s_peaked[port] = false;
     return s_fighter;
+}
+
+EMSCRIPTEN_KEEPALIVE void eggy_tap(int port, int buttons) {
+    if (port < 0 || port >= EGGY_PORTS) {
+        return;
+    }
+    s_taps[port] |= (u16)((unsigned)buttons & EGGY_PAD_BUTTONS);
 }
 
 /* ---- HUD -------------------------------------------------------------- */

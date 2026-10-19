@@ -239,6 +239,8 @@ int eggy_load(int serial);
 int eggy_go(void);
 void eggy_pad(int port, int buttons, int stick_x, int stick_y, int substick_x, int substick_y,
     int trigger_l, int trigger_r);
+/* Buttons pressed for exactly one simulated tick, on top of eggy_pad's. */
+void eggy_tap(int port, int buttons);
 const int32_t* eggy_hud(void);
 const int32_t* eggy_results(void);
 int eggy_abort(void);
@@ -273,6 +275,9 @@ void pc_eggy_scene_begin(int scene_kind);
 void pc_eggy_after_tick(void);
 /* lbaudio_ax.c: no music stream may start on this device. */
 bool pc_eggy_music_off(void);
+/* src/pc/net.c capture_local_sample: the PADRead between true and false is
+ * the session's local sample, which takes eggy_tap's presses. */
+void pc_eggy_sampling(bool on);
 /* src/pc/vi.c, after a frame is presented: a picture size the page asked for. */
 void pc_eggy_frame_end(void);
 /* platforms/browser/pc_stubs.c: the config's frozen Pokemon Stadium. */

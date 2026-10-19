@@ -27,6 +27,7 @@
  * codec, link simulator, reliable channel, handshake, time sync and
  * snapshots are the net_*.c modules listed in net_internal.h. */
 #include "compat.h"
+#include "pc/eggy/eggy.h"
 #include "pc/file_cache.h"
 #include "pc/net_internal.h"
 #include "pc/net_sfx.h"
@@ -3977,7 +3978,9 @@ static void hitch_test(void) {
 static void capture_local_sample(bool fresh) {
     if (fresh) {
         PADStatus pads[4];
+        pc_eggy_sampling(true); /* MELEE_EGGY: this sample takes the page's one-tick presses */
         PADRead(pads);
+        pc_eggy_sampling(false);
         s_raw_last = pads[0];
     }
 }
