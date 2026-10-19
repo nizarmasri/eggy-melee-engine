@@ -152,6 +152,7 @@ void pc_frame_boundary(void) {
     pc_audio_pump();
 #endif
     aurora_heap_check();    /* no-op unless MELEE_HEAP_CHECK is set */
+    pc_eggy_frame_end();    /* MELEE_EGGY: the page's picture size (eggy_view) */
     pc_widescreen_update(); /* Auto mode follows window resizes. */
     /* MELEE_LAN_TEST=1|host: the LAN lobby without the menu; "host" starts
      * a match with the first peer found. MELEE_LAN_DIRECT=ip:port: the same

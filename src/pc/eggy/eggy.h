@@ -74,6 +74,20 @@
  *   [3 + 4 * port]: present, stocks, percent (as the game shows it), the
  *       fighter's CharacterKind now (18/19 follow Zelda and Sheik's changes)
  *
+ * Fighter (int32 words at eggy_fighter(port), read on demand; all 0 when the
+ * port has no fighter right now). For the page's tests, never the simulation:
+ *   [0] present, [1] motion state (ftCommon_MotionState: 14 Wait, 15..17
+ *   walks, 20 Dash, 21 Run, 24 KneeBend...), [2] airborne, [3] facing -1/1,
+ *   [4] x and [5] y position, [6] ground velocity, [7] stick x and [8] stick y
+ *   as the fighter read them (after the dead zone), all x1000, [9] jumps used,
+ *   [10..25] every motion state entered on a tick since the last read, as a
+ *   512-bit set (bit m of word m / 32), [26] the highest y since then, x1000.
+ *   A read starts the next set
+ *
+ * Picture: eggy_view(width, height) asks for a render of that many pixels,
+ * which is its shape too (widescreen follows the window); taken at the next
+ * frame boundary. 64..4096 each, else -1. Each phone may pick its own.
+ *
  * Results (int32 words at eggy_results(), filled before onState('ended')):
  *   [0] end frame: the match frame on which GAME! or TIME! came
  *   [1] outcome: 0 normal, 1 time out, 2 sudden death then decided, 3 aborted,
@@ -102,6 +116,9 @@ extern "C" {
 #define EGGY_RESULTS_WORDS (2 + 8 * EGGY_PORTS)
 #define EGGY_RESULTS_PORT_BASE 2
 #define EGGY_NET_STATS_WORDS 20
+#define EGGY_FIGHTER_SEEN_AT 10
+#define EGGY_FIGHTER_SEEN_WORDS 16
+#define EGGY_FIGHTER_WORDS (EGGY_FIGHTER_SEEN_AT + EGGY_FIGHTER_SEEN_WORDS + 1)
 #define EGGY_NET_PHONES_MIN 2
 #define EGGY_NET_PHONES_MAX 4
 
@@ -222,6 +239,8 @@ int eggy_load(int serial);
 int eggy_go(void);
 void eggy_pad(int port, int buttons, int stick_x, int stick_y, int substick_x, int substick_y,
     int trigger_l, int trigger_r);
+/* Buttons pressed for exactly one simulated tick, on top of eggy_pad's. */
+void eggy_tap(int port, int buttons);
 const int32_t* eggy_hud(void);
 const int32_t* eggy_results(void);
 int eggy_abort(void);
@@ -237,6 +256,8 @@ int32_t eggy_snapshot_frame(void);
 uint8_t* eggy_snapshot_reserve(int len);
 int eggy_snapshot_apply(const uint8_t* ptr, int len, int32_t frame);
 int eggy_test_desync(void);
+int eggy_view(int width, int height);
+const int32_t* eggy_fighter(int port);
 
 /* ---- hooks the engine calls -------------------------------------------- */
 
@@ -254,6 +275,11 @@ void pc_eggy_scene_begin(int scene_kind);
 void pc_eggy_after_tick(void);
 /* lbaudio_ax.c: no music stream may start on this device. */
 bool pc_eggy_music_off(void);
+/* src/pc/net.c capture_local_sample: the PADRead between true and false is
+ * the session's local sample, which takes eggy_tap's presses. */
+void pc_eggy_sampling(bool on);
+/* src/pc/vi.c, after a frame is presented: a picture size the page asked for. */
+void pc_eggy_frame_end(void);
 /* platforms/browser/pc_stubs.c: the config's frozen Pokemon Stadium. */
 bool pc_eggy_frozen_stadium(void);
 

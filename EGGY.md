@@ -104,6 +104,7 @@ keeping a view across frames.
 | `int eggy_load(int serial)` | 0 or an error code | `serial` comes back in `onState` |
 | `int eggy_go(void)` | 1 if taken | |
 | `void eggy_pad(int port, int buttons, int stickX, int stickY, int substickX, int substickY, int triggerL, int triggerR)` | | port 0..3; PADStatus semantics: GameCube button bits (mask 0x1F7F), int8 sticks, uint8 triggers |
+| `void eggy_tap(int port, int buttons)` | | buttons pressed for exactly one simulated tick, on top of `eggy_pad`'s, whatever the frame rate (a short hop) |
 | `const int32_t* eggy_hud(void)` | the HUD words | updated every tick; also refreshed by the call |
 | `const int32_t* eggy_results(void)` | the results words | |
 | `int eggy_abort(void)` | 1 if there was something to abort | |
@@ -118,7 +119,9 @@ keeping a view across frames.
 | `int32_t eggy_snapshot_frame(void)` | its session frame | -1 none |
 | `uint8_t* eggy_snapshot_reserve(int len)` | room for `len` bytes | a receiver writes the leader's snapshot there; NULL if it cannot |
 | `int eggy_snapshot_apply(const uint8_t* ptr, int len, int32_t frame)` | 0 taken, or a resync error | a receiver hands the snapshot over; `resync` follows once applied |
-| `int eggy_test_desync(void)` | 1 armed | `MELEE_EGGY_TEST=1` only: this phone's fighter takes 10% the others never see, so it desyncs |
+| `int eggy_test_desync(void)` | 1 armed | `MELEE_EGGY_TEST=1` only: this phone's fighter takes 10% the others never see, so it desyncs. `MELEE_EGGY_TEST=1` also makes every CPU Melee's Stay CPU, which never attacks, for the control tests |
+| `int eggy_view(int width, int height)` | 0, or -1 out of 64..4096 | the render size in pixels, and so the picture's shape; taken at the next frame boundary |
+| `const int32_t* eggy_fighter(int port)` | the fighter words | for tests: motion state, airborne, facing, position, ground speed, the stick as read, jumps used, and every motion state entered and the highest point reached since the last read, tick by tick, so a slow machine's skipped frames hide nothing (see `eggy.h`) |
 
 They are `Module._eggy_*` (EXPORTED_FUNCTIONS in `platforms/browser/CMakeLists.txt`).
 The pointers index `Module.HEAP32` as `ptr >> 2`.
@@ -299,8 +302,10 @@ VS mode's CSS, VS, results cycle does. The Eggy code allocates nothing.
   (`aurora_card_set_present(false)`), so every device builds the same
   card-absent save. Every match also pins `pc_unlock_state_all()`, the state
   netplay pins: unlock predicates gate RNG draws.
-- **Fixed rules.** UCF is on. Pause is off. The picture is widescreen mode 1:
-  fixed 16:9, never the window's shape. The HUD is melee-pc's wide HUD.
+- **Fixed rules.** UCF is on. Pause is off. The picture is widescreen mode 2,
+  the window's shape, and the page sets the window to its screen's
+  (`eggy_view`): a phone's 20:9 shows 20:9 of the stage. The HUD is Melee's
+  own, in the middle, clear of the touch controls in the corners.
   Nothing records or saves: the VS-mode record keeping (`gm_80162574`,
   `gm_801623A4` and the rest of `gmVsMelee_ExitVs` / `ExitResults`) is never
   called, so the save data, and with it every RNG-gating predicate, stays the
@@ -748,9 +753,10 @@ sets, so melee-web's two-peer sessions run exactly as before:
   fixed (`pc_net_audio_deaf`). Out-of-tick RNG draws are put back
   (`seed_out_of_tick_check`), and the seed is reseeded every fight frame
   (`fight_reseed`). The results screen's timer counts lockstep ticks, and its
-  exit is agreed. The picture is fixed 16:9 on every phone (widescreen mode 1),
-  never the canvas's shape, so anything that reads the camera's shape reads
-  the same on both.
+  exit is agreed. Each phone's picture has its own shape (`eggy_view`), which
+  only the projection submitted for drawing sees: the camera object and every
+  query of it keep the GameCube's 4:3 (`cobj.c`), so the simulation never reads
+  a phone's shape.
 - **Per-device words.** [12] (music on this device) only decides whether a
   music stream is opened. No VS caller reads the result, and the stream's
   reads never raise the rollback barrier in the browser (`pc_audio_pumping`).
@@ -787,10 +793,11 @@ that keep their defaults unless `src/pc/eggy` sets them.
 | `src/melee/gm/gmvs.c` | Zelda/Sheik hold-A swap off | the config names her outright |
 | `src/melee/gm/gm_1601.c` | `gm_GetNumCostumesForCKind` uncapped | every costume |
 | `src/melee/lb/lbaudio_ax.c` | `lbAudioAx_80023F28` returns early with music off | no music file read on that device |
-| `src/pc/vi.c` | the frame buffer is preserved while parked | the last picture stays up; a load or hold clears to black, so frame 0 draws into cleared buffers |
+| `src/pc/net.c` | `capture_local_sample` brackets its `PADRead` with `pc_eggy_sampling` | the session's local sample takes `eggy_tap`'s one-tick presses |
+| `src/pc/vi.c` | the frame buffer is preserved while parked; `pc_eggy_frame_end()` after each presented frame | the last picture stays up; a load or hold clears to black, so frame 0 draws into cleared buffers; the page's picture size is taken between two frames |
 | `src/pc/audio.c` | the worklet loads from a static file first; the page's AudioContext is used | Eggy's CSP; iOS's unlocked context (any page, not only `MELEE_EGGY`) |
 | `platforms/browser/main.c` | `pc_eggy_preinit()` before `aurora_initialize`; no memory card | SDL keyboard off; one card-absent save everywhere |
-| `platforms/browser/pc_stubs.c` | frozen stadium from the config, UCF forced on, wide HUD | fixed rules |
+| `platforms/browser/pc_stubs.c` | frozen stadium from the config, UCF forced on, Melee's own HUD | fixed rules |
 | `platforms/browser/CMakeLists.txt` | `src/pc/eggy` sources, `-Wl,--wrap=PADRead`, `_eggy_*` exports | the API |
 | `platforms/browser/bundle/melee-audio.worklet.js` | new | the static worklet |
 | `tools/eggy/engine_release.py` | ships `melee-audio.worklet.js` | in `engine.json` with size and sha256 |

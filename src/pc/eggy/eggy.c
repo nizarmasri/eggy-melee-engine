@@ -35,8 +35,11 @@
 #include "pc/widescreen.h"
 
 #include <dolphin/pad.h>
+#include <math.h>
 #include <dolphin/vi.h>
 #include <SDL3/SDL_hints.h>
+#include <SDL3/SDL_stdinc.h>
+#include <SDL3/SDL_video.h>
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wscalar-storage-order" /* disc-struct unions in lb/types.h */
 #include <melee/ft/fighter.h>
@@ -170,6 +173,20 @@ bool pc_eggy_frozen_stadium(void) {
     return s_cfg.frozen_stadium;
 }
 
+/* Presses for one simulated tick only (eggy_tap), whatever the frame rate: a
+ * phone that renders a frame in two ticks would hold a one-frame press for
+ * both, and a short hop needs jump up again before the jump squat ends (3
+ * ticks at the quickest). Taken by the sample a tick simulates: the pad
+ * alarm's alone, or in netplay the session's local sample (net.c
+ * capture_local_sample, between pc_eggy_sampling(true) and (false)), never
+ * the alarm's, whose samples the session overwrites. */
+static u16 s_taps[EGGY_PORTS];
+static bool s_sampling;
+
+void pc_eggy_sampling(bool on) {
+    s_sampling = on;
+}
+
 /* ---- input --------------------------------------------------------------
  * Every PADRead in the engine (the pad alarm's HSD_PadRenewRawStatus, netplay's
  * local sample, the chat overlay) goes through here: -Wl,--wrap=PADRead in
@@ -192,14 +209,22 @@ u32 __wrap_PADRead(PADStatus* status) {
     }
     const bool live = s_state == EGGY_STATE_LOADED || s_state == EGGY_STATE_FIGHTING;
     const bool net = s_cfg.netplay && pc_net_active();
+    const bool takes_taps = net ? s_sampling : true;
     for (int i = 0; i < EGGY_PORTS; i++) {
         const int from = net ? (i == 0 ? s_cfg.local_port : -1) : i;
         if (live && from >= 0) {
             status[i] = s_pads[from];
+            if (takes_taps) {
+                status[i].button |= s_taps[from];
+                s_taps[from] = 0;
+            }
         } else {
             memset(&status[i], 0, sizeof status[i]);
         }
         status[i].err = PAD_ERR_NONE;
+    }
+    if (!live) {
+        memset(s_taps, 0, sizeof s_taps);
     }
     return 0; /* no rumble */
 }
@@ -227,6 +252,116 @@ EMSCRIPTEN_KEEPALIVE void eggy_pad(int port, int buttons, int stick_x, int stick
     p->triggerLeft = clamp_u8(trigger_l);
     p->triggerRight = clamp_u8(trigger_r);
     p->err = PAD_ERR_NONE;
+}
+
+/* ---- the picture --------------------------------------------------------
+ * The page sizes the render to its screen: eggy_view(width, height), in
+ * pixels, which is the picture's shape too. Widescreen follows the window
+ * (park: mode 2), so a phone's 20:9 shows 20:9 of the stage, never a 16:9 cut
+ * to fit or barred. Applied at the next frame boundary (vi.c), between two
+ * presented frames. Presentation only: Melee's cameras and every query of them
+ * keep GameCube semantics (cobj.c), so each phone of a match may have its own
+ * shape and the simulations still agree. */
+static int s_view_w;
+static int s_view_h;
+
+EMSCRIPTEN_KEEPALIVE int eggy_view(int width, int height) {
+    if (width < 64 || height < 64 || width > 4096 || height > 4096) {
+        return -1;
+    }
+    s_view_w = width;
+    s_view_h = height;
+    return 0;
+}
+
+void pc_eggy_frame_end(void) {
+    if (!pc_eggy_enabled() || s_view_w == 0) {
+        return;
+    }
+    const int w = s_view_w;
+    const int h = s_view_h;
+    s_view_w = s_view_h = 0;
+    int count = 0;
+    SDL_Window** windows = SDL_GetWindows(&count);
+    if (windows != NULL && count > 0) {
+        int now_w = 0;
+        int now_h = 0;
+        SDL_GetWindowSize(windows[0], &now_w, &now_h);
+        if (now_w != w || now_h != h) {
+            SDL_SetWindowSize(windows[0], w, h);
+        }
+    }
+    SDL_free(windows);
+}
+
+/* ---- a fighter, as the page's tests read it ------------------------------
+ * eggy_fighter(port): what the game made of the pads, so a test can drive the
+ * real touch controls and check the fighter dashed rather than walked. Read
+ * only, and never part of the simulation. A slow machine renders one frame in
+ * several ticks, so what a page samples between frames misses ticks: every
+ * motion state entered on any tick, and the highest the fighter rose, are
+ * kept since the last read (watch_fighters, after each fresh tick). */
+static int32_t s_fighter[EGGY_FIGHTER_WORDS];
+static uint32_t s_seen[EGGY_PORTS][EGGY_FIGHTER_SEEN_WORDS];
+static float s_peak[EGGY_PORTS];
+static bool s_peaked[EGGY_PORTS];
+
+static void watch_fighters(void) {
+    if (!s_scene_live) {
+        return;
+    }
+    for (int port = 0; port < EGGY_PORTS; port++) {
+        HSD_GObj* gobj = Player_GetEntity(port);
+        if (gobj == NULL || gobj->classifier != HSD_GOBJ_CLASS_FIGHTER) {
+            continue;
+        }
+        const Fighter* fp = GET_FIGHTER(gobj);
+        const int motion = fp->motion_id;
+        if (motion >= 0 && motion < 32 * EGGY_FIGHTER_SEEN_WORDS) {
+            s_seen[port][motion / 32] |= 1u << (motion % 32);
+        }
+        if (!s_peaked[port] || fp->cur_pos.y > s_peak[port]) {
+            s_peak[port] = fp->cur_pos.y;
+            s_peaked[port] = true;
+        }
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE const int32_t* eggy_fighter(int port) {
+    memset(s_fighter, 0, sizeof s_fighter);
+    if (port < 0 || port >= EGGY_PORTS || !s_scene_live ||
+        (s_state != EGGY_STATE_LOADED && s_state != EGGY_STATE_FIGHTING))
+    {
+        return s_fighter;
+    }
+    HSD_GObj* gobj = Player_GetEntity(port);
+    if (gobj == NULL || gobj->classifier != HSD_GOBJ_CLASS_FIGHTER) {
+        return s_fighter;
+    }
+    const Fighter* fp = GET_FIGHTER(gobj);
+    s_fighter[0] = 1;
+    s_fighter[1] = fp->motion_id;
+    s_fighter[2] = fp->ground_or_air == GA_Air;
+    s_fighter[3] = fp->facing_dir < 0 ? -1 : 1;
+    s_fighter[4] = (int32_t)lroundf(fp->cur_pos.x * 1000);
+    s_fighter[5] = (int32_t)lroundf(fp->cur_pos.y * 1000);
+    s_fighter[6] = (int32_t)lroundf(fp->gr_vel * 1000);
+    s_fighter[7] = (int32_t)lroundf(fp->input.lstick[0].x * 1000);
+    s_fighter[8] = (int32_t)lroundf(fp->input.lstick[0].y * 1000);
+    s_fighter[9] = fp->x1968_jumpsUsed;
+    memcpy(&s_fighter[EGGY_FIGHTER_SEEN_AT], s_seen[port], sizeof s_seen[port]);
+    s_fighter[EGGY_FIGHTER_SEEN_AT + EGGY_FIGHTER_SEEN_WORDS] =
+        (int32_t)lroundf((s_peaked[port] ? s_peak[port] : fp->cur_pos.y) * 1000);
+    memset(s_seen[port], 0, sizeof s_seen[port]);
+    s_peaked[port] = false;
+    return s_fighter;
+}
+
+EMSCRIPTEN_KEEPALIVE void eggy_tap(int port, int buttons) {
+    if (port < 0 || port >= EGGY_PORTS) {
+        return;
+    }
+    s_taps[port] |= (u16)((unsigned)buttons & EGGY_PAD_BUTTONS);
 }
 
 /* ---- HUD -------------------------------------------------------------- */
@@ -342,6 +477,13 @@ static void build_match(StartMeleeData* start) {
         p->stocks = (s8)(c->match_kind == EGGY_MATCH_STOCK ? c->stocks : 0);
         if (src->kind == EGGY_PORT_CPU) {
             p->cpu_level = (u8)src->cpu_level;
+            /* MELEE_EGGY_TEST=1: Melee's own Stay CPU, which keeps to its spot
+             * and never attacks, so a test can drive the controls and read
+             * what the fighter did without being hit. */
+            const char* test = getenv("MELEE_EGGY_TEST");
+            if (test != NULL && test[0] == '1') {
+                p->cpu_kind = CpuKind_0;
+            }
         }
         if (src->handicap > 0) {
             p->handicap = (s8)src->handicap;
@@ -385,7 +527,7 @@ static void park(void) {
     static bool started;
     if (!started) {
         started = true;
-        pc_widescreen_set_mode(1); /* fixed 16:9, never the window's shape */
+        pc_widescreen_set_mode(2); /* the window's shape, which the page sets (eggy_view) */
     }
     if (s_matches > 0) {
         /* What a match end stops (gmvs.c fn_8016C7F0): the results screen's
@@ -591,6 +733,9 @@ void pc_eggy_after_tick(void) {
         if (p->queue != NULL && p->qnum != 0) {
             memcpy(
                 s_tick_pads, p->queue[(p->qread + p->qnum - 1) % p->qnum].stat, sizeof s_tick_pads);
+        }
+        if (fresh) {
+            watch_fighters();
         }
         if (s_cfg.netplay && fresh) {
             net_tick();
