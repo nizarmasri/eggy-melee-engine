@@ -780,12 +780,14 @@ background or runs short of memory. Upstream aborts on that, and on any WebGPU
 error once it is running, which in a page kills the runtime for good. In a
 browser build neither aborts:
 
-- **Device lost:** logged, and `Module.onGpuTrouble('lost', reason, message)`.
-  Every call on a lost device is a no-op, so the game runs on drawing nothing
-  until the page acts (Eggy reloads once the phone is in front again).
+- **Device lost:** logged, and `Module.onGpuTrouble('lost', reason, message)`
+  with the `WGPUDeviceLostReason` (1 unknown, 2 destroyed). Every call on a
+  lost device is a no-op, so the game runs on drawing nothing until the page
+  acts (Eggy reloads once the phone is in front again).
 - **A WebGPU error:** the first eight are logged; the first, and any
-  OutOfMemory, reach `Module.onGpuTrouble('error' | 'lost', type, message)`.
-  OutOfMemory is `'lost'`: what it couldn't make is gone.
+  OutOfMemory, reach `Module.onGpuTrouble('error', type, message)` with the
+  `WGPUErrorType` (2 validation, 3 out of memory, 4 internal). The frame is
+  drawn past; after an OutOfMemory, what it couldn't make is missing.
 
 ## Not done
 

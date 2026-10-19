@@ -38,8 +38,9 @@
 // takes the device away when it goes to the background or runs short of
 // memory, and aborting there took the whole runtime with it, for good: nothing
 // short of a reload brought the game back, and every match after failed. The
-// page's Module.onGpuTrouble(kind, code, message) hears it instead: 'lost' (the
-// device is gone, or ran out of memory) or 'error' (a WebGPU error, drawn past).
+// page's Module.onGpuTrouble(kind, code, message) hears it instead: 'lost' with
+// the WGPUDeviceLostReason, or 'error' with the WGPUErrorType (drawn past; an
+// OutOfMemory means what it couldn't make is missing).
 // clang-format off
 EM_JS(void, aurora_js_gpu_trouble, (int lost, int code, const char* message), {
   const fn = Module['onGpuTrouble'];
@@ -1124,9 +1125,8 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
             if (s_errors < 8) {
               Log.error("WebGPU error {}: {}", underlying(type), text);
             }
-            const bool lost = type == wgpu::ErrorType::OutOfMemory;
-            if (s_errors++ == 0 || lost) {
-              aurora_js_gpu_trouble(lost ? 1 : 0, static_cast<int>(underlying(type)), text.c_str());
+            if (s_errors++ == 0 || type == wgpu::ErrorType::OutOfMemory) {
+              aurora_js_gpu_trouble(0, static_cast<int>(underlying(type)), text.c_str());
             }
 #else
             FATAL("WebGPU error {}: {}", underlying(type), message);
