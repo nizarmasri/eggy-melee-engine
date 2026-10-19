@@ -53,7 +53,10 @@ bool pc_is_ucf_enabled(void) {
 }
 /* MELEE_EGGY plays fixed 16:9 (src/pc/eggy), with the HUD spread to it. */
 int pc_get_hud_mode(void) {
-    return pc_eggy_enabled() ? 1 : 0;
+    /* Melee's own HUD, in the middle whatever shape the picture is: clear of
+     * the touch controls in the bottom corners, and placed once per match
+     * (ifall.c), so a phone that turns mid-match never strands it. */
+    return 0;
 }
 bool pc_is_custom_textures_enabled(void) {
     return false;

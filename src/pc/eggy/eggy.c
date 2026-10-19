@@ -35,8 +35,11 @@
 #include "pc/widescreen.h"
 
 #include <dolphin/pad.h>
+#include <math.h>
 #include <dolphin/vi.h>
 #include <SDL3/SDL_hints.h>
+#include <SDL3/SDL_stdinc.h>
+#include <SDL3/SDL_video.h>
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wscalar-storage-order" /* disc-struct unions in lb/types.h */
 #include <melee/ft/fighter.h>
@@ -229,6 +232,77 @@ EMSCRIPTEN_KEEPALIVE void eggy_pad(int port, int buttons, int stick_x, int stick
     p->err = PAD_ERR_NONE;
 }
 
+/* ---- the picture --------------------------------------------------------
+ * The page sizes the render to its screen: eggy_view(width, height), in
+ * pixels, which is the picture's shape too. Widescreen follows the window
+ * (park: mode 2), so a phone's 20:9 shows 20:9 of the stage, never a 16:9 cut
+ * to fit or barred. Applied at the next frame boundary (vi.c), between two
+ * presented frames. Presentation only: Melee's cameras and every query of them
+ * keep GameCube semantics (cobj.c), so each phone of a match may have its own
+ * shape and the simulations still agree. */
+static int s_view_w;
+static int s_view_h;
+
+EMSCRIPTEN_KEEPALIVE int eggy_view(int width, int height) {
+    if (width < 64 || height < 64 || width > 4096 || height > 4096) {
+        return -1;
+    }
+    s_view_w = width;
+    s_view_h = height;
+    return 0;
+}
+
+void pc_eggy_frame_end(void) {
+    if (!pc_eggy_enabled() || s_view_w == 0) {
+        return;
+    }
+    const int w = s_view_w;
+    const int h = s_view_h;
+    s_view_w = s_view_h = 0;
+    int count = 0;
+    SDL_Window** windows = SDL_GetWindows(&count);
+    if (windows != NULL && count > 0) {
+        int now_w = 0;
+        int now_h = 0;
+        SDL_GetWindowSize(windows[0], &now_w, &now_h);
+        if (now_w != w || now_h != h) {
+            SDL_SetWindowSize(windows[0], w, h);
+        }
+    }
+    SDL_free(windows);
+}
+
+/* ---- a fighter, as the page's tests read it ------------------------------
+ * eggy_fighter(port): what the game made of the pads, so a test can drive the
+ * real touch controls and check the fighter dashed rather than walked. Read
+ * only, and never part of the simulation. */
+static int32_t s_fighter[EGGY_FIGHTER_WORDS];
+
+EMSCRIPTEN_KEEPALIVE const int32_t* eggy_fighter(int port) {
+    memset(s_fighter, 0, sizeof s_fighter);
+    if (port < 0 || port >= EGGY_PORTS || !s_scene_live ||
+        (s_state != EGGY_STATE_LOADED && s_state != EGGY_STATE_FIGHTING))
+    {
+        return s_fighter;
+    }
+    HSD_GObj* gobj = Player_GetEntity(port);
+    if (gobj == NULL || gobj->classifier != HSD_GOBJ_CLASS_FIGHTER) {
+        return s_fighter;
+    }
+    const Fighter* fp = GET_FIGHTER(gobj);
+    s_fighter[0] = 1;
+    s_fighter[1] = fp->motion_id;
+    s_fighter[2] = fp->ground_or_air == GA_Air;
+    s_fighter[3] = fp->facing_dir < 0 ? -1 : 1;
+    s_fighter[4] = (int32_t)lroundf(fp->cur_pos.x * 1000);
+    s_fighter[5] = (int32_t)lroundf(fp->cur_pos.y * 1000);
+    s_fighter[6] = (int32_t)lroundf(fp->gr_vel * 1000);
+    s_fighter[7] = (int32_t)lroundf(fp->input.lstick[0].x * 1000);
+    s_fighter[8] = (int32_t)lroundf(fp->input.lstick[0].y * 1000);
+    s_fighter[9] = fp->x1968_jumpsUsed;
+    return s_fighter;
+}
+
 /* ---- HUD -------------------------------------------------------------- */
 
 /* The fighter's CharacterKind now: Zelda and Sheik follow their changes. Only
@@ -385,7 +459,7 @@ static void park(void) {
     static bool started;
     if (!started) {
         started = true;
-        pc_widescreen_set_mode(1); /* fixed 16:9, never the window's shape */
+        pc_widescreen_set_mode(2); /* the window's shape, which the page sets (eggy_view) */
     }
     if (s_matches > 0) {
         /* What a match end stops (gmvs.c fn_8016C7F0): the results screen's
