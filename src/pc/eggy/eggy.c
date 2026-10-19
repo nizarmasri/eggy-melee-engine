@@ -416,6 +416,13 @@ static void build_match(StartMeleeData* start) {
         p->stocks = (s8)(c->match_kind == EGGY_MATCH_STOCK ? c->stocks : 0);
         if (src->kind == EGGY_PORT_CPU) {
             p->cpu_level = (u8)src->cpu_level;
+            /* MELEE_EGGY_TEST=1: Melee's own Stay CPU, which keeps to its spot
+             * and never attacks, so a test can drive the controls and read
+             * what the fighter did without being hit. */
+            const char* test = getenv("MELEE_EGGY_TEST");
+            if (test != NULL && test[0] == '1') {
+                p->cpu_kind = CpuKind_0;
+            }
         }
         if (src->handicap > 0) {
             p->handicap = (s8)src->handicap;

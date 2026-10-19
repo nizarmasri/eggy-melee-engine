@@ -118,7 +118,7 @@ keeping a view across frames.
 | `int32_t eggy_snapshot_frame(void)` | its session frame | -1 none |
 | `uint8_t* eggy_snapshot_reserve(int len)` | room for `len` bytes | a receiver writes the leader's snapshot there; NULL if it cannot |
 | `int eggy_snapshot_apply(const uint8_t* ptr, int len, int32_t frame)` | 0 taken, or a resync error | a receiver hands the snapshot over; `resync` follows once applied |
-| `int eggy_test_desync(void)` | 1 armed | `MELEE_EGGY_TEST=1` only: this phone's fighter takes 10% the others never see, so it desyncs |
+| `int eggy_test_desync(void)` | 1 armed | `MELEE_EGGY_TEST=1` only: this phone's fighter takes 10% the others never see, so it desyncs. `MELEE_EGGY_TEST=1` also makes every CPU Melee's Stay CPU, which never attacks, for the control tests |
 | `int eggy_view(int width, int height)` | 0, or -1 out of 64..4096 | the render size in pixels, and so the picture's shape; taken at the next frame boundary |
 | `const int32_t* eggy_fighter(int port)` | the fighter words | for tests: motion state, airborne, facing, position, ground speed, the stick as read, jumps used (see `eggy.h`) |
 
