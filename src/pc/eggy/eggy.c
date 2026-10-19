@@ -173,6 +173,20 @@ bool pc_eggy_frozen_stadium(void) {
     return s_cfg.frozen_stadium;
 }
 
+/* Presses for one simulated tick only (eggy_tap), whatever the frame rate: a
+ * phone that renders a frame in two ticks would hold a one-frame press for
+ * both, and a short hop needs jump up again before the jump squat ends (3
+ * ticks at the quickest). Taken by the sample a tick simulates: the pad
+ * alarm's alone, or in netplay the session's local sample (net.c
+ * capture_local_sample, between pc_eggy_sampling(true) and (false)), never
+ * the alarm's, whose samples the session overwrites. */
+static u16 s_taps[EGGY_PORTS];
+static bool s_sampling;
+
+void pc_eggy_sampling(bool on) {
+    s_sampling = on;
+}
+
 /* ---- input --------------------------------------------------------------
  * Every PADRead in the engine (the pad alarm's HSD_PadRenewRawStatus, netplay's
  * local sample, the chat overlay) goes through here: -Wl,--wrap=PADRead in
@@ -213,20 +227,6 @@ u32 __wrap_PADRead(PADStatus* status) {
         memset(s_taps, 0, sizeof s_taps);
     }
     return 0; /* no rumble */
-}
-
-/* Presses for one simulated tick only (eggy_tap), whatever the frame rate: a
- * phone that renders a frame in two ticks would hold a one-frame press for
- * both, and a short hop needs jump up again before the jump squat ends (3
- * ticks at the quickest). Taken by the sample a tick simulates: the pad
- * alarm's alone, or in netplay the session's local sample (net.c
- * capture_local_sample, between pc_eggy_sampling(true) and (false)), never
- * the alarm's, whose samples the session overwrites. */
-static u16 s_taps[EGGY_PORTS];
-static bool s_sampling;
-
-void pc_eggy_sampling(bool on) {
-    s_sampling = on;
 }
 
 static int8_t clamp_s8(int v) {
