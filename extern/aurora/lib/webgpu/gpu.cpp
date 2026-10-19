@@ -31,6 +31,29 @@
 #include <dawn/native/DawnNative.h>
 #endif
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+
+// Eggy: in a browser the page decides what GPU trouble means. A phone's browser
+// takes the device away when it goes to the background or runs short of
+// memory, and aborting there took the whole runtime with it, for good: nothing
+// short of a reload brought the game back, and every match after failed. The
+// page's Module.onGpuTrouble(kind, code, message) hears it instead: 'lost' with
+// the WGPUDeviceLostReason, or 'error' with the WGPUErrorType (drawn past; an
+// OutOfMemory means what it couldn't make is missing).
+// clang-format off
+EM_JS(void, aurora_js_gpu_trouble, (int lost, int code, const char* message), {
+  const fn = Module['onGpuTrouble'];
+  if (typeof fn !== 'function') return;
+  try {
+    fn(lost ? 'lost' : 'error', code, UTF8ToString(message));
+  } catch (e) {
+    err('onGpuTrouble threw: ' + e);
+  }
+});
+// clang-format on
+#endif
+
 
 namespace aurora::gfx {
 void clear_offscreen_cache();
@@ -1095,7 +1118,19 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     deviceDescriptor.SetUncapturedErrorCallback(
         [](const wgpu::Device& device, wgpu::ErrorType type, wgpu::StringView message) {
           if (g_initialized) {
+#ifdef __EMSCRIPTEN__
+            // The first few are logged, and the page hears the first and any shortage of memory.
+            static int s_errors = 0;
+            const std::string text{std::string_view(message)};
+            if (s_errors < 8) {
+              Log.error("WebGPU error {}: {}", underlying(type), text);
+            }
+            if (s_errors++ == 0 || type == wgpu::ErrorType::OutOfMemory) {
+              aurora_js_gpu_trouble(0, static_cast<int>(underlying(type)), text.c_str());
+            }
+#else
             FATAL("WebGPU error {}: {}", underlying(type), message);
+#endif
           } else {
             Log.warn("WebGPU error {}: {}", underlying(type), message);
           }
@@ -1104,7 +1139,15 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         wgpu::CallbackMode::AllowSpontaneous,
         [](const wgpu::Device& device, wgpu::DeviceLostReason reason, wgpu::StringView message) {
           if (g_initialized) {
+#ifdef __EMSCRIPTEN__
+            // Every call on a lost device is a no-op in a browser, so the game runs on, drawing nothing, until the page acts.
+            g_deviceLost = true;
+            const std::string text{std::string_view(message)};
+            Log.error("Device lost on {} ({}): {}", g_adapterName, magic_enum::enum_name(g_backendType), text);
+            aurora_js_gpu_trouble(1, static_cast<int>(reason), text.c_str());
+#else
             FATAL("Device lost on {} ({}): {}", g_adapterName, magic_enum::enum_name(g_backendType), message);
+#endif
           } else {
             if (reason != wgpu::DeviceLostReason::Destroyed) {
               g_deviceLost = true;

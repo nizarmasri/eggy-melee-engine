@@ -773,6 +773,22 @@ from `gm_801A4014` (the VS state's `on_enter`); the hold from `gm_801A4D34`;
 and net.c's `wait_remote` and `resync_hold` (the leader's resync hold, inside
 `fresh_tick`).
 
+## The GPU
+
+A browser takes the WebGPU device away when the phone sends the page to the
+background or runs short of memory. Upstream aborts on that, and on any WebGPU
+error once it is running, which in a page kills the runtime for good. In a
+browser build neither aborts:
+
+- **Device lost:** logged, and `Module.onGpuTrouble('lost', reason, message)`
+  with the `WGPUDeviceLostReason` (1 unknown, 2 destroyed). Every call on a
+  lost device is a no-op, so the game runs on drawing nothing until the page
+  acts (Eggy reloads once the phone is in front again).
+- **A WebGPU error:** the first eight are logged; the first, and any
+  OutOfMemory, reach `Module.onGpuTrouble('error', type, message)` with the
+  `WGPUErrorType` (2 validation, 3 out of memory, 4 internal). The frame is
+  drawn past; after an OutOfMemory, what it couldn't make is missing.
+
 ## Not done
 
 `eggy_render_size` is not built. Aurora has no public resize call, and the
@@ -795,6 +811,7 @@ that keep their defaults unless `src/pc/eggy` sets them.
 | `src/melee/lb/lbaudio_ax.c` | `lbAudioAx_80023F28` returns early with music off | no music file read on that device |
 | `src/pc/net.c` | `capture_local_sample` brackets its `PADRead` with `pc_eggy_sampling` | the session's local sample takes `eggy_tap`'s one-tick presses |
 | `src/pc/vi.c` | the frame buffer is preserved while parked; `pc_eggy_frame_end()` after each presented frame | the last picture stays up; a load or hold clears to black, so frame 0 draws into cleared buffers; the page's picture size is taken between two frames |
+| `extern/aurora/lib/webgpu/gpu.cpp` | a lost device or a WebGPU error calls `Module.onGpuTrouble` instead of aborting (any browser page, not only `MELEE_EGGY`) | The GPU |
 | `src/pc/audio.c` | the worklet loads from a static file first; the page's AudioContext is used | Eggy's CSP; iOS's unlocked context (any page, not only `MELEE_EGGY`) |
 | `platforms/browser/main.c` | `pc_eggy_preinit()` before `aurora_initialize`; no memory card | SDL keyboard off; one card-absent save everywhere |
 | `platforms/browser/pc_stubs.c` | frozen stadium from the config, UCF forced on, Melee's own HUD | fixed rules |
