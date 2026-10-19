@@ -275,8 +275,35 @@ void pc_eggy_frame_end(void) {
 /* ---- a fighter, as the page's tests read it ------------------------------
  * eggy_fighter(port): what the game made of the pads, so a test can drive the
  * real touch controls and check the fighter dashed rather than walked. Read
- * only, and never part of the simulation. */
+ * only, and never part of the simulation. A slow machine renders one frame in
+ * several ticks, so what a page samples between frames misses ticks: every
+ * motion state entered on any tick, and the highest the fighter rose, are
+ * kept since the last read (watch_fighters, after each fresh tick). */
 static int32_t s_fighter[EGGY_FIGHTER_WORDS];
+static uint32_t s_seen[EGGY_PORTS][EGGY_FIGHTER_SEEN_WORDS];
+static float s_peak[EGGY_PORTS];
+static bool s_peaked[EGGY_PORTS];
+
+static void watch_fighters(void) {
+    if (!s_scene_live) {
+        return;
+    }
+    for (int port = 0; port < EGGY_PORTS; port++) {
+        HSD_GObj* gobj = Player_GetEntity(port);
+        if (gobj == NULL || gobj->classifier != HSD_GOBJ_CLASS_FIGHTER) {
+            continue;
+        }
+        const Fighter* fp = GET_FIGHTER(gobj);
+        const int motion = fp->motion_id;
+        if (motion >= 0 && motion < 32 * EGGY_FIGHTER_SEEN_WORDS) {
+            s_seen[port][motion / 32] |= 1u << (motion % 32);
+        }
+        if (!s_peaked[port] || fp->cur_pos.y > s_peak[port]) {
+            s_peak[port] = fp->cur_pos.y;
+            s_peaked[port] = true;
+        }
+    }
+}
 
 EMSCRIPTEN_KEEPALIVE const int32_t* eggy_fighter(int port) {
     memset(s_fighter, 0, sizeof s_fighter);
@@ -300,6 +327,11 @@ EMSCRIPTEN_KEEPALIVE const int32_t* eggy_fighter(int port) {
     s_fighter[7] = (int32_t)lroundf(fp->input.lstick[0].x * 1000);
     s_fighter[8] = (int32_t)lroundf(fp->input.lstick[0].y * 1000);
     s_fighter[9] = fp->x1968_jumpsUsed;
+    memcpy(&s_fighter[EGGY_FIGHTER_SEEN_AT], s_seen[port], sizeof s_seen[port]);
+    s_fighter[EGGY_FIGHTER_SEEN_AT + EGGY_FIGHTER_SEEN_WORDS] =
+        (int32_t)lroundf((s_peaked[port] ? s_peak[port] : fp->cur_pos.y) * 1000);
+    memset(s_seen[port], 0, sizeof s_seen[port]);
+    s_peaked[port] = false;
     return s_fighter;
 }
 
@@ -672,6 +704,9 @@ void pc_eggy_after_tick(void) {
         if (p->queue != NULL && p->qnum != 0) {
             memcpy(
                 s_tick_pads, p->queue[(p->qread + p->qnum - 1) % p->qnum].stat, sizeof s_tick_pads);
+        }
+        if (fresh) {
+            watch_fighters();
         }
         if (s_cfg.netplay && fresh) {
             net_tick();

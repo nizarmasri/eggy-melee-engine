@@ -79,7 +79,10 @@
  *   [0] present, [1] motion state (ftCommon_MotionState: 14 Wait, 15..17
  *   walks, 20 Dash, 21 Run, 24 KneeBend...), [2] airborne, [3] facing -1/1,
  *   [4] x and [5] y position, [6] ground velocity, [7] stick x and [8] stick y
- *   as the fighter read them (after the dead zone), all x1000, [9] jumps used
+ *   as the fighter read them (after the dead zone), all x1000, [9] jumps used,
+ *   [10..25] every motion state entered on a tick since the last read, as a
+ *   512-bit set (bit m of word m / 32), [26] the highest y since then, x1000.
+ *   A read starts the next set
  *
  * Picture: eggy_view(width, height) asks for a render of that many pixels,
  * which is its shape too (widescreen follows the window); taken at the next
@@ -113,7 +116,9 @@ extern "C" {
 #define EGGY_RESULTS_WORDS (2 + 8 * EGGY_PORTS)
 #define EGGY_RESULTS_PORT_BASE 2
 #define EGGY_NET_STATS_WORDS 20
-#define EGGY_FIGHTER_WORDS 10
+#define EGGY_FIGHTER_SEEN_AT 10
+#define EGGY_FIGHTER_SEEN_WORDS 16
+#define EGGY_FIGHTER_WORDS (EGGY_FIGHTER_SEEN_AT + EGGY_FIGHTER_SEEN_WORDS + 1)
 #define EGGY_NET_PHONES_MIN 2
 #define EGGY_NET_PHONES_MAX 4
 
