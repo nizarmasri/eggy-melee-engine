@@ -1,4 +1,5 @@
 #ifdef __EMSCRIPTEN__
+#include <cstdint>
 #include <emscripten.h>
 extern "C" void browser_yield(void);
 extern "C" uint32_t aurora_browser_pipelines_compiling(void); /* gx/gx.cpp */
