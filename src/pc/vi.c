@@ -338,42 +338,43 @@ void pc_frame_boundary(void) {
      * Sleep a frame between attempts: without it a minimized window spins a
      * core at 100% polling SDL. An undrawn frame's boundary keeps the frame
      * that is open. */
-    if (!s_in_frame) for (;;) {
-        u64 started = timing_debug ? SDL_GetTicksNS() : 0;
-        pc_eggy_perf_enter(EGGY_PERF_GPU_WAIT);
-        bool begun = aurora_begin_frame();
-        pc_eggy_perf_enter(EGGY_PERF_OTHER);
-        if (timing_debug) {
-            u64 elapsed = SDL_GetTicksNS() - started;
-            if (elapsed > 20000000ull)
-                pc_log_line("net timing: aurora_begin_frame %.1f ms at retrace %u frame %d",
-                    elapsed / 1e6, s_retrace_count, pc_net_frame());
-        }
-        if (begun)
-            break;
-        update_started = timing_debug ? SDL_GetTicksNS() : 0;
-        event = aurora_update();
-        if (timing_debug) {
-            u64 elapsed = SDL_GetTicksNS() - update_started;
-            if (elapsed > 50000000ull)
-                pc_log_line("net timing: aurora_update %.1f ms at retrace %u frame %d",
-                    elapsed / 1e6, s_retrace_count, pc_net_frame());
-        }
-        while (event != NULL && event->type != AURORA_NONE) {
-            if (event->type == AURORA_EXIT) {
-                pc_net_match_stop();
-                pc_net_disconnect();
-                pc_lan_stop();
-                exit(0);
+    if (!s_in_frame)
+        for (;;) {
+            u64 started = timing_debug ? SDL_GetTicksNS() : 0;
+            pc_eggy_perf_enter(EGGY_PERF_GPU_WAIT);
+            bool begun = aurora_begin_frame();
+            pc_eggy_perf_enter(EGGY_PERF_OTHER);
+            if (timing_debug) {
+                u64 elapsed = SDL_GetTicksNS() - started;
+                if (elapsed > 20000000ull)
+                    pc_log_line("net timing: aurora_begin_frame %.1f ms at retrace %u frame %d",
+                        elapsed / 1e6, s_retrace_count, pc_net_frame());
             }
-            ++event;
-        }
+            if (begun)
+                break;
+            update_started = timing_debug ? SDL_GetTicksNS() : 0;
+            event = aurora_update();
+            if (timing_debug) {
+                u64 elapsed = SDL_GetTicksNS() - update_started;
+                if (elapsed > 50000000ull)
+                    pc_log_line("net timing: aurora_update %.1f ms at retrace %u frame %d",
+                        elapsed / 1e6, s_retrace_count, pc_net_frame());
+            }
+            while (event != NULL && event->type != AURORA_NONE) {
+                if (event->type == AURORA_EXIT) {
+                    pc_net_match_stop();
+                    pc_net_disconnect();
+                    pc_lan_stop();
+                    exit(0);
+                }
+                ++event;
+            }
 #ifdef __EMSCRIPTEN__
-        emscripten_sleep(16);
+            emscripten_sleep(16);
 #else
-        SDL_Delay(16);
+            SDL_Delay(16);
 #endif
-    }
+        }
     s_in_frame = true;
 
     /* Presentation-only chat reads the physical local controller, never a
