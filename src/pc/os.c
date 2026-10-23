@@ -21,6 +21,10 @@
 
 #include "pc/pc.h"
 #include "pc/disc.h"
+#include "pc/eggy/eggy.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 /* ---- interrupts ------------------------------------------------------- */
 
@@ -240,15 +244,31 @@ void pc_os_wait_alarm(void) {
     const OSTime wait = next - OSGetTime();
     if (next != 0 && wait > 0) {
 #ifdef __EMSCRIPTEN__
-        /* At most 1 ms, where SDL's delay spins the page's only thread; hand
-         * it to the event loop instead (platforms/browser/scheduler.c). */
+        /* Hand the wait to the event loop (platforms/browser/scheduler.c), as
+         * spare time in the page's frame report. A wait long enough for a
+         * timer sleeps: yielding over and over spun a phone's core for most of
+         * a frame, heat its throttling then took out of the next frames. */
         extern void browser_yield(void);
-        browser_yield();
+        const int perf = pc_eggy_perf_enter(EGGY_PERF_SPARE);
+        const uint64_t us = OSTicksToMicroseconds(wait);
+        if (us >= 5000u) {
+            emscripten_sleep((unsigned)(us / 1000u) - 1u);
+        } else {
+            browser_yield();
+        }
+        pc_eggy_perf_enter(perf);
 #else
         const uint64_t ns = (uint64_t)OSTicksToMicroseconds(wait) * 1000u;
         SDL_DelayPrecise(ns < 1000000u ? ns : 1000000u);
 #endif
     }
+}
+
+bool pc_in_mem1(const void* p, uint32_t size) {
+    const uintptr_t lo = (uintptr_t)OSPhysicalToCached(0);
+    const uintptr_t hi = lo + OSGetPhysicalMemSize();
+    const uintptr_t at = (uintptr_t)p;
+    return at >= lo && at < hi && size <= hi - at;
 }
 
 /* The game's disc waits (lbdvd.c, lbfile.c) spin on a flag that aurora's DVD

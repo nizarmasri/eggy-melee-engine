@@ -31,7 +31,7 @@ target_compile_options(aurora_gd PRIVATE ${MELEE_FP_FLAGS})
 # game needs goes in this list.
 set(BROWSER_PC_SOURCES
  audio.c discfont.c gcadapter.c gx.c input_poll.c keyboard.c misc.c os.c profile.c region.c stb_vorbis.c thp.c touch.c vi.c widescreen.c
- eggy/eggy.c eggy/eggy_config.c eggy/eggy_hold.c eggy/eggy_net.c
+ eggy/eggy.c eggy/eggy_config.c eggy/eggy_hold.c eggy/eggy_net.c eggy/eggy_perf.c
  android_compat.cpp music_stream.cpp textures.cpp
  net.c net_chat.c net_dht.c net_dht_item.c net_handshake.c net_identity.c net_lan.c net_match_web.c net_rank.c
  net_mesh.c net_mesh_wire.c net_rank_session.c net_resync.c net_rank_store.c net_reliable.c net_sfx.c net_sim.c net_snapshot.c net_sync.c net_watchdog.c net_web.c net_wire.c
@@ -55,12 +55,20 @@ target_link_libraries(melee_browser PRIVATE aurora::core aurora::gx aurora::gd a
 set(EGGY_EXPORTS _eggy_config_buffer _eggy_load _eggy_go _eggy_pad _eggy_hud _eggy_results _eggy_abort
  _eggy_checksum _eggy_audio _eggy_costumes _eggy_team_costume _eggy_net_stats
  _eggy_snapshot_begin _eggy_snapshot_size _eggy_snapshot_buffer _eggy_snapshot_frame
- _eggy_snapshot_reserve _eggy_snapshot_apply _eggy_test_desync _eggy_view _eggy_fighter _eggy_tap)
+ _eggy_snapshot_reserve _eggy_snapshot_apply _eggy_test_desync _eggy_view _eggy_fighter _eggy_tap _eggy_perf)
 list(JOIN EGGY_EXPORTS "," EGGY_EXPORTS)
 # MELEE_STATE_SECTIONS: the netplay snapshot ranges (tools/browser/wasm_state_sections.py).
 target_compile_definitions(melee_browser PRIVATE TARGET_PC=1 MELEE_PC=1 MELEE_USE_BUILTIN_SHA1 MELEE_STATE_SECTIONS=1)
 target_compile_options(melee_browser PRIVATE -Wno-incompatible-pointer-types -Wno-int-conversion ${MELEE_FP_FLAGS})
-target_link_options(melee_browser PRIVATE -O1 --profiling-funcs -sEMULATE_FUNCTION_POINTER_CASTS=1 -sSTACK_SIZE=8388608 -sINITIAL_MEMORY=268435456 -sMAXIMUM_MEMORY=2147483648 -sPTHREAD_POOL_SIZE=4 -sEXIT_RUNTIME=0 -sASSERTIONS=0 -lidbfs.js -sFORCE_FILESYSTEM=1 -Wl,--wrap=clock_gettime -Wl,--wrap=PADRead -sEXPORTED_FUNCTIONS=_main,_net_web_pump,${EGGY_EXPORTS} -sEXPORTED_RUNTIME_METHODS=callMain,FS,ENV,HEAPU8,HEAP32 -sINVOKE_RUN=0 -sASYNCIFY_IMPORTS=browser_disc_read -sASYNCIFY_STACK_SIZE=1048576 -sERROR_ON_UNDEFINED_SYMBOLS=1 -Wl,--error-limit=0)
+# Asyncify instruments every function that might be on the stack when the game
+# yields to the page (the frame boundary, disc polls and reads, the GPU wait at
+# a frame's start), and every indirect call counts as might: three functions in
+# four were instrumented, drawing included. asyncify-remove.json names what can
+# never be on that stack -- GX and aurora's command processing and encoding, the
+# HSD display tree, math, the allocator and its locks -- and they run plain.
+# A function listed there must never reach browser_yield, emscripten_sleep or
+# browser_disc_read: Asyncify cannot unwind through it.
+target_link_options(melee_browser PRIVATE -O1 --profiling-funcs -sEMULATE_FUNCTION_POINTER_CASTS=1 -sSTACK_SIZE=8388608 -sINITIAL_MEMORY=268435456 -sMAXIMUM_MEMORY=2147483648 -sPTHREAD_POOL_SIZE=4 -sEXIT_RUNTIME=0 -sASSERTIONS=0 -lidbfs.js -sFORCE_FILESYSTEM=1 -Wl,--wrap=clock_gettime -Wl,--wrap=PADRead -sEXPORTED_FUNCTIONS=_main,_net_web_pump,${EGGY_EXPORTS} -sEXPORTED_RUNTIME_METHODS=callMain,FS,ENV,HEAPU8,HEAP32 -sINVOKE_RUN=0 -sASYNCIFY_IMPORTS=browser_disc_read -sASYNCIFY_REMOVE=@${CMAKE_CURRENT_SOURCE_DIR}/asyncify-remove.json -sASYNCIFY_STACK_SIZE=1048576 -sERROR_ON_UNDEFINED_SYMBOLS=1 -Wl,--error-limit=0)
 set_target_properties(melee_browser PROPERTIES SUFFIX ".js")
 # emcc's single-pass link fails validation at -O2/-O3 when --fpcast-emu runs
 # ahead of the optimizer (direct calls into cast thunks keep the original

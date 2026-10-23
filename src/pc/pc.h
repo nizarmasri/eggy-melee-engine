@@ -25,6 +25,10 @@ uint64_t pc_sim_period_ns(void);
  * and a 0.1 ms sleep for the game's disc wait loops, src/pc/os.c. */
 void pc_os_wait_alarm(void);
 void pc_os_yield(void);
+/* Whether `size` bytes at `p` lie inside MEM1, where the game's heaps are:
+ * for the few places the game reads through a pointer it may have left
+ * dangling (src/pc/os.c). */
+bool pc_in_mem1(const void* p, uint32_t size);
 
 /* Append a line to the diagnostic log (src/pc/main.c), so frame stalls
  * interleave with aurora's own records and can be attributed to whatever

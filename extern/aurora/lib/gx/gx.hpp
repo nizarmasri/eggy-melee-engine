@@ -556,6 +556,8 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
                                     const char* label) noexcept;
 #ifdef __EMSCRIPTEN__
 bool take_browser_pipeline(gfx::PipelineRef ref, wgpu::RenderPipeline& pipeline);
+/* The browser's pipeline compilations asked for and not finished. */
+uint32_t browser_pipelines_compiling();
 #endif
 std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttachment = UINT32_MAX) noexcept;
 wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTargetLayout& layout) noexcept;

@@ -88,6 +88,25 @@
  * which is its shape too (widescreen follows the window); taken at the next
  * frame boundary. 64..4096 each, else -1. Each phone may pick its own.
  *
+ * Frame report (int32 words at eggy_perf(); totals since the last read, and
+ * each read starts the next; src/pc/eggy/eggy_perf.c). Times in microseconds:
+ *   [0] frames drawn (frame boundaries), [1] ticks simulated fresh, [2] ticks
+ *   re-simulated (rollback, sync test)
+ *   [3] in fresh ticks, [4] in re-run ticks, [5] drawing (the game's render
+ *   pass and aurora turning it into GPU work), [6] submitting (aurora_end_frame:
+ *   encode, upload, present), [7] waiting for the GPU (aurora_begin_frame),
+ *   [8] spare (the pacing's sleep and the pad wait: ahead of time), [9]
+ *   yielded with no time to spare (the browser's own work between frames),
+ *   [10] everything else (audio, alarms, netplay, events)
+ *   [11] the longest frame, boundary to boundary, [12] frames over 20 ms,
+ *   [13] over 34 ms
+ *   [14] draws in the last frame, [15] of them merged, [16] pipelines created,
+ *   [17] queued, [18] the browser's pipeline compilations still running
+ *   [19] the window these cover
+ *   [20] cached pipelines still to build behind the frames
+ *   (MELEE_PIPELINES_BACKGROUND), [21] vertex, [22] index and [23] uniform
+ *   data of the last frame, in KiB
+ *
  * Results (int32 words at eggy_results(), filled before onState('ended')):
  *   [0] end frame: the match frame on which GAME! or TIME! came
  *   [1] outcome: 0 normal, 1 time out, 2 sudden death then decided, 3 aborted,
@@ -121,6 +140,20 @@ extern "C" {
 #define EGGY_FIGHTER_WORDS (EGGY_FIGHTER_SEEN_AT + EGGY_FIGHTER_SEEN_WORDS + 1)
 #define EGGY_NET_PHONES_MIN 2
 #define EGGY_NET_PHONES_MAX 4
+#define EGGY_PERF_WORDS 24
+
+/* Where the clock goes (pc_eggy_perf_enter). */
+enum EggyPerfSection {
+    EGGY_PERF_OTHER = 0,
+    EGGY_PERF_TICK = 1,
+    EGGY_PERF_RERUN = 2,
+    EGGY_PERF_DRAW = 3,
+    EGGY_PERF_SUBMIT = 4,
+    EGGY_PERF_GPU_WAIT = 5,
+    EGGY_PERF_SPARE = 6,
+    EGGY_PERF_YIELD = 7,
+    EGGY_PERF_SECTIONS = 8,
+};
 
 /* CharacterKind 0..25, Sheik included. */
 #define EGGY_CKIND_COUNT 26
@@ -258,6 +291,7 @@ int eggy_snapshot_apply(const uint8_t* ptr, int len, int32_t frame);
 int eggy_test_desync(void);
 int eggy_view(int width, int height);
 const int32_t* eggy_fighter(int port);
+const int32_t* eggy_perf(void);
 
 /* ---- hooks the engine calls -------------------------------------------- */
 
@@ -282,6 +316,12 @@ void pc_eggy_sampling(bool on);
 void pc_eggy_frame_end(void);
 /* platforms/browser/pc_stubs.c: the config's frozen Pokemon Stadium. */
 bool pc_eggy_frozen_stadium(void);
+/* The frame report (eggy_perf.c): the clock goes to `section` from now, and
+ * the section it left is returned, to hand the clock back to. */
+int pc_eggy_perf_enter(int section);
+/* gmscene.c, per simulated tick; vi.c, per frame boundary. */
+void pc_eggy_perf_tick(bool rerun);
+void pc_eggy_perf_boundary(void);
 
 #ifdef __cplusplus
 }

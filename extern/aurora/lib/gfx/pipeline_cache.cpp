@@ -1,6 +1,7 @@
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 extern "C" void browser_yield(void);
+extern "C" uint32_t aurora_browser_pipelines_compiling(void); /* gx/gx.cpp */
 EM_JS(void, browser_graphics_progress, (unsigned done, unsigned total), {
   Module.onGraphicsPreparation?.(done, total);
 });
@@ -1482,13 +1483,35 @@ void begin_pipeline_frame() {
 }
 
 #ifdef __EMSCRIPTEN__
+// How many of the browser's asynchronous pipeline compilations the known rows
+// may keep running at once, built a few per frame (end_pipeline_frame); 0
+// leaves them to wait_pipelines. MELEE_PIPELINES_BACKGROUND=<n> at boot: Safari
+// compiles each pipeline into Metal in its GPU process, about 50 ms apiece on
+// an iPhone 11, and the whole cache before the first frame took 47 s there and
+// lost that process soon after. The host turns it off while a match is played
+// (aurora_background_pipelines), so the fight's own pipelines go first.
+static uint32_t g_browserBackgroundInFlight = 0;
+
+extern "C" void aurora_background_pipelines(uint32_t max_in_flight) { g_browserBackgroundInFlight = max_in_flight; }
+
+extern "C" uint32_t aurora_background_pipelines_left() {
+  std::lock_guard lock{g_pipelineMutex};
+  return static_cast<uint32_t>(g_backgroundPipelineQueue.size());
+}
+
 // Restore the cache before simulation begins. Without workers, frames build
 // only what they draw, so known pipelines would otherwise wait for a launcher.
 // wait_pipelines builds the queues on this thread; yielding between slices
 // lets the asynchronous creations resolve and the page paint the progress.
+// With MELEE_PIPELINES_BACKGROUND they are built behind the frames instead.
 extern "C" void browser_prepare_graphics() {
   const uint32_t total = wait_pipelines(0);
   if (!total) return;
+  if (const char* background = std::getenv("MELEE_PIPELINES_BACKGROUND"); background != nullptr && std::atoi(background) > 0) {
+    g_browserBackgroundInFlight = static_cast<uint32_t>(std::atoi(background));
+    Log.info("Building {} cached browser pipelines in the background, {} at a time", total, g_browserBackgroundInFlight);
+    return;
+  }
   browser_graphics_progress(0, total);
   for (uint32_t left = total; left != 0;) {
     left = wait_pipelines(16);
@@ -1502,6 +1525,22 @@ extern "C" void browser_prepare_graphics() {
 void end_pipeline_frame() {
   if (!g_hasPipelineThread) {
     pipeline_worker();
+#ifdef __EMSCRIPTEN__
+    for (int built = 0; built < 2 && g_browserBackgroundInFlight != 0 &&
+                        aurora_browser_pipelines_compiling() < g_browserBackgroundInFlight;
+         ++built) {
+      PendingPipeline pending;
+      {
+        std::lock_guard lock{g_pipelineMutex};
+        if (g_backgroundPipelineQueue.empty()) {
+          break;
+        }
+        pending = std::move(g_backgroundPipelineQueue.front());
+        g_backgroundPipelineQueue.pop_front();
+      }
+      build_pending_pipeline(pending);
+    }
+#endif
   }
 }
 

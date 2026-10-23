@@ -148,9 +148,29 @@ void pc_eggy_preinit(void) {
     SDL_SetHint(SDL_HINT_EMSCRIPTEN_KEYBOARD_ELEMENT, "#none");
 }
 
+/* The cached pipelines building behind the frames (MELEE_PIPELINES_BACKGROUND,
+ * aurora's pipeline_cache.cpp) stop while a match is played: the fight's own
+ * pipelines come first, and a compile in the GPU process slows every frame. */
+extern void aurora_background_pipelines(uint32_t max_in_flight);
+
+static void background_pipelines(bool on) {
+    static int in_flight = -1;
+    if (in_flight < 0) {
+        const char* n = getenv("MELEE_PIPELINES_BACKGROUND");
+        in_flight = n != NULL ? atoi(n) : 0;
+        if (in_flight < 0) {
+            in_flight = 0;
+        }
+    }
+    if (in_flight > 0) {
+        aurora_background_pipelines(on ? (uint32_t)in_flight : 0);
+    }
+}
+
 static void set_state(int state) {
     s_state = state;
     s_hud[0] = state;
+    background_pipelines(state != EGGY_STATE_FIGHTING);
 }
 
 static bool fighting(void) {

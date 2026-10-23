@@ -26,63 +26,63 @@ namespace aurora::gx::fifo {
 namespace {
 constexpr Module Log{"aurora::gx::fifo"};
 
+// The triangle-list indices for every vertex of every frame, written straight
+// into room made once (an append per index was the browser engine's hottest
+// loop). The same indices, in the same order, as one append each.
 u16 prepare_idx_buffer(ByteBuffer& buf, GXPrimitive prim, u16 vtxStart, u16 vtxCount) noexcept {
+  if (prim == GX_QUADS || prim == GX_TRIANGLES || prim == GX_TRIANGLEFAN || prim == GX_TRIANGLESTRIP) {
+    const u32 count = prim == GX_QUADS       ? ((u32(vtxCount) + 3) / 4) * 6
+                      : prim == GX_TRIANGLES ? u32(vtxCount)
+                      : vtxCount < 3         ? u32(vtxCount)
+                                             : (u32(vtxCount) - 2) * 3;
+    if (count == 0) {
+      return 0;
+    }
+    u8* out = buf.append_uninitialized(count * sizeof(u16));
+    const auto put = [&out](u32 idx) {
+      const u16 v = static_cast<u16>(idx);
+      std::memcpy(out, &v, sizeof v);
+      out += sizeof v;
+    };
+    if (prim == GX_QUADS) {
+      for (u32 v = 0; v < vtxCount; v += 4) {
+        const u32 idx0 = vtxStart + v;
+        put(idx0);
+        put(idx0 + 1);
+        put(idx0 + 2);
+        put(idx0 + 2);
+        put(idx0 + 3);
+        put(idx0);
+      }
+    } else if (prim == GX_TRIANGLES) {
+      for (u32 v = 0; v < vtxCount; ++v) {
+        put(vtxStart + v);
+      }
+    } else {
+      const bool fan = prim == GX_TRIANGLEFAN;
+      for (u32 v = 0; v < vtxCount; ++v) {
+        const u32 idx = vtxStart + v;
+        if (v < 3) {
+          put(idx);
+        } else if (fan) {
+          put(vtxStart);
+          put(idx - 1);
+          put(idx);
+        } else if ((v & 1) == 0) {
+          put(idx - 2);
+          put(idx - 1);
+          put(idx);
+        } else {
+          put(idx - 1);
+          put(idx - 2);
+          put(idx);
+        }
+      }
+    }
+    return static_cast<u16>(count);
+  }
   u16 numIndices = 0;
-  if (prim == GX_QUADS) {
-    buf.reserve_extra((vtxCount / 4) * 6 * sizeof(u16));
-
-    for (u16 v = 0; v < vtxCount; v += 4) {
-      u16 idx0 = vtxStart + v;
-      u16 idx1 = vtxStart + v + 1;
-      u16 idx2 = vtxStart + v + 2;
-      u16 idx3 = vtxStart + v + 3;
-
-      buf.append(idx0);
-      buf.append(idx1);
-      buf.append(idx2);
-      numIndices += 3;
-
-      buf.append(idx2);
-      buf.append(idx3);
-      buf.append(idx0);
-      numIndices += 3;
-    }
-  } else if (prim == GX_TRIANGLES) {
-    buf.reserve_extra(vtxCount * sizeof(u16));
-    for (u16 v = 0; v < vtxCount; ++v) {
-      const u16 idx = vtxStart + v;
-      buf.append(idx);
-      ++numIndices;
-    }
-  } else if (prim == GX_TRIANGLEFAN) {
-    buf.reserve_extra(((u32(vtxCount) - 3) * 3 + 3) * sizeof(u16));
-    for (u16 v = 0; v < vtxCount; ++v) {
-      const u16 idx = vtxStart + v;
-      if (v < 3) {
-        buf.append(idx);
-        ++numIndices;
-        continue;
-      }
-      buf.append(std::array{vtxStart, static_cast<u16>(idx - 1), idx});
-      numIndices += 3;
-    }
-  } else if (prim == GX_TRIANGLESTRIP) {
-    buf.reserve_extra(((static_cast<u32>(vtxCount) - 3) * 3 + 3) * sizeof(u16));
-    for (u16 v = 0; v < vtxCount; ++v) {
-      const u16 idx = vtxStart + v;
-      if (v < 3) {
-        buf.append(idx);
-        ++numIndices;
-        continue;
-      }
-      if ((v & 1) == 0) {
-        buf.append(std::array{static_cast<u16>(idx - 2), static_cast<u16>(idx - 1), idx});
-      } else {
-        buf.append(std::array{static_cast<u16>(idx - 1), static_cast<u16>(idx - 2), idx});
-      }
-      numIndices += 3;
-    }
-  } else if (prim == GX_LINES || prim == GX_LINESTRIP || prim == GX_POINTS) {
+  if (prim == GX_LINES || prim == GX_LINESTRIP || prim == GX_POINTS) {
     buf.reserve_extra(6 * sizeof(u16));
     buf.append<u16>(0);
     buf.append<u16>(1);

@@ -132,9 +132,15 @@ void pc_frame_boundary(void) {
 
     if (timing_debug < 0)
         timing_debug = getenv("MELEE_NET_DEBUG") != NULL;
+    /* The page's frame report (src/pc/eggy/eggy_perf.c): the boundary's own
+     * sections, and the clock back to whoever called it at the end. */
+    pc_eggy_perf_boundary();
+    const int perf_caller = pc_eggy_perf_enter(EGGY_PERF_OTHER);
     if (s_in_frame) {
         u64 started = timing_debug ? SDL_GetTicksNS() : 0;
+        pc_eggy_perf_enter(EGGY_PERF_SUBMIT);
         aurora_end_frame();
+        pc_eggy_perf_enter(EGGY_PERF_OTHER);
         if (timing_debug) {
             u64 elapsed = SDL_GetTicksNS() - started;
             if (elapsed > 20000000ull)
@@ -297,7 +303,9 @@ void pc_frame_boundary(void) {
          * (120/144/240 Hz) or VSync-off, this throttles simulation to exact 60 Hz. */
         if (PC_PACE_ALWAYS || !aurora_vsync_enabled() || want > 2000000ull) {
             u64 started = (fps_log || timing_debug) ? SDL_GetTicksNS() : 0;
+            pc_eggy_perf_enter(EGGY_PERF_SPARE);
             pc_pace_wait(want);
+            pc_eggy_perf_enter(EGGY_PERF_OTHER);
             if (fps_log || timing_debug) {
                 u64 slept = SDL_GetTicksNS() - started;
                 if (fps_log && slept > want && slept - want > sleep_worst_over_ns) {
@@ -312,8 +320,11 @@ void pc_frame_boundary(void) {
     }
     next_sim_ns += sim_period;
 #ifdef __EMSCRIPTEN__
-    if (!s_pace_waited)
+    if (!s_pace_waited) {
+        pc_eggy_perf_enter(EGGY_PERF_YIELD);
         browser_yield(); /* every frame returns to the event loop at least once */
+        pc_eggy_perf_enter(EGGY_PERF_OTHER);
+    }
     pc_refresh_input();
 #endif
 
@@ -322,7 +333,9 @@ void pc_frame_boundary(void) {
      * core at 100% polling SDL. */
     for (;;) {
         u64 started = timing_debug ? SDL_GetTicksNS() : 0;
+        pc_eggy_perf_enter(EGGY_PERF_GPU_WAIT);
         bool begun = aurora_begin_frame();
+        pc_eggy_perf_enter(EGGY_PERF_OTHER);
         if (timing_debug) {
             u64 elapsed = SDL_GetTicksNS() - started;
             if (elapsed > 20000000ull)
@@ -406,6 +419,7 @@ void pc_frame_boundary(void) {
                     elapsed / 1e6, s_retrace_count, pc_net_frame());
         }
     }
+    pc_eggy_perf_enter(perf_caller);
 }
 
 void VIWaitForRetrace(void) {

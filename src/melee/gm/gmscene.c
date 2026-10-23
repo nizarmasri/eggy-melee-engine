@@ -442,12 +442,20 @@ void gm_801A4D34(void (*on_frame)(void), GameSceneInfo* info)
              * and GObjs animate, but the decision is made once. */
             void (*frame_fn)(void) = s_scene_end_held != 0 ? NULL : on_frame;
             pc_net_sync();
+            /* MELEE_EGGY's frame report (src/pc/eggy/eggy_perf.c): fresh ticks
+             * and re-run ones apart. */
+            int perf = pc_eggy_perf_enter(EGGY_PERF_TICK);
             gm_RunSimTick(frame_fn, temp_r25);
+            pc_eggy_perf_enter(perf);
+            pc_eggy_perf_tick(false);
             /* Finish rollback / sync-test re-simulation before gating the exit,
              * but never insert
              * a fresh tick past an exit request or its agreed boundary. */
             while (pc_net_after_tick(temp_r25->unk_C != 0 || s_scene_end_held != 0)) {
+                perf = pc_eggy_perf_enter(EGGY_PERF_RERUN);
                 gm_RunSimTick(frame_fn, temp_r25);
+                pc_eggy_perf_enter(perf);
+                pc_eggy_perf_tick(true);
             }
             /* Per TICK, not per pad batch: a batch is however many pad
              * periods the last load let pile up, so checking once per batch
@@ -468,6 +476,7 @@ void gm_801A4D34(void (*on_frame)(void), GameSceneInfo* info)
 
 #ifdef TARGET_PC
         pc_net_render_audit(false);
+        const int perf_draw = pc_eggy_perf_enter(EGGY_PERF_DRAW);
 #endif
         lb_800195D0();
         GXInvalidateVtxCache();
@@ -478,6 +487,7 @@ void gm_801A4D34(void (*on_frame)(void), GameSceneInfo* info)
         HSD_PerfSetDrawTime();
         HSD_VICopyXFBAsync(HSD_RP_SCREEN);
 #ifdef TARGET_PC
+        pc_eggy_perf_enter(perf_draw);
         pc_net_render_audit(true);
 #endif
         if (temp_r25->unk_4 != -2U) {
