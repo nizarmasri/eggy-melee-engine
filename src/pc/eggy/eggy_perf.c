@@ -33,6 +33,7 @@ static int32_t s_late_20;
 static int32_t s_late_34;
 static int32_t s_ticks;
 static int32_t s_reruns;
+static int32_t s_undrawn;
 static int32_t s_words[EGGY_PERF_WORDS];
 
 int pc_eggy_perf_enter(int section) {
@@ -56,8 +57,9 @@ void pc_eggy_perf_tick(bool rerun) {
     }
 }
 
-void pc_eggy_perf_boundary(void) {
+void pc_eggy_perf_boundary(bool undrawn) {
     const double now = emscripten_get_now();
+    s_undrawn += undrawn;
     if (s_last_boundary != 0) {
         const double frame = now - s_last_boundary;
         if (frame > s_worst_ms) {
@@ -106,9 +108,10 @@ EMSCRIPTEN_KEEPALIVE const int32_t* eggy_perf(void) {
     s_words[18] = (int32_t)aurora_browser_pipelines_compiling();
     s_words[19] = us(now - s_window_start);
     s_words[20] = (int32_t)aurora_background_pipelines_left();
+    s_words[24] = s_undrawn;
     memset(s_ms, 0, sizeof s_ms);
     s_window_start = now;
     s_worst_ms = 0;
-    s_frames = s_late_20 = s_late_34 = s_ticks = s_reruns = 0;
+    s_frames = s_late_20 = s_late_34 = s_ticks = s_reruns = s_undrawn = 0;
     return s_words;
 }

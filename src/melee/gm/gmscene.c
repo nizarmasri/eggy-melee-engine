@@ -475,6 +475,16 @@ void gm_801A4D34(void (*on_frame)(void), GameSceneInfo* info)
         }
 
 #ifdef TARGET_PC
+        /* MELEE_EGGY's quality (eggy_draw_every): a phone that cannot draw
+         * every frame of a match skips some of the drawing, never a tick. The
+         * frame boundary still runs, so pacing, the retrace callbacks and the
+         * pad alarm are a drawn frame's; the render touches no simulation
+         * state (a rollback re-run draws nothing either, and
+         * MELEE_NET_RENDER_AUDIT checks it). */
+        if (pc_eggy_skip_draw()) {
+            lb_800195D0();
+            pc_frame_boundary_undrawn();
+        } else {
         pc_net_render_audit(false);
         const int perf_draw = pc_eggy_perf_enter(EGGY_PERF_DRAW);
 #endif
@@ -489,6 +499,7 @@ void gm_801A4D34(void (*on_frame)(void), GameSceneInfo* info)
 #ifdef TARGET_PC
         pc_eggy_perf_enter(perf_draw);
         pc_net_render_audit(true);
+        }
 #endif
         if (temp_r25->unk_4 != -2U) {
             temp_r25->unk_4++;

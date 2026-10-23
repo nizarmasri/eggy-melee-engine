@@ -294,6 +294,30 @@ EMSCRIPTEN_KEEPALIVE int eggy_view(int width, int height) {
     return 0;
 }
 
+/* ---- quality --------------------------------------------------------------
+ * eggy_draw_every(n): while a match is played, one frame in n is drawn and the
+ * others skip their render pass (gmscene.c); ticks are untouched. A count of
+ * frames since the fight started picks which, so the pattern starts over with
+ * every match. Presentation only, like the picture's size. */
+static int s_draw_every = 1;
+static uint32_t s_draw_count;
+
+EMSCRIPTEN_KEEPALIVE int eggy_draw_every(int n) {
+    if (n < 1 || n > 4) {
+        return -1;
+    }
+    s_draw_every = n;
+    return 0;
+}
+
+bool pc_eggy_skip_draw(void) {
+    if (!pc_eggy_enabled() || s_state != EGGY_STATE_FIGHTING || s_draw_every <= 1) {
+        s_draw_count = 0;
+        return false;
+    }
+    return s_draw_count++ % (uint32_t)s_draw_every != 0;
+}
+
 void pc_eggy_frame_end(void) {
     if (!pc_eggy_enabled() || s_view_w == 0) {
         return;

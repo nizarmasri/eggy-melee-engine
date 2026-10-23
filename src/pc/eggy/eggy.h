@@ -105,7 +105,12 @@
  *   [19] the window these cover
  *   [20] cached pipelines still to build behind the frames
  *   (MELEE_PIPELINES_BACKGROUND), [21] vertex, [22] index and [23] uniform
- *   data of the last frame, in KiB
+ *   data of the last frame, in KiB, [24] frames not drawn (eggy_draw_every)
+ *
+ * Quality: eggy_draw_every(n), n 1..4, draws one frame in n of a match being
+ * played and skips the drawing of the rest; every tick still runs, at 60 a
+ * second, so a phone that cannot draw each frame plays at full speed and keeps
+ * its place in a netplay match. Each phone may pick its own; 1 by default.
  *
  * Results (int32 words at eggy_results(), filled before onState('ended')):
  *   [0] end frame: the match frame on which GAME! or TIME! came
@@ -140,7 +145,7 @@ extern "C" {
 #define EGGY_FIGHTER_WORDS (EGGY_FIGHTER_SEEN_AT + EGGY_FIGHTER_SEEN_WORDS + 1)
 #define EGGY_NET_PHONES_MIN 2
 #define EGGY_NET_PHONES_MAX 4
-#define EGGY_PERF_WORDS 24
+#define EGGY_PERF_WORDS 25
 
 /* Where the clock goes (pc_eggy_perf_enter). */
 enum EggyPerfSection {
@@ -292,6 +297,7 @@ int eggy_test_desync(void);
 int eggy_view(int width, int height);
 const int32_t* eggy_fighter(int port);
 const int32_t* eggy_perf(void);
+int eggy_draw_every(int n);
 
 /* ---- hooks the engine calls -------------------------------------------- */
 
@@ -321,7 +327,10 @@ bool pc_eggy_frozen_stadium(void);
 int pc_eggy_perf_enter(int section);
 /* gmscene.c, per simulated tick; vi.c, per frame boundary. */
 void pc_eggy_perf_tick(bool rerun);
-void pc_eggy_perf_boundary(void);
+void pc_eggy_perf_boundary(bool undrawn);
+/* gmscene.c, before a frame's render pass: true to skip its drawing
+ * (eggy_draw_every). */
+bool pc_eggy_skip_draw(void);
 
 #ifdef __cplusplus
 }

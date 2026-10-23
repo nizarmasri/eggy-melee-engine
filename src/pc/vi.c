@@ -44,6 +44,10 @@ static void* s_next_fb;
 static void* s_current_fb;
 static BOOL s_black;
 static bool s_in_frame;
+/* This boundary ends a frame that drew nothing (pc_frame_boundary_undrawn):
+ * aurora's frame stays open for the next one to draw into, so the screen keeps
+ * the last picture instead of presenting an empty one. */
+static bool s_undrawn;
 
 void pc_os_run_alarms(void);
 void aurora_heap_check(void);
@@ -134,9 +138,9 @@ void pc_frame_boundary(void) {
         timing_debug = getenv("MELEE_NET_DEBUG") != NULL;
     /* The page's frame report (src/pc/eggy/eggy_perf.c): the boundary's own
      * sections, and the clock back to whoever called it at the end. */
-    pc_eggy_perf_boundary();
+    pc_eggy_perf_boundary(s_undrawn);
     const int perf_caller = pc_eggy_perf_enter(EGGY_PERF_OTHER);
-    if (s_in_frame) {
+    if (s_in_frame && !s_undrawn) {
         u64 started = timing_debug ? SDL_GetTicksNS() : 0;
         pc_eggy_perf_enter(EGGY_PERF_SUBMIT);
         aurora_end_frame();
@@ -157,8 +161,10 @@ void pc_frame_boundary(void) {
     extern void pc_audio_pump(void);
     pc_audio_pump();
 #endif
-    aurora_heap_check();    /* no-op unless MELEE_HEAP_CHECK is set */
-    pc_eggy_frame_end();    /* MELEE_EGGY: the page's picture size (eggy_view) */
+    aurora_heap_check(); /* no-op unless MELEE_HEAP_CHECK is set */
+    if (!s_in_frame) {
+        pc_eggy_frame_end(); /* MELEE_EGGY: the page's picture size (eggy_view), between frames */
+    }
     pc_widescreen_update(); /* Auto mode follows window resizes. */
     /* MELEE_LAN_TEST=1|host: the LAN lobby without the menu; "host" starts
      * a match with the first peer found. MELEE_LAN_DIRECT=ip:port: the same
@@ -330,8 +336,9 @@ void pc_frame_boundary(void) {
 
     /* aurora_begin_frame returns false while minimized/paused; keep pumping.
      * Sleep a frame between attempts: without it a minimized window spins a
-     * core at 100% polling SDL. */
-    for (;;) {
+     * core at 100% polling SDL. An undrawn frame's boundary keeps the frame
+     * that is open. */
+    if (!s_in_frame) for (;;) {
         u64 started = timing_debug ? SDL_GetTicksNS() : 0;
         pc_eggy_perf_enter(EGGY_PERF_GPU_WAIT);
         bool begun = aurora_begin_frame();
@@ -430,6 +437,14 @@ void VIWaitForRetrace(void) {
     while (pc_menu_is_open() && !pc_exit_requested) {
         pc_frame_boundary();
     }
+}
+
+/* The boundary of a frame the game did not draw (gmscene.c, MELEE_EGGY's
+ * eggy_draw_every): everything a retrace does, with aurora's frame kept open. */
+void pc_frame_boundary_undrawn(void) {
+    s_undrawn = true;
+    VIWaitForRetrace();
+    s_undrawn = false;
 }
 
 u32 VIGetRetraceCount(void) {
