@@ -6,7 +6,8 @@ what tools/browser/bundle.py would put in the web app's folder, minus
 melee.pak, so the release is code only:
 
 - melee_browser.js and melee_browser.wasm (DWARF and producers stripped the
-  way bundle.py strips them, function names kept), each with a brotli .br;
+  way bundle.py strips them, function names kept: --logs lists them by index
+  in wasm-names.txt), each with a brotli .br;
 - any other script the link emitted beside them (pthread or worklet loaders);
 - initial_pipeline_cache.db.gz, the shader seed the page installs as
   /initial_pipeline_cache.db (tools/browser/vs_pipeline_cache.db.gz);
@@ -147,6 +148,31 @@ def wasm_interface(data):
     return imports, exports, shared
 
 
+def wasm_function_names(data):
+    """{function index: name} from the wasm's name section (subsection 1), or {}."""
+    pos = 8
+    while pos < len(data):
+        section = data[pos]
+        size, pos = leb(data, pos + 1)
+        end = pos + size
+        if section == 0:
+            name, at = wasm_name(data, pos)
+            if name == 'name':
+                while at < end:
+                    kind = data[at]
+                    length, at = leb(data, at + 1)
+                    if kind == 1:
+                        names = {}
+                        count, sub = leb(data, at)
+                        for _ in range(count):
+                            index, sub = leb(data, sub)
+                            names[index], sub = wasm_name(data, sub)
+                        return names
+                    at += length
+        pos = end
+    return {}
+
+
 def scan_glue(text):
     lines = []
     reads = sorted(set(re.findall(r'Module\[["\']([A-Za-z_$][\w$]*)["\']\]', text)) |
@@ -188,7 +214,9 @@ def main():
     out.mkdir(parents=True)
 
     print('link output:', *sorted(p.name for p in RUNTIME.iterdir() if p.is_file()))
-    subprocess.run([SDK / 'upstream/bin/wasm-opt', '--strip-dwarf', '--strip-producers', *FEATURES,
+    # -g keeps the name section: a phone's error stack and a profile then name
+    # the engine's functions instead of numbering them.
+    subprocess.run([SDK / 'upstream/bin/wasm-opt', '-g', '--strip-dwarf', '--strip-producers', *FEATURES,
                     RUNTIME / WASM, '-o', out / WASM], check=True)
     # The glue, plus any worker or worklet script the link wrote beside it.
     scripts = sorted(p for p in RUNTIME.iterdir() if p.is_file() and p.suffix in ('.js', '.mjs'))
@@ -234,6 +262,9 @@ def main():
         logs.mkdir(parents=True, exist_ok=True)
         (logs / 'wasm-imports.txt').write_text('\n'.join(imports) + '\n')
         (logs / 'wasm-exports.txt').write_text('\n'.join(exports) + '\n')
+        names = wasm_function_names((out / WASM).read_bytes())
+        (logs / 'wasm-names.txt').write_text(''.join(f'{i}\t{n}\n' for i, n in sorted(names.items())))
+        print(f'{len(names)} function names kept')
         report = scan_glue((out / ENTRY).read_text(errors='replace'))
         (logs / 'glue-report.txt').write_text(report)
         print(f'{len(imports)} wasm imports, {len(exports)} exports; glue scan:\n{report}')
