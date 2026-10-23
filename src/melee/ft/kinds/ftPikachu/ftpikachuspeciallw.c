@@ -20,6 +20,30 @@
 #include <melee/ft/kinds/ftCommon/inlines.h>
 #include <melee/ft/types.h>
 #include <melee/it/kinds/itpikachuthunder.h>
+#ifdef TARGET_PC
+#include "pc/pc.h"
+#include <melee/it/inlines.h>
+#include <melee/it/itCharItems.h>
+#include <melee/it/types.h>
+
+/* PORT: the bolt's destroy callback (it_2725_Logic39_Destroyed) re-arms x4
+ * but leaves x0 on the item it was, so ftPk_SpecialLw_8012765C can read a
+ * freed item. On a GameCube that finds stale data and goes on; here, once the
+ * memory has gone to something else, a pointer past the end of memory, and
+ * the engine traps (an iPhone, Pikachu's aerial down-B, 2026-10-21). Stale but
+ * readable data is read as the GameCube reads it; only a chain that leaves
+ * MEM1 (the same range on every phone) counts as no bolt. */
+static bool thunder_readable(Item_GObj* thunder)
+{
+    if (!pc_in_mem1(thunder, sizeof(HSD_GObj))) {
+        return false;
+    }
+    Item* ip = GET_ITEM(thunder);
+    return pc_in_mem1(ip, sizeof(Item)) && pc_in_mem1(ip->xC4_article_data, sizeof(Article)) &&
+           pc_in_mem1(DP(itPikachuthunderAttributes, ip->xC4_article_data->x4_specialAttributes),
+                      sizeof(itPikachuthunderAttributes));
+}
+#endif
 
 bool ftPk_SpecialLw_CheckProperty(HSD_GObj* gobj)
 {
@@ -74,6 +98,11 @@ bool ftPk_SpecialLw_8012765C(HSD_GObj* gobj)
         return false;
     }
 
+#ifdef TARGET_PC
+    if (thunder_gobj != NULL && !thunder_readable(thunder_gobj)) {
+        return false;
+    }
+#endif
     if (thunder_gobj) {
         it_802B1FE8(thunder_gobj, &vec);
     } else {

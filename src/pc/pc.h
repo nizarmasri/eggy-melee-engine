@@ -19,12 +19,19 @@ void pc_platform_init(void);
 /* Frame boundary: presents the current frame, pumps events, starts the next
  * frame and runs due OSAlarms. Called from VIWaitForRetrace. */
 void pc_frame_boundary(void);
+/* A frame boundary after a frame that drew nothing: the screen keeps the last
+ * picture (src/pc/vi.c). */
+void pc_frame_boundary_undrawn(void);
 /* Simulation frame period the boundary paces to (60.000 Hz), src/pc/vi.c. */
 uint64_t pc_sim_period_ns(void);
 /* Sleep (at most 1 ms) toward the next due OSAlarm instead of spinning for it,
  * and a 0.1 ms sleep for the game's disc wait loops, src/pc/os.c. */
 void pc_os_wait_alarm(void);
 void pc_os_yield(void);
+/* Whether `size` bytes at `p` lie inside MEM1, where the game's heaps are:
+ * for the few places the game reads through a pointer it may have left
+ * dangling (src/pc/os.c). */
+bool pc_in_mem1(const void* p, uint32_t size);
 
 /* Append a line to the diagnostic log (src/pc/main.c), so frame stalls
  * interleave with aurora's own records and can be attributed to whatever

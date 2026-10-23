@@ -148,9 +148,29 @@ void pc_eggy_preinit(void) {
     SDL_SetHint(SDL_HINT_EMSCRIPTEN_KEYBOARD_ELEMENT, "#none");
 }
 
+/* The cached pipelines building behind the frames (MELEE_PIPELINES_BACKGROUND,
+ * aurora's pipeline_cache.cpp) stop while a match is played: the fight's own
+ * pipelines come first, and a compile in the GPU process slows every frame. */
+extern void aurora_background_pipelines(uint32_t max_in_flight);
+
+static void background_pipelines(bool on) {
+    static int in_flight = -1;
+    if (in_flight < 0) {
+        const char* n = getenv("MELEE_PIPELINES_BACKGROUND");
+        in_flight = n != NULL ? atoi(n) : 0;
+        if (in_flight < 0) {
+            in_flight = 0;
+        }
+    }
+    if (in_flight > 0) {
+        aurora_background_pipelines(on ? (uint32_t)in_flight : 0);
+    }
+}
+
 static void set_state(int state) {
     s_state = state;
     s_hud[0] = state;
+    background_pipelines(state != EGGY_STATE_FIGHTING);
 }
 
 static bool fighting(void) {
@@ -272,6 +292,30 @@ EMSCRIPTEN_KEEPALIVE int eggy_view(int width, int height) {
     s_view_w = width;
     s_view_h = height;
     return 0;
+}
+
+/* ---- quality --------------------------------------------------------------
+ * eggy_draw_every(n): while a match is played, one frame in n is drawn and the
+ * others skip their render pass (gmscene.c); ticks are untouched. A count of
+ * frames since the fight started picks which, so the pattern starts over with
+ * every match. Presentation only, like the picture's size. */
+static int s_draw_every = 1;
+static uint32_t s_draw_count;
+
+EMSCRIPTEN_KEEPALIVE int eggy_draw_every(int n) {
+    if (n < 1 || n > 4) {
+        return -1;
+    }
+    s_draw_every = n;
+    return 0;
+}
+
+bool pc_eggy_skip_draw(void) {
+    if (!pc_eggy_enabled() || s_state != EGGY_STATE_FIGHTING || s_draw_every <= 1) {
+        s_draw_count = 0;
+        return false;
+    }
+    return s_draw_count++ % (uint32_t)s_draw_every != 0;
 }
 
 void pc_eggy_frame_end(void) {

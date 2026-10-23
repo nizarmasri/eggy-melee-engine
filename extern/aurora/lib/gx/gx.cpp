@@ -50,6 +50,8 @@ wgpu::PipelineLayout sPipelineLayout;
 // Browser rendering and these callbacks share one realm. Keep pending results
 // separate until the pipeline cache can bind a fully compiled pipeline.
 absl::flat_hash_map<gfx::PipelineRef, std::shared_ptr<wgpu::RenderPipeline>> sBrowserPipelines;
+// Asked of the browser and not compiled yet (aurora_browser_pipelines_compiling).
+uint32_t sBrowserCompiling = 0;
 #endif
 
 std::atomic<int> sPendingViewportPolicy{-1};
@@ -391,8 +393,10 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
   const auto ref = xxh3_hash(layout.key, xxh3_hash(config, static_cast<HashType>(gfx::ShaderType::GX)));
   auto pending = std::make_shared<wgpu::RenderPipeline>();
   sBrowserPipelines[ref] = pending;
+  ++sBrowserCompiling;
   g_device.CreateRenderPipelineAsync(&descriptor, wgpu::CallbackMode::AllowSpontaneous,
       [pending](wgpu::CreatePipelineAsyncStatus status, wgpu::RenderPipeline pipeline, wgpu::StringView) {
+        if (sBrowserCompiling != 0) --sBrowserCompiling;
         if (status == wgpu::CreatePipelineAsyncStatus::Success) {
           *pending = std::move(pipeline);
         } else {
@@ -414,6 +418,10 @@ bool take_browser_pipeline(gfx::PipelineRef ref, wgpu::RenderPipeline& pipeline)
   sBrowserPipelines.erase(it);
   return true;
 }
+
+uint32_t browser_pipelines_compiling() { return sBrowserCompiling; }
+// For the host page's frame report (src/pc/eggy/eggy_perf.c).
+extern "C" uint32_t aurora_browser_pipelines_compiling() { return sBrowserCompiling; }
 #endif
 
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept {

@@ -289,10 +289,25 @@ public:
   [[nodiscard]] size_t size() const noexcept { return m_length; }
   [[nodiscard]] bool empty() const noexcept { return m_length == 0; }
 
+  // The capacity check is inline and resize() only runs to grow: every vertex,
+  // index and uniform of a frame comes through here, and a call per append
+  // was the browser engine's hottest path.
   void append(const void* data, size_t size) {
-    resize(m_length + size, false);
+    if (m_data == nullptr || m_length + size > m_capacity) [[unlikely]] {
+      resize(m_length + size, false);
+    }
     memcpy(m_data + m_length, data, size);
     m_length += size;
+  }
+
+  /** Room for `size` more bytes, written by the caller through the pointer returned. */
+  [[nodiscard]] uint8_t* append_uninitialized(size_t size) {
+    if (m_data == nullptr || m_length + size > m_capacity) [[unlikely]] {
+      resize(m_length + size, false);
+    }
+    uint8_t* at = m_data + m_length;
+    m_length += size;
+    return at;
   }
 
   template <typename T>
@@ -316,7 +331,11 @@ public:
   }
 
   void clear() { m_length = 0; }
-  void reserve_extra(size_t size) { resize(m_length + size, true); }
+  void reserve_extra(size_t size) {
+    if (m_data == nullptr || m_length + size > m_capacity) [[unlikely]] {
+      resize(m_length + size, true);
+    }
+  }
 
   ByteBuffer clone() const {
     ByteBuffer clone{m_length};

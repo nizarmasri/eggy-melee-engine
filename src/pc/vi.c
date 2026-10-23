@@ -44,6 +44,10 @@ static void* s_next_fb;
 static void* s_current_fb;
 static BOOL s_black;
 static bool s_in_frame;
+/* This boundary ends a frame that drew nothing (pc_frame_boundary_undrawn):
+ * aurora's frame stays open for the next one to draw into, so the screen keeps
+ * the last picture instead of presenting an empty one. */
+static bool s_undrawn;
 
 void pc_os_run_alarms(void);
 void aurora_heap_check(void);
@@ -132,9 +136,15 @@ void pc_frame_boundary(void) {
 
     if (timing_debug < 0)
         timing_debug = getenv("MELEE_NET_DEBUG") != NULL;
-    if (s_in_frame) {
+    /* The page's frame report (src/pc/eggy/eggy_perf.c): the boundary's own
+     * sections, and the clock back to whoever called it at the end. */
+    pc_eggy_perf_boundary(s_undrawn);
+    const int perf_caller = pc_eggy_perf_enter(EGGY_PERF_OTHER);
+    if (s_in_frame && !s_undrawn) {
         u64 started = timing_debug ? SDL_GetTicksNS() : 0;
+        pc_eggy_perf_enter(EGGY_PERF_SUBMIT);
         aurora_end_frame();
+        pc_eggy_perf_enter(EGGY_PERF_OTHER);
         if (timing_debug) {
             u64 elapsed = SDL_GetTicksNS() - started;
             if (elapsed > 20000000ull)
@@ -151,8 +161,10 @@ void pc_frame_boundary(void) {
     extern void pc_audio_pump(void);
     pc_audio_pump();
 #endif
-    aurora_heap_check();    /* no-op unless MELEE_HEAP_CHECK is set */
-    pc_eggy_frame_end();    /* MELEE_EGGY: the page's picture size (eggy_view) */
+    aurora_heap_check(); /* no-op unless MELEE_HEAP_CHECK is set */
+    if (!s_in_frame) {
+        pc_eggy_frame_end(); /* MELEE_EGGY: the page's picture size (eggy_view), between frames */
+    }
     pc_widescreen_update(); /* Auto mode follows window resizes. */
     /* MELEE_LAN_TEST=1|host: the LAN lobby without the menu; "host" starts
      * a match with the first peer found. MELEE_LAN_DIRECT=ip:port: the same
@@ -297,7 +309,9 @@ void pc_frame_boundary(void) {
          * (120/144/240 Hz) or VSync-off, this throttles simulation to exact 60 Hz. */
         if (PC_PACE_ALWAYS || !aurora_vsync_enabled() || want > 2000000ull) {
             u64 started = (fps_log || timing_debug) ? SDL_GetTicksNS() : 0;
+            pc_eggy_perf_enter(EGGY_PERF_SPARE);
             pc_pace_wait(want);
+            pc_eggy_perf_enter(EGGY_PERF_OTHER);
             if (fps_log || timing_debug) {
                 u64 slept = SDL_GetTicksNS() - started;
                 if (fps_log && slept > want && slept - want > sleep_worst_over_ns) {
@@ -312,48 +326,55 @@ void pc_frame_boundary(void) {
     }
     next_sim_ns += sim_period;
 #ifdef __EMSCRIPTEN__
-    if (!s_pace_waited)
+    if (!s_pace_waited) {
+        pc_eggy_perf_enter(EGGY_PERF_YIELD);
         browser_yield(); /* every frame returns to the event loop at least once */
+        pc_eggy_perf_enter(EGGY_PERF_OTHER);
+    }
     pc_refresh_input();
 #endif
 
     /* aurora_begin_frame returns false while minimized/paused; keep pumping.
      * Sleep a frame between attempts: without it a minimized window spins a
-     * core at 100% polling SDL. */
-    for (;;) {
-        u64 started = timing_debug ? SDL_GetTicksNS() : 0;
-        bool begun = aurora_begin_frame();
-        if (timing_debug) {
-            u64 elapsed = SDL_GetTicksNS() - started;
-            if (elapsed > 20000000ull)
-                pc_log_line("net timing: aurora_begin_frame %.1f ms at retrace %u frame %d",
-                    elapsed / 1e6, s_retrace_count, pc_net_frame());
-        }
-        if (begun)
-            break;
-        update_started = timing_debug ? SDL_GetTicksNS() : 0;
-        event = aurora_update();
-        if (timing_debug) {
-            u64 elapsed = SDL_GetTicksNS() - update_started;
-            if (elapsed > 50000000ull)
-                pc_log_line("net timing: aurora_update %.1f ms at retrace %u frame %d",
-                    elapsed / 1e6, s_retrace_count, pc_net_frame());
-        }
-        while (event != NULL && event->type != AURORA_NONE) {
-            if (event->type == AURORA_EXIT) {
-                pc_net_match_stop();
-                pc_net_disconnect();
-                pc_lan_stop();
-                exit(0);
+     * core at 100% polling SDL. An undrawn frame's boundary keeps the frame
+     * that is open. */
+    if (!s_in_frame)
+        for (;;) {
+            u64 started = timing_debug ? SDL_GetTicksNS() : 0;
+            pc_eggy_perf_enter(EGGY_PERF_GPU_WAIT);
+            bool begun = aurora_begin_frame();
+            pc_eggy_perf_enter(EGGY_PERF_OTHER);
+            if (timing_debug) {
+                u64 elapsed = SDL_GetTicksNS() - started;
+                if (elapsed > 20000000ull)
+                    pc_log_line("net timing: aurora_begin_frame %.1f ms at retrace %u frame %d",
+                        elapsed / 1e6, s_retrace_count, pc_net_frame());
             }
-            ++event;
-        }
+            if (begun)
+                break;
+            update_started = timing_debug ? SDL_GetTicksNS() : 0;
+            event = aurora_update();
+            if (timing_debug) {
+                u64 elapsed = SDL_GetTicksNS() - update_started;
+                if (elapsed > 50000000ull)
+                    pc_log_line("net timing: aurora_update %.1f ms at retrace %u frame %d",
+                        elapsed / 1e6, s_retrace_count, pc_net_frame());
+            }
+            while (event != NULL && event->type != AURORA_NONE) {
+                if (event->type == AURORA_EXIT) {
+                    pc_net_match_stop();
+                    pc_net_disconnect();
+                    pc_lan_stop();
+                    exit(0);
+                }
+                ++event;
+            }
 #ifdef __EMSCRIPTEN__
-        emscripten_sleep(16);
+            emscripten_sleep(16);
 #else
-        SDL_Delay(16);
+            SDL_Delay(16);
 #endif
-    }
+        }
     s_in_frame = true;
 
     /* Presentation-only chat reads the physical local controller, never a
@@ -406,6 +427,7 @@ void pc_frame_boundary(void) {
                     elapsed / 1e6, s_retrace_count, pc_net_frame());
         }
     }
+    pc_eggy_perf_enter(perf_caller);
 }
 
 void VIWaitForRetrace(void) {
@@ -416,6 +438,14 @@ void VIWaitForRetrace(void) {
     while (pc_menu_is_open() && !pc_exit_requested) {
         pc_frame_boundary();
     }
+}
+
+/* The boundary of a frame the game did not draw (gmscene.c, MELEE_EGGY's
+ * eggy_draw_every): everything a retrace does, with aurora's frame kept open. */
+void pc_frame_boundary_undrawn(void) {
+    s_undrawn = true;
+    VIWaitForRetrace();
+    s_undrawn = false;
 }
 
 u32 VIGetRetraceCount(void) {

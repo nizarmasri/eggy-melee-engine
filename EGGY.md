@@ -121,6 +121,8 @@ keeping a view across frames.
 | `int eggy_snapshot_apply(const uint8_t* ptr, int len, int32_t frame)` | 0 taken, or a resync error | a receiver hands the snapshot over; `resync` follows once applied |
 | `int eggy_test_desync(void)` | 1 armed | `MELEE_EGGY_TEST=1` only: this phone's fighter takes 10% the others never see, so it desyncs. `MELEE_EGGY_TEST=1` also makes every CPU Melee's Stay CPU, which never attacks, for the control tests |
 | `int eggy_view(int width, int height)` | 0, or -1 out of 64..4096 | the render size in pixels, and so the picture's shape; taken at the next frame boundary |
+| `const int32_t* eggy_perf(void)` | the frame report words | where the frame time went since the last read (ticks, re-run ticks, drawing, submitting, waiting for the GPU, spare, yielded), the longest frame and the late ones, draws, pipelines compiled and still compiling, and the last frame's vertex, index and uniform data; each read starts the next window (see `eggy.h`) |
+| `int eggy_draw_every(int n)` | 0, or -1 out of 1..4 | quality: while a match is played, one frame in `n` is drawn and the rest skip their render pass (the screen keeps the last picture); every tick still runs, 60 a second. Each phone may pick its own |
 | `const int32_t* eggy_fighter(int port)` | the fighter words | for tests: motion state, airborne, facing, position, ground speed, the stick as read, jumps used, and every motion state entered and the highest point reached since the last read, tick by tick, so a slow machine's skipped frames hide nothing (see `eggy.h`) |
 
 They are `Module._eggy_*` (EXPORTED_FUNCTIONS in `platforms/browser/CMakeLists.txt`).
@@ -773,6 +775,22 @@ from `gm_801A4014` (the VS state's `on_enter`); the hold from `gm_801A4D34`;
 and net.c's `wait_remote` and `resync_hold` (the leader's resync hold, inside
 `fresh_tick`).
 
+It is narrowed the other way instead: `platforms/browser/asyncify-remove.json`
+(`-sASYNCIFY_REMOVE`) names what can never be on the stack when the engine
+yields, so it runs uninstrumented. Before it, 11,255 of 14,839 functions were
+instrumented, every caller of `malloc` among them, and a profile of a VS match
+spent two thirds of the page's main thread drawing: `HSD_PObjDisp` into
+`GXCallDisplayList` into aurora's command processor, with `prepare_idx_buffer`
+alone 38% (an out-of-line `ByteBuffer::resize` call per index, each wrapped
+in Asyncify's checks). The list holds GX and aurora's command processing and
+encoding, the HSD display tree, math, hashing, and the allocator with its
+locks; none of them reaches `browser_yield`, `emscripten_sleep` or
+`browser_disc_read`. The stacks that do yield, in a VS match: `main >
+melee_main > gm_801A4014 > HSD_VICopyXFBAsync > VIWaitForRetrace >
+pc_frame_boundary`, and `gm_801A4014 > lb_800195D0 > DVDGetDriveStatus`; the
+park, the hold and the netplay waits above; scene loads through the disc
+reads. A function added to the list must stay off all of them.
+
 ## The GPU
 
 A browser takes the WebGPU device away when the phone sends the page to the
@@ -788,6 +806,30 @@ browser build neither aborts:
   OutOfMemory, reach `Module.onGpuTrouble('error', type, message)` with the
   `WGPUErrorType` (2 validation, 3 out of memory, 4 internal). The frame is
   drawn past; after an OutOfMemory, what it couldn't make is missing.
+
+### Pipelines on Safari
+
+Safari compiles each WebGPU pipeline into Metal in its GPU process, about
+50 ms apiece on an iPhone 11. `browser_prepare_graphics` building the whole
+cache (865 rows) before the first frame took 47 s there, and both iPhones that
+did it lost that process soon after; with no cache at all, a match started
+black and filled in over its first minute while every frame waited on the
+compiles. `MELEE_PIPELINES_BACKGROUND=<n>` keeps the cache but builds it
+behind the frames, `n` compilations in flight at most, two started per frame,
+while the engine is parked, loading or holding at frame 0; a match being played
+builds only what it draws (`pc_eggy` turns the background off and on again
+with `aurora_background_pipelines`). `eggy_perf` [20] is what is left.
+
+### Yielding on Safari
+
+A page that only ever posts itself messages starves WebKit's rendering and
+timers. A phone too slow to sleep between frames yielded only through
+`browser_yield`'s MessageChannel, and Safari never showed a frame of the
+canvas (a two-second interval ran forty seconds late). While the page is in
+front and no animation frame has come for 50 ms, `browser_yield` resumes after
+the next one. The pad wait (`pc_os_wait_alarm`) sleeps on a timer when the
+next alarm is 5 ms or more away instead of yielding over and over, which spun
+a phone's core for most of a frame.
 
 ## Not done
 
@@ -805,12 +847,18 @@ that keep their defaults unless `src/pc/eggy` sets them.
 | `src/melee/gm/forward.h` | `GM_EGGY` before `GM_COUNT` | the mode Eggy matches run in |
 | `src/melee/gm/gmscdata.c` | the `GM_EGGY` entry in the mode table | its states are `gm_Mode_Eggy_States` (`src/pc/eggy/eggy.c`) |
 | `src/melee/gm/gmboot.c` | `MELEE_BOOT_SCENE=eggy` maps to `GM_EGGY` | boot straight into it |
-| `src/melee/gm/gmscene.c` | `pc_eggy_scene_begin` at the start of `gm_801A4D34`, `pc_eggy_after_tick` at the end of `gm_RunSimTick` | the hold at frame 0 (before the pad-queue flush); the HUD, abort and results timer per tick |
+| `src/melee/gm/gmscene.c` | `pc_eggy_scene_begin` at the start of `gm_801A4D34`, `pc_eggy_after_tick` at the end of `gm_RunSimTick`; the frame report's sections around the ticks and the render pass; the render pass skipped for `eggy_draw_every` | the hold at frame 0 (before the pad-queue flush); the HUD, abort and results timer per tick; `eggy_perf`; quality |
+| `src/melee/ft/kinds/ftPikachu/ftpikachuspeciallw.c` | `ftPk_SpecialLw_8012765C` reads the bolt only while its chain stays in MEM1 (`pc_in_mem1`) | the bolt's destroy callback leaves the fighter pointing at the freed item; once that memory went to something else an iPhone trapped out of bounds on Pikachu's aerial down-B |
+| `src/pc/os.c` | `pc_in_mem1`; the pad wait sleeps when it can, as spare time | the Pikachu check; a core spun yielding |
+| `platforms/browser/scheduler.c` | `browser_yield` lets an animation frame through when none came for 50 ms | Yielding on Safari |
+| `extern/aurora/lib/internal.hpp`, `extern/aurora/lib/gx/command_processor.cpp` | `ByteBuffer` checks capacity inline; `prepare_idx_buffer` writes straight into room made once | the hottest loop of a frame |
+| `extern/aurora/lib/gfx/pipeline_cache.cpp`, `extern/aurora/lib/gx/gx.cpp` | `MELEE_PIPELINES_BACKGROUND`, `aurora_background_pipelines`, the compilations in flight | Pipelines on Safari |
+| `platforms/browser/asyncify-remove.json` | new | Asyncify |
 | `src/melee/gm/gmvs.c` | Zelda/Sheik hold-A swap off | the config names her outright |
 | `src/melee/gm/gm_1601.c` | `gm_GetNumCostumesForCKind` uncapped | every costume |
 | `src/melee/lb/lbaudio_ax.c` | `lbAudioAx_80023F28` returns early with music off | no music file read on that device |
 | `src/pc/net.c` | `capture_local_sample` brackets its `PADRead` with `pc_eggy_sampling` | the session's local sample takes `eggy_tap`'s one-tick presses |
-| `src/pc/vi.c` | the frame buffer is preserved while parked; `pc_eggy_frame_end()` after each presented frame | the last picture stays up; a load or hold clears to black, so frame 0 draws into cleared buffers; the page's picture size is taken between two frames |
+| `src/pc/vi.c` | the frame buffer is preserved while parked; `pc_eggy_frame_end()` after each presented frame; the frame report's sections in the boundary; `pc_frame_boundary_undrawn` keeps aurora's frame open across a frame that drew nothing | the last picture stays up; a load or hold clears to black, so frame 0 draws into cleared buffers; the page's picture size is taken between two frames; `eggy_perf` |
 | `extern/aurora/lib/webgpu/gpu.cpp` | a lost device or a WebGPU error calls `Module.onGpuTrouble` instead of aborting (any browser page, not only `MELEE_EGGY`) | The GPU |
 | `src/pc/audio.c` | the worklet loads from a static file first; the page's AudioContext is used | Eggy's CSP; iOS's unlocked context (any page, not only `MELEE_EGGY`) |
 | `platforms/browser/main.c` | `pc_eggy_preinit()` before `aurora_initialize`; no memory card | SDL keyboard off; one card-absent save everywhere |
