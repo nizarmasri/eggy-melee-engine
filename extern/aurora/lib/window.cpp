@@ -377,7 +377,13 @@ bool create_window(AuroraBackend backend) {
     Log.error("Failed to create window: {}", SDL_GetError());
     return false;
   }
+#ifdef __EMSCRIPTEN__
+  // The page picks the render size in pixels (MELEE_EGGY's eggy_view, 64 to 4096 a side). Under a 640x480 minimum a
+  // phone stepping down to 360 lines kept 480 of them, only the width following, and its picture was stretched.
+  SDL_SetWindowMinimumSize(g_window, 64, 64);
+#else
   SDL_SetWindowMinimumSize(g_window, 640, 480);
+#endif
   set_window_icon();
   return true;
 }

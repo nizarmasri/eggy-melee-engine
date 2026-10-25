@@ -854,6 +854,7 @@ that keep their defaults unless `src/pc/eggy` sets them.
 | `src/pc/os.c` | `pc_in_mem1`; the pad wait sleeps when it can, as spare time | the Pikachu check; a core spun yielding |
 | `platforms/browser/scheduler.c` | `browser_yield` lets an animation frame through when none came for 50 ms | Yielding on Safari |
 | `extern/aurora/lib/internal.hpp`, `extern/aurora/lib/gx/command_processor.cpp` | `ByteBuffer` checks capacity inline; `prepare_idx_buffer` writes straight into room made once | the hottest loop of a frame |
+| `extern/aurora/lib/window.cpp` | the browser window's minimum size is 64x64, not 640x480 | the page picks the render size (`eggy_view`); a step down to 360 lines kept 480 of them, only the width following, and stretched the picture |
 | `extern/aurora/lib/gfx/pipeline_cache.cpp`, `extern/aurora/lib/gx/gx.cpp` | `MELEE_PIPELINES_BACKGROUND`, `aurora_background_pipelines`, the compilations in flight | Pipelines on Safari |
 | `platforms/browser/asyncify-remove.json` | new | Asyncify |
 | `src/melee/gm/gmvs.c` | Zelda/Sheik hold-A swap off | the config names her outright |
