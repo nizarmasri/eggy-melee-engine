@@ -149,6 +149,11 @@ void pc_eggy_preinit(void) {
      * page keystroke is captured or default-prevented (SDL3 accepts "#none"
      * for this hint; it must be set before the window exists). */
     SDL_SetHint(SDL_HINT_EMSCRIPTEN_KEYBOARD_ELEMENT, "#none");
+    /* The engine boots while people pick: nothing builds ahead until the page
+     * says it may (eggy_background_builds), or the boot's compiles stall the
+     * pick screen in the GPU process. */
+    extern void aurora_set_background_builds(bool on);
+    aurora_set_background_builds(false);
 }
 
 /* aurora's pipeline cache (extern/aurora/lib/gfx/pipeline_cache.cpp): every
@@ -173,10 +178,10 @@ extern void aurora_prebuild_tagged(void);
 extern void pc_audio_set_held(bool held);
 
 /* The cache's known pipelines build only while parked, and only while the page
- * allows it (eggy_background_builds; it says no while people pick): a compile
- * in the GPU process slows every frame, and a loading or played match's own
- * pipelines come first. */
-static bool s_background_ok = true;
+ * allows it (eggy_background_builds: off until it says, and it says no while
+ * people pick): a compile in the GPU process slows every frame, and a loading
+ * or played match's own pipelines come first. */
+static bool s_background_ok = false;
 static bool s_audio_held;
 
 static void background_builds_follow(void) {
