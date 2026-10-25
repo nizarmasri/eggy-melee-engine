@@ -558,7 +558,13 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
 bool take_browser_pipeline(gfx::PipelineRef ref, wgpu::RenderPipeline& pipeline);
 /* The browser's pipeline compilations asked for and not finished. */
 uint32_t browser_pipelines_compiling();
+/* A compilation the browser refused: its draws stay skipped for the session. */
+bool browser_pipeline_failed(gfx::PipelineRef ref);
 #endif
+/* aurora_set_fog_enabled: false populates every new pipeline config without
+ * fog, so no fog variant is ever asked for. */
+bool fog_enabled() noexcept;
+void set_fog_enabled(bool enabled) noexcept;
 std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttachment = UINT32_MAX) noexcept;
 wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTargetLayout& layout) noexcept;
 GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept;

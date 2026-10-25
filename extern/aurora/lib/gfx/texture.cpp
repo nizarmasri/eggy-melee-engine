@@ -10,6 +10,7 @@
 #include "../gx/gx_fmt.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -98,9 +99,13 @@ u16 wgpu_aniso(GXAnisotropy aniso) {
 }
 } // namespace
 
+// GX textures uploaded since boot, for the host's graphics-ready test (aurora_texture_uploads).
+static std::atomic_uint32_t g_textureUploads{0};
+
 TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 format, ArrayRef<uint8_t> data,
                                     bool tlut, const char* label) noexcept {
   ZoneScoped;
+  ++g_textureUploads;
 
   auto handle = new_dynamic_texture_2d(width, height, mips, format, label);
   auto& ref = *handle;
@@ -347,3 +352,11 @@ wgpu::SamplerDescriptor TextureBind::get_descriptor() const noexcept {
   };
 }
 } // namespace aurora::gfx
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#define AURORA_PAGE_EXPORT EMSCRIPTEN_KEEPALIVE
+#else
+#define AURORA_PAGE_EXPORT
+#endif
+extern "C" AURORA_PAGE_EXPORT uint32_t aurora_texture_uploads(void) { return aurora::gfx::g_textureUploads.load(); }

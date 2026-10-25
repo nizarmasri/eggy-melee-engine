@@ -3,8 +3,20 @@
 #include <emscripten.h>
 extern "C" void browser_yield(void);
 extern "C" uint32_t aurora_browser_pipelines_compiling(void); /* gx/gx.cpp */
+extern "C" uint32_t aurora_pipelines_finished(void);
+extern "C" uint32_t aurora_pipelines_failed(void);
+extern "C" uint32_t aurora_compile_ms_total(void);
 EM_JS(void, browser_graphics_progress, (unsigned done, unsigned total), {
   Module.onGraphicsPreparation?.(done, total);
+});
+// The engine Safari and every iOS browser run, by the Eggy page's own test
+// (webkitGpu): WebKit compiles each pipeline into Metal in its GPU process,
+// about 50 ms apiece on an iPhone, and lost that process when hundreds were
+// asked for at once.
+EM_JS(int, browser_is_webkit, (), {
+  const ua = navigator.userAgent || "";
+  const webkit = /AppleWebKit/.test(ua) && !/Chrome|Chromium|Android|Edg/.test(ua);
+  return webkit || /CriOS|FxiOS|EdgiOS/.test(ua) ? 1 : 0;
 });
 #endif
 #include "pipeline_cache.hpp"
@@ -25,7 +37,9 @@ EM_JS(void, browser_graphics_progress, (unsigned done, unsigned total), {
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <functional>
@@ -62,6 +76,7 @@ struct CachedPipeline {
 struct PendingPipeline {
   PipelineRef hash;
   NewPipelineCallback create;
+  bool fog = false; // a GX config with fog, held back while fog is off (aurora_set_fog_enabled)
 };
 
 struct PipelineCacheWrite {
@@ -71,6 +86,8 @@ struct PipelineCacheWrite {
   ByteBuffer config;
   uint32_t firstFrameUsed = UINT32_MAX;
   bool deviceBuilt = false; // only marks (type, hash) in pipeline_device
+  bool tagRow = false;      // only (hash, tag) in pipeline_tags
+  uint32_t tag = 0;
 };
 
 using SavedPipelineConfig = std::variant<gx::PipelineConfig, clear::PipelineConfig
@@ -110,6 +127,39 @@ static std::optional<uint64_t> g_pipelineLayoutKey;
 static std::deque<PendingPipeline> g_pipelineQueue;
 static std::deque<PendingPipeline> g_backgroundPipelineQueue;
 static absl::flat_hash_set<PipelineRef> g_pendingPipelines;
+/* The refs in g_backgroundPipelineQueue. A draw of a queued pipeline promotes
+ * it, which searched the whole background queue (every known config, twice) on
+ * every draw of every queued pipeline, every frame. */
+static absl::flat_hash_set<PipelineRef> g_backgroundPending;
+static std::atomic_uint32_t g_drawsSkipped{0};
+#ifdef __EMSCRIPTEN__
+/* The browser compile gate. Every GX pipeline on the web is created by
+ * browser_pump, the only caller of create for them, which keeps at most the cap
+ * compiling at once, demanded work first. Before it, draws started compiles
+ * inline (five a frame, three hundred a second) with nothing bounding how many
+ * were in flight, and frame 0 of a match asked for hundreds at once: an
+ * iPhone's GPU process, at about twenty a second, lost the device at GO. */
+static uint32_t g_browserCompileCap = 0;  // aurora_set_compile_cap; 0 is the browser's default
+static bool g_browserBackgroundOn = true; // aurora_set_background_builds
+static std::deque<PendingPipeline> g_backgroundFogParked; // background fog configs while fog is off
+/* Asked for by a draw and not compiled yet; the second set only those first
+ * asked for after aurora_mark_go. */
+static absl::flat_hash_set<PipelineRef> g_browserWanted;
+static absl::flat_hash_set<PipelineRef> g_browserWantedAfterGo;
+static bool g_browserAfterGo = false;
+/* The device database keeps only configs this browser has compiled: a row is
+ * held here until its first compile succeeds, and dropped if it is refused,
+ * so a config that took the GPU process down is never asked for at boot. */
+static absl::flat_hash_map<HashType, PipelineCacheWrite> g_browserUnbuiltRows;
+static absl::flat_hash_set<HashType> g_browserBuiltKeys;
+/* Which configs a match needed, by the host's tags for it (its fighters and
+ * stage): pipeline_tags in the device database, and here by tag. The next
+ * match sharing a tag builds them all before GO (aurora_prebuild_tagged), the
+ * effects that only appear after GO with them. */
+static std::vector<uint32_t> g_matchTags;
+static absl::flat_hash_set<HashType> g_matchTagged;
+static absl::flat_hash_map<uint32_t, absl::flat_hash_set<HashType>> g_tagConfigs;
+#endif
 static std::atomic_bool g_gpuCachePrunePending = false;
 /* Android warms only pipelines this device has already built. The seed is
  * recorded on desktop GPUs and is not shipped in the APK
@@ -160,12 +210,16 @@ static sqlite3* g_pipelineCacheDb = nullptr;
 static sqlite3_stmt* g_pipelineCacheLoadStmt = nullptr;
 static sqlite3_stmt* g_pipelineCacheUpsertStmt = nullptr;
 static sqlite3_stmt* g_pipelineDeviceStmt = nullptr;
+static sqlite3_stmt* g_pipelineTagStmt = nullptr;
 static bool g_pipelineCacheBroken = false;
 static std::thread g_pipelineCacheWriterThread;
 static std::condition_variable g_pipelineCacheWriterCv;
 static std::mutex g_pipelineCacheWriterMutex;
 static std::deque<PipelineCacheWrite> g_pipelineCacheWriteQueue;
 static bool g_pipelineCacheWriterStop = false;
+// The writer holds a batch it has not committed yet (aurora_pipeline_cache_flush).
+static bool g_pipelineCacheWriterBusy = false;
+static std::condition_variable g_pipelineCacheWriterIdleCv;
 static int g_sdlVfsRegisterResult = SQLITE_ERROR;
 
 static SdlVfsSqliteFile* sdl_vfs_file(sqlite3_file* file) { return reinterpret_cast<SdlVfsSqliteFile*>(file); }
@@ -461,6 +515,14 @@ static void log_pipeline_stats() {
            created, totalMs, created != 0 ? totalMs / created : 0.0,
            static_cast<double>(g_statCreateMaxNs.load()) / 1e6, demanded, dawn.hits, dawn.hitBytes / 1024,
            dawn.misses, dawn.stores, dawn.storeBytes / 1024);
+#ifdef __EMSCRIPTEN__
+  // "Created" above is a compile started; these are the browser's results.
+  const uint32_t finished = aurora_pipelines_finished();
+  Log.info("browser pipelines: {} compiled (avg {:.0f} ms each in the GPU process), {} refused, {} compiling, "
+           "{} skipped draws",
+           finished, finished != 0 ? static_cast<double>(aurora_compile_ms_total()) / finished : 0.0,
+           aurora_pipelines_failed(), aurora_browser_pipelines_compiling(), g_drawsSkipped.load());
+#endif
 }
 
 template <typename PipelineConfig>
@@ -512,6 +574,19 @@ static auto find_pending_pipeline(Queue& queue, PipelineRef hash) {
   return std::find_if(queue.begin(), queue.end(), [=](const PendingPipeline& pending) { return pending.hash == hash; });
 }
 
+// Both under g_pipelineMutex.
+static void queue_background(PendingPipeline&& pending) {
+  g_backgroundPending.insert(pending.hash);
+  g_backgroundPipelineQueue.emplace_back(std::move(pending));
+}
+
+static PendingPipeline pop_background() {
+  PendingPipeline pending = std::move(g_backgroundPipelineQueue.front());
+  g_backgroundPipelineQueue.pop_front();
+  g_backgroundPending.erase(pending.hash);
+  return pending;
+}
+
 enum class PipelinePriority {
   Background, // cache warmup
   Normal,     // async skip draw
@@ -519,7 +594,7 @@ enum class PipelinePriority {
 };
 
 static void promote_pending_pipeline(PipelineRef hash, PipelinePriority priority) {
-  if (priority == PipelinePriority::Background) {
+  if (priority == PipelinePriority::Background || !g_backgroundPending.contains(hash)) {
     return;
   }
 
@@ -533,6 +608,7 @@ static void promote_pending_pipeline(PipelineRef hash, PipelinePriority priority
     g_pipelineQueue.emplace_back(std::move(*backgroundIt));
   }
   g_backgroundPipelineQueue.erase(backgroundIt);
+  g_backgroundPending.erase(hash);
 }
 
 static std::optional<PendingPipeline> take_pending_pipeline(PipelineRef hash) {
@@ -548,6 +624,7 @@ static std::optional<PendingPipeline> take_pending_pipeline(PipelineRef hash) {
   if (backgroundIt != g_backgroundPipelineQueue.end()) {
     PendingPipeline pending = std::move(*backgroundIt);
     g_backgroundPipelineQueue.erase(backgroundIt);
+    g_backgroundPending.erase(hash);
     g_pendingPipelines.erase(hash);
     return pending;
   }
@@ -573,17 +650,67 @@ static void remember_pipeline_config(ShaderType type, const Config& config, uint
     auto [it, inserted] = g_knownPipelines.try_emplace(cacheKey, KnownPipeline{type, config, firstFrameUsed});
     changed = inserted || firstFrameUsed < it->second.firstFrameUsed;
     it->second.firstFrameUsed = std::min(it->second.firstFrameUsed, firstFrameUsed);
+#ifdef __EMSCRIPTEN__
+    if (persist && type == ShaderType::GX && !g_matchTags.empty() && g_matchTagged.insert(cacheKey).second) {
+      for (const uint32_t tag : g_matchTags) {
+        if (g_tagConfigs[tag].insert(cacheKey).second) {
+          enqueue_pipeline_cache_write(PipelineCacheWrite{.type = type, .hash = cacheKey, .tagRow = true, .tag = tag});
+        }
+      }
+    }
+    // Written once a compile of it succeeds (browser_pipeline_settled).
+    if (persist && changed && type == ShaderType::GX && !g_browserBuiltKeys.contains(cacheKey)) {
+      if (!g_pipelineCacheBroken && g_pipelineCacheDb != nullptr) {
+        g_browserUnbuiltRows.insert_or_assign(cacheKey,
+                                              make_pipeline_cache_write(type, cacheKey, config, firstFrameUsed));
+      }
+      return;
+    }
+#endif
   }
   if (persist && changed) {
     enqueue_pipeline_cache_write(make_pipeline_cache_write(type, cacheKey, config, firstFrameUsed));
   }
 }
 
-static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallback&& cb,
-                                      PipelinePriority priority = PipelinePriority::Normal) {
+#ifdef __EMSCRIPTEN__
+static void browser_pump();
+
+// Under g_pipelineMutex: a draw asked for a GX pipeline that is not compiled.
+static void browser_want(PipelineRef ref) {
+  if (g_browserWanted.insert(ref).second && g_browserAfterGo) {
+    g_browserWantedAfterGo.insert(ref);
+  }
+}
+#endif
+
+// Under g_pipelineMutex: a draw found its pipeline not ready and was skipped.
+static void note_skipped_draw(PipelineRef ref) {
+#ifdef __EMSCRIPTEN__
+  if (gx::browser_pipeline_failed(ref)) {
+    return; // refused for good: not a draw still waiting on its pipeline
+  }
+  browser_want(ref);
+#endif
+  ++g_drawsSkipped;
+}
+
+/* gated: a GX pipeline, which the browser compiles asynchronously; those are
+ * only ever queued there, for browser_pump. Clear pipelines are created
+ * synchronously and stay inline, or the screen goes uncleared behind a queue. */
+static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallback&& cb, PipelinePriority priority,
+                                      bool gated, bool fog) {
   ZoneScoped;
 
   const bool blocking = priority == PipelinePriority::Blocking;
+#ifdef __EMSCRIPTEN__
+  const bool queueOnly = gated && !blocking;
+  const bool inlineAlways = !gated;
+#else
+  const bool queueOnly = false;
+  const bool inlineAlways = false;
+  (void)gated;
+#endif
   bool notifyWorker = false;
   bool pipelineReady = false;
   bool createdPipeline = false;
@@ -593,6 +720,11 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallbac
     auto pipelineIt = g_pipelines.find(runtimeKey);
     if (pipelineIt == g_pipelines.end() && priority != PipelinePriority::Background) {
       g_demandedPipelines.insert(runtimeKey);
+#ifdef __EMSCRIPTEN__
+      if (gated) {
+        browser_want(runtimeKey);
+      }
+#endif
     }
     if (pipelineIt != g_pipelines.end()) {
       pipelineReady = true;
@@ -610,7 +742,8 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallbac
         promote_pending_pipeline(runtimeKey, priority);
         notifyWorker = priority != PipelinePriority::Background;
       }
-    } else if (!g_hasPipelineThread && (blocking || g_pipelinesPerFrame < BuildPipelinesPerFrame)) {
+    } else if (!queueOnly && !g_hasPipelineThread &&
+               (blocking || inlineAlways || g_pipelinesPerFrame < BuildPipelinesPerFrame)) {
       g_pipelines.try_emplace(runtimeKey, CachedPipeline{.pipeline = create_timed(cb)});
       pipelineReady = true;
       ++g_pipelinesPerFrame;
@@ -619,10 +752,11 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallbac
       PendingPipeline pending{
           .hash = runtimeKey,
           .create = std::move(cb),
+          .fog = fog,
       };
       switch (priority) {
       case PipelinePriority::Background:
-        g_backgroundPipelineQueue.emplace_back(std::move(pending));
+        queue_background(std::move(pending));
         break;
       case PipelinePriority::Normal:
         g_pipelineQueue.emplace_back(std::move(pending));
@@ -642,7 +776,11 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallbac
   }
 
   if (notifyWorker) {
+#ifdef __EMSCRIPTEN__
+    browser_pump();
+#else
     g_pipelineQueueCv.notify_one();
+#endif
   }
 
   if (blocking && !pipelineReady) {
@@ -662,7 +800,7 @@ static PipelineRef resolve_pipeline(ShaderType type, const gx::PipelineConfig& c
         mark_device_built(type, cacheKey);
         return pipeline;
       },
-      priority);
+      priority, true, config.shaderConfig.fogType != GX_FOG_NONE);
 }
 
 static PipelineRef resolve_pipeline(ShaderType type, const clear::PipelineConfig& config,
@@ -675,7 +813,7 @@ static PipelineRef resolve_pipeline(ShaderType type, const clear::PipelineConfig
         mark_device_built(type, cacheKey);
         return pipeline;
       },
-      priority);
+      priority, false, false);
 }
 
 #ifdef AURORA_ENABLE_RMLUI
@@ -689,7 +827,7 @@ static PipelineRef resolve_pipeline(ShaderType type, const rmlui::PipelineConfig
         mark_device_built(type, cacheKey);
         return pipeline;
       },
-      priority);
+      priority, false, false);
 }
 #endif
 
@@ -706,6 +844,10 @@ static void pipeline_cache_abort() {
   if (g_pipelineDeviceStmt != nullptr) {
     sqlite3_finalize(g_pipelineDeviceStmt);
     g_pipelineDeviceStmt = nullptr;
+  }
+  if (g_pipelineTagStmt != nullptr) {
+    sqlite3_finalize(g_pipelineTagStmt);
+    g_pipelineTagStmt = nullptr;
   }
   if (g_pipelineCacheDb != nullptr) {
     sqlite3_close(g_pipelineCacheDb);
@@ -779,6 +921,7 @@ static sqlite3* open_pipeline_cache_seed_db(const std::string& path) {
   return seedDb;
 }
 
+#ifndef __EMSCRIPTEN__
 static void seed_pipeline_cache() {
   if (g_pipelineCacheBroken || g_pipelineCacheDb == nullptr || g_pipelineCacheUpsertStmt == nullptr) {
     return;
@@ -892,8 +1035,43 @@ static void seed_pipeline_cache() {
     Log.info("Seeded pipeline cache from '{}' ({} rows merged, {} rows skipped)", usedPath, mergedRows, skippedRows);
   }
 }
+#endif
 
-static bool prepare_pipeline_cache_db() {
+static std::string pipeline_cache_db_path() {
+  return io::fs_path_to_string(io::fs_path_from_string(g_config.cachePath) / "pipeline_cache.db");
+}
+
+#ifdef __EMSCRIPTEN__
+/* The page persists /cache between visits (FS.syncfs after
+ * aurora_pipeline_cache_flush). A database persisted torn, or cut short by the
+ * browser, can open and fail later, so it is checked once at boot, and one
+ * that is wrong in any way starts again empty instead of leaving the phone
+ * with no cache for the session. The seed does not depend on it. */
+static bool pipeline_cache_db_sound(const std::string& path) {
+  sqlite3* db = nullptr;
+  if (sqlite3_open_v2(path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
+    if (db != nullptr) {
+      sqlite3_close(db);
+    }
+    return false;
+  }
+  bool ok = false;
+  const auto ret = sqlite::exec(db, "PRAGMA quick_check(1);", [&ok](int argc, char** argv, char**) {
+    ok = argc > 0 && argv[0] != nullptr && std::strcmp(argv[0], "ok") == 0;
+  });
+  sqlite3_close(db);
+  return ret == SQLITE_OK && ok;
+}
+
+static void remove_pipeline_cache_db(const char* why) {
+  const auto path = pipeline_cache_db_path();
+  Log.warn("Starting the pipeline cache database again: {}", why);
+  std::remove(path.c_str());
+  std::remove((path + "-journal").c_str());
+}
+#endif
+
+static bool open_pipeline_cache_db() {
   if (g_pipelineCacheBroken) {
     return false;
   }
@@ -901,7 +1079,17 @@ static bool prepare_pipeline_cache_db() {
     return true;
   }
 
-  const auto path = io::fs_path_to_string(io::fs_path_from_string(g_config.cachePath) / "pipeline_cache.db");
+  const auto path = pipeline_cache_db_path();
+#ifdef __EMSCRIPTEN__
+  static bool checked = false;
+  if (!checked) {
+    checked = true;
+    std::error_code ec;
+    if (std::filesystem::exists(io::fs_path_from_string(path), ec) && !pipeline_cache_db_sound(path)) {
+      remove_pipeline_cache_db("it failed its integrity check");
+    }
+  }
+#endif
   auto ret = sqlite3_open(path.c_str(), &g_pipelineCacheDb);
   if (ret != SQLITE_OK) {
     Log.error("Failed to open pipeline cache database: {}", sqlite3_errmsg(g_pipelineCacheDb));
@@ -1024,12 +1212,55 @@ INSERT INTO aurora_schema VALUES ({});)",
     }
   }
 
+#ifdef __EMSCRIPTEN__
+  ret = sqlite::exec(g_pipelineCacheDb, "CREATE TABLE IF NOT EXISTS pipeline_tags ("
+                                        "hash INTEGER NOT NULL, tag INTEGER NOT NULL, PRIMARY KEY (hash, tag)"
+                                        ") WITHOUT ROWID;");
+  if (ret == SQLITE_OK) {
+    ret = sqlite3_prepare_v3(g_pipelineCacheDb, "INSERT OR IGNORE INTO pipeline_tags (hash, tag) VALUES (?, ?)", -1,
+                             SQLITE_PREPARE_PERSISTENT, &g_pipelineTagStmt, nullptr);
+  }
+  if (ret != SQLITE_OK) {
+    Log.error("Failed to prepare pipeline_tags table: {}", sqlite3_errmsg(g_pipelineCacheDb));
+    pipeline_cache_abort();
+    return false;
+  }
+#endif
+
+#ifndef __EMSCRIPTEN__
   seed_pipeline_cache();
   if (g_pipelineCacheBroken) {
     return false;
   }
+#endif
 
   return true;
+}
+
+#ifdef __EMSCRIPTEN__
+// Once per boot: a database that failed to open or read starts again empty.
+static bool recreate_pipeline_cache_db(const char* why) {
+  static bool recreated = false;
+  if (recreated) {
+    return false;
+  }
+  recreated = true;
+  pipeline_cache_abort();
+  remove_pipeline_cache_db(why);
+  g_pipelineCacheBroken = false;
+  return open_pipeline_cache_db();
+}
+#endif
+
+static bool prepare_pipeline_cache_db() {
+  if (open_pipeline_cache_db()) {
+    return true;
+  }
+#ifdef __EMSCRIPTEN__
+  return recreate_pipeline_cache_db("it could not be opened");
+#else
+  return false;
+#endif
 }
 
 static void prune_old_pipeline_cache_versions() {
@@ -1150,6 +1381,22 @@ static bool write_device_built_record(const PipelineCacheWrite& write) {
   return ret == SQLITE_OK;
 }
 
+static bool write_tag_record(const PipelineCacheWrite& write) {
+  int ret = sqlite3_bind_int64(g_pipelineTagStmt, 1, static_cast<sqlite3_int64>(write.hash));
+  if (ret == SQLITE_OK) {
+    ret = sqlite3_bind_int64(g_pipelineTagStmt, 2, static_cast<sqlite3_int64>(write.tag));
+  }
+  if (ret == SQLITE_OK) {
+    ret = sqlite3_step(g_pipelineTagStmt) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+  }
+  if (ret != SQLITE_OK) {
+    Log.error("Failed to tag a pipeline with its match: {}", sqlite3_errmsg(g_pipelineCacheDb));
+  }
+  sqlite3_reset(g_pipelineTagStmt);
+  sqlite3_clear_bindings(g_pipelineTagStmt);
+  return ret == SQLITE_OK;
+}
+
 static void pipeline_cache_writer() {
 #ifdef TRACY_ENABLE
   tracy::SetThreadName("Pipeline cache writer thread");
@@ -1165,6 +1412,7 @@ static void pipeline_cache_writer() {
         return;
       }
       batch.swap(g_pipelineCacheWriteQueue);
+      g_pipelineCacheWriterBusy = true;
     }
 
     bool writeFailed = false;
@@ -1175,7 +1423,10 @@ static void pipeline_cache_writer() {
         writeFailed = true;
       } else {
         for (const auto& write : batch) {
-          if (!(write.deviceBuilt ? write_device_built_record(write) : write_pipeline_cache_record(write))) {
+          const bool written = write.tagRow        ? write_tag_record(write)
+                               : write.deviceBuilt ? write_device_built_record(write)
+                                                   : write_pipeline_cache_record(write);
+          if (!written) {
             writeFailed = true;
             break;
           }
@@ -1189,6 +1440,13 @@ static void pipeline_cache_writer() {
 
     if (writeFailed) {
       pipeline_cache_abort();
+    }
+    {
+      std::lock_guard lock{g_pipelineCacheWriterMutex};
+      g_pipelineCacheWriterBusy = false;
+    }
+    g_pipelineCacheWriterIdleCv.notify_all();
+    if (writeFailed) {
       return;
     }
   }
@@ -1231,9 +1489,12 @@ static void pipeline_worker() {
       if (g_pipelineThreadEnd) {
         break;
       }
-      auto& source = (!g_hasPipelineThread || !g_pipelineQueue.empty()) ? g_pipelineQueue : g_backgroundPipelineQueue;
-      pending = std::move(source.front());
-      source.pop_front();
+      if (!g_hasPipelineThread || !g_pipelineQueue.empty()) {
+        pending = std::move(g_pipelineQueue.front());
+        g_pipelineQueue.pop_front();
+      } else {
+        pending = pop_background();
+      }
     }
     build_pending_pipeline(pending);
     if (!g_hasPipelineThread) {
@@ -1241,6 +1502,56 @@ static void pipeline_worker() {
     }
   }
 }
+
+#ifdef __EMSCRIPTEN__
+static uint32_t browser_compile_cap() {
+  if (g_browserCompileCap != 0) {
+    return g_browserCompileCap;
+  }
+  // MELEE_PIPELINES_INFLIGHT=<n> at boot, for measuring; otherwise by browser.
+  static const uint32_t byBrowser = [] {
+    if (const char* v = std::getenv("MELEE_PIPELINES_INFLIGHT"); v != nullptr && std::atoi(v) > 0) {
+      return static_cast<uint32_t>(std::atoi(v));
+    }
+    return browser_is_webkit() != 0 ? 2u : 6u;
+  }();
+  return byBrowser;
+}
+
+/* Starts queued compiles while fewer than the cap are in flight: every
+ * pipeline a draw asked for first, the known configs (seed and device rows)
+ * only when nothing a draw wants is waiting, and only while the host allows
+ * them. Cheap when nothing is queued or the cap is full. A lost device is
+ * asked for nothing. */
+static void browser_pump() {
+  if (webgpu::device_lost()) {
+    return;
+  }
+  const uint32_t cap = browser_compile_cap();
+  while (aurora_browser_pipelines_compiling() < cap) {
+    PendingPipeline pending;
+    {
+      std::lock_guard lock{g_pipelineMutex};
+      if (!g_pipelineQueue.empty()) {
+        pending = std::move(g_pipelineQueue.front());
+        g_pipelineQueue.pop_front();
+      } else {
+        if (!g_browserBackgroundOn) {
+          return;
+        }
+        while (!g_backgroundPipelineQueue.empty() && g_backgroundPipelineQueue.front().fog && !gx::fog_enabled()) {
+          g_backgroundFogParked.emplace_back(pop_background());
+        }
+        if (g_backgroundPipelineQueue.empty()) {
+          return;
+        }
+        pending = pop_background();
+      }
+    }
+    build_pending_pipeline(pending);
+  }
+}
+#endif
 
 template <typename PipelineConfig>
 static size_t load_pipeline_cache_entries(ShaderType type, uint32_t configVersion) {
@@ -1295,7 +1606,7 @@ static size_t load_pipeline_cache_entries(ShaderType type, uint32_t configVersio
   return acceptedRows;
 }
 
-static size_t load_pipeline_cache() {
+static size_t load_device_pipeline_cache() {
   if (!prepare_pipeline_cache_db()) {
     return 0;
   }
@@ -1311,6 +1622,111 @@ static size_t load_pipeline_cache() {
   acceptedRows +=
       load_pipeline_cache_entries<clear::PipelineConfig>(ShaderType::Clear, clear::ClearPipelineConfigVersion);
   acceptedRows += load_pipeline_cache_entries<gx::PipelineConfig>(ShaderType::GX, gx::GXPipelineConfigVersion);
+#ifdef __EMSCRIPTEN__
+  if (g_pipelineCacheBroken) {
+    return acceptedRows;
+  }
+  size_t tags = 0;
+  const auto ret = sqlite::exec(g_pipelineCacheDb, "SELECT hash, tag FROM pipeline_tags;",
+                                [&tags](int argc, char** argv, char**) {
+                                  if (argc < 2 || argv[0] == nullptr || argv[1] == nullptr) {
+                                    return;
+                                  }
+                                  const auto hash = static_cast<HashType>(std::strtoll(argv[0], nullptr, 10));
+                                  const auto tag = static_cast<uint32_t>(std::strtoll(argv[1], nullptr, 10));
+                                  g_tagConfigs[tag].insert(hash);
+                                  ++tags;
+                                });
+  if (ret != SQLITE_OK) {
+    Log.warn("Failed to read pipeline tags: {}", sqlite3_errmsg(g_pipelineCacheDb));
+  } else if (tags != 0) {
+    Log.info("Read {} pipeline tags for {} matches' fighters and stages", tags, g_tagConfigs.size());
+  }
+#endif
+  return acceptedRows;
+}
+
+#ifdef __EMSCRIPTEN__
+template <typename PipelineConfig>
+static bool remember_seed_row(ShaderType type, uint32_t configVersion, const uint8_t* blob, int size,
+                              uint32_t firstFrameUsed) {
+  if (size != static_cast<int>(sizeof(PipelineConfig)) || blob == nullptr) {
+    return false;
+  }
+  PipelineConfig config;
+  std::memcpy(&config, blob, sizeof(config));
+  if (config.version != configVersion) {
+    return false;
+  }
+  remember_pipeline_config(type, config, firstFrameUsed, false);
+  return true;
+}
+
+/* The browser reads the shipped seed on every boot, after this device's rows
+ * and their prune, straight into the known configs. It is never merged into
+ * the device database: the merge was skipped whenever the table had a row,
+ * and it ran before the prune, so a config version bump would have left a
+ * phone with neither. */
+static size_t load_pipeline_cache_seed() {
+  const auto seedPath = pipeline_cache_seed_path();
+  const auto besideExe = pipeline_cache_seed_beside_exe_path();
+  std::string usedPath = seedPath;
+  sqlite3* seedDb = open_pipeline_cache_seed_db(seedPath);
+  if (seedDb == nullptr && besideExe != seedPath) {
+    seedDb = open_pipeline_cache_seed_db(besideExe);
+    usedPath = besideExe;
+  }
+  if (seedDb == nullptr) {
+    Log.info("No bundled initial pipeline cache found at '{}' or '{}'", seedPath, besideExe);
+    return 0;
+  }
+
+  sqlite3_stmt* stmt = nullptr;
+  size_t accepted = 0;
+  size_t skipped = 0;
+  auto ret = sqlite3_prepare_v3(seedDb,
+                                "SELECT type, config_version, config, first_frame_used FROM pipeline_cache "
+                                "ORDER BY first_frame_used ASC, rowid ASC",
+                                -1, 0, &stmt, nullptr);
+  if (ret == SQLITE_OK) {
+    while ((ret = sqlite3_step(stmt)) == SQLITE_ROW) {
+      const int type = sqlite3_column_int(stmt, 0);
+      const int version = sqlite3_column_int(stmt, 1);
+      const auto* blob = static_cast<const uint8_t*>(sqlite3_column_blob(stmt, 2));
+      const int size = sqlite3_column_bytes(stmt, 2);
+      const auto used = std::clamp<sqlite3_int64>(sqlite3_column_int64(stmt, 3), 0, UINT32_MAX);
+      bool ok = false;
+      if (type == underlying(ShaderType::GX) && version == static_cast<int>(gx::GXPipelineConfigVersion)) {
+        ok = remember_seed_row<gx::PipelineConfig>(ShaderType::GX, gx::GXPipelineConfigVersion, blob, size,
+                                                   static_cast<uint32_t>(used));
+      } else if (type == underlying(ShaderType::Clear) &&
+                 version == static_cast<int>(clear::ClearPipelineConfigVersion)) {
+        ok = remember_seed_row<clear::PipelineConfig>(ShaderType::Clear, clear::ClearPipelineConfigVersion, blob,
+                                                      size, static_cast<uint32_t>(used));
+      }
+      ok ? ++accepted : ++skipped;
+    }
+  }
+  if (ret != SQLITE_DONE) {
+    Log.warn("Failed to read bundled pipeline cache rows from '{}': {}", usedPath, sqlite3_errmsg(seedDb));
+  }
+  if (stmt != nullptr) {
+    sqlite3_finalize(stmt);
+  }
+  sqlite3_close(seedDb);
+  Log.info("Read the pipeline cache seed '{}': {} rows, {} skipped", usedPath, accepted, skipped);
+  return accepted;
+}
+#endif
+
+static size_t load_pipeline_cache() {
+  size_t acceptedRows = load_device_pipeline_cache();
+#ifdef __EMSCRIPTEN__
+  if (g_pipelineCacheBroken && recreate_pipeline_cache_db("its rows could not be read")) {
+    acceptedRows += load_device_pipeline_cache();
+  }
+  acceptedRows += load_pipeline_cache_seed();
+#endif
   return acceptedRows;
 }
 
@@ -1455,8 +1871,21 @@ void shutdown_pipeline_cache() {
   g_pipelineLayoutKey.reset();
   g_pipelineQueue.clear();
   g_backgroundPipelineQueue.clear();
+  g_backgroundPending.clear();
   g_pendingPipelines.clear();
   g_deviceBuilt.clear();
+#ifdef __EMSCRIPTEN__
+  g_backgroundFogParked.clear();
+  g_browserWanted.clear();
+  g_browserWantedAfterGo.clear();
+  g_browserAfterGo = false;
+  g_browserUnbuiltRows.clear();
+  g_browserBuiltKeys.clear();
+  g_matchTags.clear();
+  g_matchTagged.clear();
+  g_tagConfigs.clear();
+#endif
+  g_drawsSkipped = 0;
 
   queuedPipelines = 0;
   createdPipelines = 0;
@@ -1484,63 +1913,36 @@ void begin_pipeline_frame() {
 }
 
 #ifdef __EMSCRIPTEN__
-// How many of the browser's asynchronous pipeline compilations the known rows
-// may keep running at once, built a few per frame (end_pipeline_frame); 0
-// leaves them to wait_pipelines. MELEE_PIPELINES_BACKGROUND=<n> at boot: Safari
-// compiles each pipeline into Metal in its GPU process, about 50 ms apiece on
-// an iPhone 11, and the whole cache before the first frame took 47 s there and
-// lost that process soon after. The host turns it off while a match is played
-// (aurora_background_pipelines), so the fight's own pipelines go first.
-static uint32_t g_browserBackgroundInFlight = 0;
-
-extern "C" void aurora_background_pipelines(uint32_t max_in_flight) { g_browserBackgroundInFlight = max_in_flight; }
+// The legacy switch (MELEE_PIPELINES_BACKGROUND hosts): any number above 0 lets
+// the known configs build behind the frames, at the shared cap.
+extern "C" void aurora_background_pipelines(uint32_t max_in_flight) { g_browserBackgroundOn = max_in_flight != 0; }
 
 extern "C" uint32_t aurora_background_pipelines_left() {
   std::lock_guard lock{g_pipelineMutex};
   return static_cast<uint32_t>(g_backgroundPipelineQueue.size());
 }
 
-// Restore the cache before simulation begins. Without workers, frames build
-// only what they draw, so known pipelines would otherwise wait for a launcher.
-// wait_pipelines builds the queues on this thread; yielding between slices
-// lets the asynchronous creations resolve and the page paint the progress.
-// With MELEE_PIPELINES_BACKGROUND they are built behind the frames instead.
+/* The known configs (the seed and this device's rows) used to be built here
+ * before simulation, in 16 ms slices that held the page: 47 s on an iPhone 11,
+ * which lost its GPU process soon after, and a frozen pick screen on Chromium.
+ * Now they only queue: browser_pump builds them behind the frames, at the cap,
+ * while the host allows background builds, and a match's own pipelines always
+ * go first. */
 extern "C" void browser_prepare_graphics() {
   const uint32_t total = wait_pipelines(0);
-  if (!total) return;
-  if (const char* background = std::getenv("MELEE_PIPELINES_BACKGROUND"); background != nullptr && std::atoi(background) > 0) {
-    g_browserBackgroundInFlight = static_cast<uint32_t>(std::atoi(background));
-    Log.info("Building {} cached browser pipelines in the background, {} at a time", total, g_browserBackgroundInFlight);
-    return;
+  if (total != 0) {
+    Log.info("Building {} cached browser pipelines in the background, {} at a time", total, browser_compile_cap());
   }
-  browser_graphics_progress(0, total);
-  for (uint32_t left = total; left != 0;) {
-    left = wait_pipelines(16);
-    browser_graphics_progress(total - left, total);
-    browser_yield();
-  }
-  Log.info("Prepared {} cached browser pipelines before simulation", total);
+  browser_graphics_progress(total, total); // nothing to wait for
 }
 #endif
 
 void end_pipeline_frame() {
   if (!g_hasPipelineThread) {
-    pipeline_worker();
 #ifdef __EMSCRIPTEN__
-    for (int built = 0; built < 2 && g_browserBackgroundInFlight != 0 &&
-                        aurora_browser_pipelines_compiling() < g_browserBackgroundInFlight;
-         ++built) {
-      PendingPipeline pending;
-      {
-        std::lock_guard lock{g_pipelineMutex};
-        if (g_backgroundPipelineQueue.empty()) {
-          break;
-        }
-        pending = std::move(g_backgroundPipelineQueue.front());
-        g_backgroundPipelineQueue.pop_front();
-      }
-      build_pending_pipeline(pending);
-    }
+    browser_pump();
+#else
+    pipeline_worker();
 #endif
   }
 }
@@ -1549,18 +1951,52 @@ bool get_pipeline(PipelineRef ref, wgpu::RenderPipeline& pipeline) {
   std::lock_guard guard{g_pipelineMutex};
   const auto it = g_pipelines.find(ref);
   if (it == g_pipelines.end()) {
+    note_skipped_draw(ref);
     return false;
   }
 #ifdef __EMSCRIPTEN__
-  // Newly encountered effects compile off the GPU submission path. Skip only
-  // their unready draws; startup waits for all initial pipelines before reveal.
-  if (!it->second.pipeline && !gx::take_browser_pipeline(ref, it->second.pipeline)) return false;
+  // Newly encountered effects compile off the GPU submission path: only their
+  // unready draws are skipped.
+  if (!it->second.pipeline && !gx::take_browser_pipeline(ref, it->second.pipeline)) {
+    note_skipped_draw(ref);
+    return false;
+  }
 #endif
   pipeline = it->second.pipeline;
   return true;
 }
 
+#ifdef __EMSCRIPTEN__
+void browser_pipeline_settled(PipelineRef ref, HashType cacheKey, bool ok) {
+  std::optional<PipelineCacheWrite> row;
+  {
+    std::lock_guard lock{g_pipelineMutex};
+    g_browserWanted.erase(ref);
+    if (ok) {
+      g_browserBuiltKeys.insert(cacheKey);
+    }
+    if (const auto it = g_browserUnbuiltRows.find(cacheKey); it != g_browserUnbuiltRows.end()) {
+      if (ok) {
+        row = std::move(it->second);
+      }
+      g_browserUnbuiltRows.erase(it);
+    }
+  }
+  if (row) {
+    enqueue_pipeline_cache_write(std::move(*row));
+  }
+}
+#endif
+
 uint32_t wait_pipelines(uint32_t maxWaitMs) {
+#ifdef __EMSCRIPTEN__
+  /* The browser never compiles on this thread's time: the gate starts what the
+   * cap allows and the count is what is still queued. */
+  (void)maxWaitMs;
+  browser_pump();
+  std::lock_guard lock{g_pipelineMutex};
+  return static_cast<uint32_t>(g_pendingPipelines.size());
+#else
   if (!g_hasPipelineThread) {
     /* No worker pool: this thread is the only one that builds pipelines (some
      * Android drivers fail vkCreateGraphicsPipelines off the draw thread), and
@@ -1573,12 +2009,14 @@ uint32_t wait_pipelines(uint32_t maxWaitMs) {
       PendingPipeline pending;
       {
         std::lock_guard lock{g_pipelineMutex};
-        auto& source = !g_pipelineQueue.empty() ? g_pipelineQueue : g_backgroundPipelineQueue;
-        if (source.empty()) {
+        if (!g_pipelineQueue.empty()) {
+          pending = std::move(g_pipelineQueue.front());
+          g_pipelineQueue.pop_front();
+        } else if (!g_backgroundPipelineQueue.empty()) {
+          pending = pop_background();
+        } else {
           break;
         }
-        pending = std::move(source.front());
-        source.pop_front();
       }
       build_pending_pipeline(pending);
     }
@@ -1589,8 +2027,153 @@ uint32_t wait_pipelines(uint32_t maxWaitMs) {
                                [] { return g_pendingPipelines.empty() || g_pipelineThreadEnd; });
   }
   return static_cast<uint32_t>(g_pendingPipelines.size());
+#endif
 }
 
 } // namespace aurora::gfx
 
 uint32_t aurora_wait_pipelines(uint32_t max_wait_ms) { return aurora::gfx::wait_pipelines(max_wait_ms); }
+
+/* The host's handles on the compile gate (src/pc/eggy). Defined on every
+ * platform; off the browser most are no-ops. The page calls the flush and
+ * reads the counts itself, so those stay exported. */
+using namespace aurora::gfx;
+
+#ifdef __EMSCRIPTEN__
+#define AURORA_PAGE_EXPORT EMSCRIPTEN_KEEPALIVE
+#else
+#define AURORA_PAGE_EXPORT
+#endif
+
+extern "C" void aurora_pump_pipelines(void) {
+#ifdef __EMSCRIPTEN__
+  browser_pump();
+#endif
+}
+
+extern "C" void aurora_set_compile_cap(uint32_t n) {
+#ifdef __EMSCRIPTEN__
+  g_browserCompileCap = n;
+  browser_pump();
+#else
+  (void)n;
+#endif
+}
+
+extern "C" void aurora_set_background_builds(bool on) {
+#ifdef __EMSCRIPTEN__
+  g_browserBackgroundOn = on;
+  if (on) {
+    browser_pump();
+  }
+#else
+  (void)on;
+#endif
+}
+
+extern "C" AURORA_PAGE_EXPORT uint32_t aurora_demanded_pipelines_pending(void) {
+#ifdef __EMSCRIPTEN__
+  std::lock_guard lock{g_pipelineMutex};
+  return static_cast<uint32_t>(g_browserWanted.size());
+#else
+  return 0;
+#endif
+}
+
+extern "C" AURORA_PAGE_EXPORT uint32_t aurora_draws_skipped(void) { return g_drawsSkipped.load(); }
+
+extern "C" void aurora_mark_go(void) {
+#ifdef __EMSCRIPTEN__
+  std::lock_guard lock{g_pipelineMutex};
+  g_browserAfterGo = true;
+  g_browserWantedAfterGo.clear();
+#endif
+}
+
+extern "C" AURORA_PAGE_EXPORT uint32_t aurora_demanded_after_go(void) {
+#ifdef __EMSCRIPTEN__
+  std::lock_guard lock{g_pipelineMutex};
+  return static_cast<uint32_t>(g_browserWantedAfterGo.size());
+#else
+  return 0;
+#endif
+}
+
+extern "C" void aurora_set_fog_enabled(bool on) {
+  aurora::gx::set_fog_enabled(on);
+#ifdef __EMSCRIPTEN__
+  if (on) {
+    std::lock_guard lock{g_pipelineMutex};
+    while (!g_backgroundFogParked.empty()) {
+      queue_background(std::move(g_backgroundFogParked.front()));
+      g_backgroundFogParked.pop_front();
+    }
+  }
+#endif
+}
+
+/* Waits, up to half a second, until every row asked for has been committed,
+ * so the page's FS.syncfs right after persists a whole database and never one
+ * torn mid-transaction. 0: written; 1: still writing; -1: no database. */
+extern "C" AURORA_PAGE_EXPORT int aurora_pipeline_cache_flush(void) {
+  if (g_pipelineCacheBroken || g_pipelineCacheDb == nullptr || !g_pipelineCacheWriterThread.joinable()) {
+    return -1;
+  }
+  std::unique_lock lock{g_pipelineCacheWriterMutex};
+  const bool drained = g_pipelineCacheWriterIdleCv.wait_for(lock, std::chrono::milliseconds{500}, [] {
+    return (g_pipelineCacheWriteQueue.empty() && !g_pipelineCacheWriterBusy) || g_pipelineCacheWriterStop;
+  });
+  if (g_pipelineCacheBroken) {
+    return -1;
+  }
+  return drained ? 0 : 1;
+}
+
+/* This match's tags (opaque to aurora; the host's fighters and stage): every
+ * GX config a draw asks for from now on is recorded under each of them. */
+extern "C" void aurora_set_pipeline_tags(const uint32_t* tags, uint32_t count) {
+#ifdef __EMSCRIPTEN__
+  std::lock_guard lock{g_pipelineMutex};
+  g_matchTags.assign(tags, tags + (tags != nullptr ? count : 0));
+  g_matchTagged.clear();
+#else
+  (void)tags;
+  (void)count;
+#endif
+}
+
+/* Asks, as a draw would, for every known config an earlier match sharing a tag
+ * with this one needed, so they compile ahead of the background builds and
+ * count as wanted until they have: the host's graphics-ready waits for them. */
+extern "C" void aurora_prebuild_tagged(void) {
+#ifdef __EMSCRIPTEN__
+  const auto scene = scene_render_target_layout();
+  std::vector<aurora::gx::PipelineConfig> configs;
+  {
+    std::lock_guard lock{g_pipelineMutex};
+    absl::flat_hash_set<aurora::HashType> seen;
+    for (const uint32_t tag : g_matchTags) {
+      const auto tagIt = g_tagConfigs.find(tag);
+      if (tagIt == g_tagConfigs.end()) {
+        continue;
+      }
+      for (const aurora::HashType key : tagIt->second) {
+        const auto it = g_knownPipelines.find(key);
+        if (!seen.insert(key).second || it == g_knownPipelines.end()) {
+          continue;
+        }
+        if (const auto* config = std::get_if<aurora::gx::PipelineConfig>(&it->second.config);
+            config != nullptr && (aurora::gx::fog_enabled() || config->shaderConfig.fogType == GX_FOG_NONE)) {
+          configs.push_back(*config);
+        }
+      }
+    }
+  }
+  for (const auto& config : configs) {
+    resolve_pipeline(ShaderType::GX, config, scene, PipelinePriority::Normal);
+  }
+  if (!configs.empty()) {
+    Log.info("Prebuilding {} pipelines matches with these fighters and stage needed before", configs.size());
+  }
+#endif
+}

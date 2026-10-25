@@ -37,4 +37,11 @@ bool get_pipeline(PipelineRef ref, wgpu::RenderPipeline& pipeline);
  * still pending (queued or mid-compile). */
 uint32_t wait_pipelines(uint32_t maxWaitMs);
 
+#ifdef __EMSCRIPTEN__
+/* A browser compilation finished (gx.cpp build_pipeline): ok, or refused. The
+ * runtime ref is the cache's key for the compiled pipeline; cacheKey names its
+ * config, the device database's row. */
+void browser_pipeline_settled(PipelineRef ref, HashType cacheKey, bool ok);
+#endif
+
 } // namespace aurora::gfx
