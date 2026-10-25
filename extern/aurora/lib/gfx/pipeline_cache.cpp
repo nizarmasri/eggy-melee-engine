@@ -902,6 +902,9 @@ static sqlite3* open_pipeline_cache_seed_db(const std::string& path) {
     }
     return nullptr; /* the caller names every path it tried */
   }
+  // The SDL VFS opens nothing but this one read-only file, and the seed is read in first-use order: a sort SQLite
+  // spilled to a temp file failed the whole read with "unable to open database file".
+  sqlite::exec(seedDb, "PRAGMA temp_store=MEMORY;");
 
   bool schemaMatch = false;
   const auto schemaQuery = fmt::format("SELECT 1 FROM aurora_schema WHERE value = {}", PipelineCacheSchema);
