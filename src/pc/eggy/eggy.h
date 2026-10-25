@@ -114,6 +114,43 @@
  * played and skips the drawing of the rest; every tick still runs, at 60 a
  * second, so a phone that cannot draw each frame plays at full speed and keeps
  * its place in a netplay match. Each phone may pick its own; 1 by default.
+ * eggy_lite(flags), only while parked, for the matches after: bit 0 draws no
+ * fighter shadows, bit 1 no stage fog (fog is part of every pipeline, so it
+ * halves the stage's shader variants). Returns the flags in force.
+ *
+ * Pre-roll: a loaded match held at frame 0 is drawn while it waits, with no
+ * tick and nothing the simulation reads, so its pipelines, textures and
+ * buffers are made before GO. eggy_graphics_ready() is 1 once the held frame
+ * is drawn, nothing a draw asked for is still compiling, the last 30 draws
+ * made nothing new (no draw skipped for a pipeline, no texture uploaded) and
+ * their frame times are steady; 0 otherwise, and outside the hold. The page
+ * says go after it. eggy_compile_cap(n), 0..16, is how many pipelines the
+ * browser may compile at once (0: the default, 2 on Safari, 6 elsewhere);
+ * eggy_background_builds(0/1) lets the cache's known pipelines build while
+ * parked (on by default; never while a match loads or is played).
+ * eggy_pipeline_cache_flush() writes the pipeline cache out, for the page to
+ * persist /cache after. eggy_preroll_min(n), for tests: ready waits for at
+ * least n pre-roll draws.
+ *
+ * Graphics (int32 words at eggy_graphics_stats(), read on demand):
+ *   [0] pipelines a draw asked for, still queued or compiling
+ *   [1] draws skipped for a pipeline not ready yet, [2] textures uploaded,
+ *   [3] pipelines asked for by a draw since this match's GO
+ *   [4] pipelines compiled, [5] failed, [6] ms spent compiling
+ *   ([1], [2], [4]..[6] since boot)
+ *   [7] pre-roll draws of this hold (the last one, once it is over)
+ *   [8] eggy_graphics_ready(), [9] pre-roll draws in a row that made nothing
+ *   new, [10] median and [11] 90th percentile pre-roll frame, microseconds
+ *   [12] eggy_lite flags in force
+ *   [13] drawing since GO (the render pass on this thread), microseconds, and
+ *   [14] frames drawn since GO
+ *   [15] reserved, 0
+ *
+ * Pipeline tags (aurora's pipeline cache): every pipeline a match first needs
+ * is filed under the match's stage, fighters and items, and loading a match
+ * builds every known pipeline filed under any of its own first:
+ * EGGY_TAG_STAGE | StKind, EGGY_TAG_FIGHTER | CharacterKind (Zelda and Sheik
+ * both, for either), EGGY_TAG_ITEMS.
  *
  * Results (int32 words at eggy_results(), filled before onState('ended')):
  *   [0] end frame: the match frame on which GAME! or TIME! came
@@ -148,6 +185,12 @@ extern "C" {
 #define EGGY_FIGHTER_WORDS (EGGY_FIGHTER_SEEN_AT + EGGY_FIGHTER_SEEN_WORDS + 1)
 #define EGGY_NET_PHONES_MIN 2
 #define EGGY_NET_PHONES_MAX 4
+#define EGGY_GRAPHICS_WORDS 16
+#define EGGY_LITE_NO_SHADOWS 1
+#define EGGY_LITE_NO_FOG 2
+#define EGGY_TAG_STAGE (1u << 24)
+#define EGGY_TAG_FIGHTER (2u << 24)
+#define EGGY_TAG_ITEMS (3u << 24)
 #define EGGY_PERF_WORDS 26
 
 /* Where the clock goes (pc_eggy_perf_enter). */
@@ -304,6 +347,13 @@ int eggy_view(int width, int height);
 const int32_t* eggy_fighter(int port);
 const int32_t* eggy_perf(void);
 int eggy_draw_every(int n);
+int eggy_lite(int flags);
+int eggy_graphics_ready(void);
+int eggy_compile_cap(int n);
+int eggy_background_builds(int on);
+int eggy_pipeline_cache_flush(void);
+int eggy_preroll_min(int n);
+const int32_t* eggy_graphics_stats(void);
 
 /* ---- hooks the engine calls -------------------------------------------- */
 
@@ -337,6 +387,17 @@ void pc_eggy_perf_boundary(bool undrawn);
 /* gmscene.c, before a frame's render pass: true to skip its drawing
  * (eggy_draw_every). */
 bool pc_eggy_skip_draw(void);
+/* gmscene.c: one frame's render pass and its XFB hand-off, the scene loop's
+ * and the pre-roll's (MELEE_NET_RENDER_AUDIT around it when `audit`). */
+void gm_DrawFrame(bool audit);
+/* gmscene.c gm_DrawFrame: how long its render pass took on this thread. */
+void pc_eggy_drew(uint64_t ns);
+/* gmscene.c, every pass of the scene loop: true for the first passes of a
+ * match played on this phone alone, which run one tick however many pad
+ * samples are queued. */
+bool pc_eggy_start_one_tick(void);
+/* lbshadow.c: eggy_lite's no fighter shadows. */
+bool pc_eggy_lite_no_shadows(void);
 
 #ifdef __cplusplus
 }
