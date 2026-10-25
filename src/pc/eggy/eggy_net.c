@@ -18,6 +18,11 @@
  * (the mesh's rule), who report it ('away') and play on. A phone the others
  * settled leaves; one left with no other phone ends the match where it
  * stands, as M2's last phone did.
+ *
+ * A phone whose page reloads before the hold releases comes back: the page
+ * tells us when a link's epoch changes (eggy_net_peer_reset), the lane to it
+ * starts over on both ends, and it is waited for again from its HELLO. Once
+ * the match is under way nothing is resumed yet.
  */
 #include "pc/compat.h"
 #include "pc/eggy/eggy_net.h"
@@ -26,9 +31,19 @@
 #include "pc/net_lan.h"
 #include "pc/pc.h"
 
+#include <sysdolphin/baselib/random.h>
+
 #include <SDL3/SDL_timer.h>
 #include <emscripten.h>
+#include <stdlib.h>
 #include <string.h>
+
+/* net_mesh.c, for eggy_net_peer_reset: only this file calls them. */
+extern int pc_net_mesh_peer_reset(int port);
+extern void pc_net_mesh_resend_away(int port);
+
+_Static_assert(
+    MAX_REGIONS <= EGGY_HEAP_LAYOUT_REGIONS, "eggy_heap_layout has a word for every region");
 
 /* The page's link states (platforms/browser/bundle/netplay.mjs LINK). */
 #define LINK_OPEN 4
@@ -77,9 +92,10 @@ static struct {
     uint64_t hold_t0;
     bool done_sent;
     uint8_t done_got;
-    int32_t desync_told; /* the desync frame last reported, -1 none */
-    int desyncs;         /* reported this match */
-    uint8_t away_told;   /* ports whose 'away' was reported */
+    int32_t desync_told;    /* the desync frame last reported, -1 none */
+    int desyncs;            /* reported this match */
+    uint8_t away_told;      /* ports whose 'away' was reported */
+    uint64_t go_release_at; /* the leader's own release, once its GO is on the way (SDL ms) */
     int32_t stats[EGGY_NET_STATS_WORDS];
 } s;
 
@@ -285,7 +301,11 @@ int eggy_net_connect_step(void) {
             return fail(EGGY_NET_ERR_PEER_LEFT); /* it left before the match was agreed */
         }
     }
-    if (s.hello_sent && s.hello_got == s.others) {
+    if ((away_mask() & s.others) == s.others) {
+        return fail(
+            EGGY_NET_ERR_PEER_LEFT); /* a page that started again: every other phone is out */
+    }
+    if (eggy_net_agreed(s.hello_sent, s.hello_got, s.others, away_mask())) {
         set_state(EGGY_NET_HOLD);
         stats_refresh();
         pc_log_line("eggy: netplay session up with ports %x, ping %d ms", s.others, s.stats[1]);
@@ -334,12 +354,26 @@ int eggy_net_hold_step(bool go, bool* loaded) {
                 return 0;
             }
             break;
-        case EGGY_HOLD_SEND_GO:
+        case EGGY_HOLD_SEND_GO: {
             if (!send_msg(EGGY_REL_GO)) {
                 return 0;
             }
+            /* The others release when the GO reaches them, half a trip from
+             * now: the leader waits that out too, rather than starting the
+             * match a trip ahead of everyone it plays. */
+            int32_t ping[EGGY_PORTS];
+            for (int port = 0; port < EGGY_PORTS; port++) {
+                ping[port] = pc_net_mesh_ping_ms(port);
+            }
+            const int hold = eggy_go_hold_ms(ping, others_live());
+            s.go_release_at = now + (uint64_t)hold;
+            pc_log_line("eggy: GO sent; this phone releases in %d ms, with the others", hold);
             break;
+        }
         case EGGY_HOLD_RELEASE:
+            if (s.hold.sent_go && now < s.go_release_at) {
+                return 0;
+            }
             set_state(EGGY_NET_LIVE);
             pc_log_line("eggy: netplay released, ping %d ms, delay %d", s.stats[1], s.stats[2]);
             return 1;
@@ -437,6 +471,76 @@ void eggy_net_drop(bool failed) {
 
 bool eggy_net_open(void) {
     return pc_net_active();
+}
+
+EMSCRIPTEN_KEEPALIVE int eggy_net_peer_reset(int port) {
+    if (s.state == EGGY_NET_LIVE || s.state == EGGY_NET_CLOSING) {
+        pc_log_line("eggy: port %d started again mid-match; nothing is resumed", port + 1);
+        return EGGY_PEER_RESET_FIGHTING;
+    }
+    if (s.state != EGGY_NET_HANDSHAKE && s.state != EGGY_NET_HOLD) {
+        pc_net_mesh_peer_reset(port); /* no mesh up: only the ring is emptied */
+        return EGGY_PEER_RESET_NONE;
+    }
+    if (port < 0 || port >= EGGY_PORTS || (s.others & (1u << port)) == 0) {
+        return EGGY_PEER_RESET_PORT;
+    }
+    const int reset = pc_net_mesh_peer_reset(port);
+    if (reset < 0) {
+        return reset == -3 ? EGGY_PEER_RESET_LEFT : EGGY_PEER_RESET_PORT;
+    }
+    const uint8_t bit = (uint8_t)(1u << port);
+    s.hello_got &= (uint8_t)~bit;
+    s.done_got &= (uint8_t)~bit;
+    eggy_hold_forget(&s.hold, port);
+    if (reset == 2) {
+        pc_net_mesh_resend_away(port); /* its own AWAY among them: it leaves */
+        return EGGY_PEER_RESET_TOLD;
+    }
+    /* Ours again, in the order they first went: HELLO is seq 0 on every lane,
+     * then LOADED and ARMED as far as this phone got, then who is out. */
+    if (s.hello_sent) {
+        uint8_t hello[EGGY_HELLO_LEN];
+        eggy_hello_encode(hello, s.cfg.hash, eggy_net_session_id(&s.cfg));
+        pc_net_mesh_send_to(port, EGGY_REL_HELLO, hello, sizeof hello);
+    }
+    uint8_t again[2];
+    const int n = eggy_hold_resend(&s.hold, again);
+    for (int i = 0; i < n; i++) {
+        pc_net_mesh_send_to(port, again[i], NULL, 0);
+    }
+    pc_net_mesh_resend_away(port);
+    pc_log_line(
+        "eggy: port %d started again before the match; waiting for it from its HELLO", port + 1);
+    return EGGY_PEER_RESET_DONE;
+}
+
+EMSCRIPTEN_KEEPALIVE const uint32_t* eggy_heap_layout(void) {
+    static uint32_t w[EGGY_HEAP_LAYOUT_WORDS];
+    Region r[MAX_REGIONS];
+    const int n = snapshot_regions_now(r);
+    memset(w, 0, sizeof w);
+    w[1] = (uint32_t)n;
+    w[2] = (uint32_t)(uintptr_t)HSD_RandSeedPtr;
+    /* FNV-1a over what resync_unusable compares, in its order. */
+    uint32_t digest = 2166136261u;
+#define EGGY_FOLD(v) (digest = (digest ^ (uint32_t)(v)) * 16777619u)
+    EGGY_FOLD(w[2]);
+    EGGY_FOLD(n);
+    for (int i = 0; i < n; i++) {
+        uint32_t* out = w + 3 + 3 * i;
+        out[0] = i < SNAPSHOT_FIXED_REGIONS ? (uint32_t)i :
+                                              16u + (uint32_t)strtoul(r[i].name + 4, NULL, 10);
+        out[1] = (uint32_t)(uintptr_t)r[i].ptr;
+        out[2] = (uint32_t)r[i].len;
+        EGGY_FOLD(out[1]);
+        if (i < SNAPSHOT_FIXED_REGIONS) {
+            EGGY_FOLD(out[2]);
+        }
+    }
+#undef EGGY_FOLD
+    w[0] = digest;
+    return w;
 }
 
 const int32_t* eggy_net_stats_words(void) {

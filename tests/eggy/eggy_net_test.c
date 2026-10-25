@@ -252,6 +252,80 @@ static void test_roles(void) {
     CHECK(eggy_hold_next(&h, true, 0, 0) == EGGY_HOLD_SEND_GO);
 }
 
+/* A phone whose page reloaded in the hold (eggy_net_peer_reset): its old
+ * page's LOADED and ARMED no longer count, so nobody reports or GOes without
+ * the new page, and ours go to it again in the order they first went. */
+static void test_hold_restart(void) {
+    Phone ph[2];
+    phones_init(ph, 2, (const int[]){0, 2});
+    /* Both loaded and armed: the leader's next move is its GO. */
+    for (int i = 0; i < 2; i++) {
+        ph[i].h.sent_loaded = ph[i].h.reported = ph[i].h.sent_armed = true;
+        ph[i].reported = ph[i].go = true;
+    }
+    ph[0].h.loaded = ph[0].h.armed = 0x04;
+    CHECK(eggy_hold_next(&ph[0].h, true, 0, 0) == EGGY_HOLD_SEND_GO);
+
+    /* Port 2's page reloads: the leader forgets what its old page said. */
+    eggy_hold_forget(&ph[0].h, 2);
+    CHECK(ph[0].h.loaded == 0 && ph[0].h.armed == 0);
+    CHECK(eggy_hold_next(&ph[0].h, true, 0, 0) == EGGY_HOLD_WAIT); /* no GO without it */
+    uint8_t again[2];
+    CHECK(eggy_hold_resend(&ph[0].h, again) == 2);
+    CHECK(again[0] == EGGY_REL_LOADED && again[1] == EGGY_REL_ARMED);
+
+    /* The new page starts from nothing and hears the leader's two again. */
+    eggy_hold_init(&ph[1].h, 0x05, 2);
+    ph[1].reported = ph[1].go = false;
+    for (int i = 0; i < 2; i++) {
+        eggy_hold_receive(&ph[1].h, again[i], 0);
+    }
+    for (int frame = 0; frame < 4 && !(ph[0].released && ph[1].released); frame++) {
+        for (int i = 1; i >= 0; i--) {
+            ph[i].go = ph[i].reported;
+            phone_frame(&ph[i], false, 0, 0);
+            deliver(ph, 2, i, 0x0F);
+        }
+    }
+    CHECK(ph[0].released && ph[1].released);
+    CHECK(ph[0].h.sent_go && !ph[1].h.sent_go);
+
+    /* Not our own port, nor one out of range. */
+    EggyHold h;
+    eggy_hold_init(&h, 0x05, 0);
+    h.loaded = h.armed = 0x04;
+    eggy_hold_forget(&h, 0);
+    eggy_hold_forget(&h, 7);
+    CHECK(h.loaded == 0x04 && h.armed == 0x04);
+    /* Nothing of ours went out yet: nothing to send again. */
+    CHECK(eggy_hold_resend(&h, again) == 0);
+    h.sent_loaded = true;
+    CHECK(eggy_hold_resend(&h, again) == 1 && again[0] == EGGY_REL_LOADED);
+}
+
+/* The handshake: every other phone's HELLO, a phone settled away excepted,
+ * and one phone left to play. */
+static void test_agreed(void) {
+    CHECK(eggy_net_agreed(true, 0x0A, 0x0A, 0));
+    CHECK(!eggy_net_agreed(false, 0x0A, 0x0A, 0)); /* ours not out yet */
+    CHECK(!eggy_net_agreed(true, 0x02, 0x0A, 0));
+    CHECK(eggy_net_agreed(true, 0x02, 0x0A, 0x08)); /* port 3 is out */
+    CHECK(!eggy_net_agreed(true, 0x00, 0x0A, 0x0A)); /* nobody left */
+    CHECK(eggy_net_agreed(true, 0x0A, 0x0A, 0x01)); /* an AWAY for no other phone */
+}
+
+/* The leader's own release after its GO: half the worst round trip of the
+ * phones it plays, capped. */
+static void test_go_hold(void) {
+    const int32_t ping[EGGY_PORTS] = {-1, 40, 9, 900};
+    CHECK(eggy_go_hold_ms(ping, 0x02) == 20);
+    CHECK(eggy_go_hold_ms(ping, 0x06) == 20);
+    CHECK(eggy_go_hold_ms(ping, 0x04) == 5); /* rounds up */
+    CHECK(eggy_go_hold_ms(ping, 0x01) == 0); /* unmeasured */
+    CHECK(eggy_go_hold_ms(ping, 0x00) == 0);
+    CHECK(eggy_go_hold_ms(ping, 0x0E) == EGGY_GO_HOLD_MAX_MS);
+}
+
 static void test_hello(void) {
     uint8_t b[EGGY_HELLO_LEN];
     eggy_hello_encode(b, 0x01020304u, 0xA0B0C0D0u);
@@ -282,6 +356,9 @@ int main(void) {
     test_hold_n();
     test_hold_away();
     test_roles();
+    test_hold_restart();
+    test_agreed();
+    test_go_hold();
     test_hello();
     test_ids();
     if (failures != 0) {
