@@ -105,3 +105,37 @@ void eggy_hold_receive(EggyHold* h, int type, int from) {
         break;
     }
 }
+
+void eggy_hold_forget(EggyHold* h, int port) {
+    if (port < 0 || port >= EGGY_PORTS || port == h->self) {
+        return;
+    }
+    h->loaded &= (uint8_t)~(1u << port);
+    h->armed &= (uint8_t)~(1u << port);
+}
+
+int eggy_hold_resend(const EggyHold* h, uint8_t out[2]) {
+    int n = 0;
+    if (h->sent_loaded) {
+        out[n++] = EGGY_REL_LOADED;
+    }
+    if (h->sent_armed) {
+        out[n++] = EGGY_REL_ARMED;
+    }
+    return n;
+}
+
+bool eggy_net_agreed(bool hello_sent, uint8_t hello_got, uint8_t others, uint8_t away) {
+    return hello_sent && (others & (uint8_t)~away) != 0 && ((hello_got | away) & others) == others;
+}
+
+int eggy_go_hold_ms(const int32_t ping_ms[EGGY_PORTS], uint8_t ports) {
+    int32_t worst = 0;
+    for (int port = 0; port < EGGY_PORTS; port++) {
+        if ((ports & (1u << port)) && ping_ms[port] > worst) {
+            worst = ping_ms[port];
+        }
+    }
+    const int32_t hold = (worst + 1) / 2;
+    return hold > EGGY_GO_HOLD_MAX_MS ? EGGY_GO_HOLD_MAX_MS : (int)hold;
+}

@@ -1050,6 +1050,124 @@ void pc_net_mesh_gone(int port) {
     }
 }
 
+/* The phone on `port` started again before the match: its page reloaded,
+ * and Eggy's page calls this (eggy_net_peer_reset) on the first datagram of
+ * the new page, before that datagram reaches the ring. Everything held of
+ * the old page goes: the lane's numbers both ways, what it reported holding,
+ * its checksums, the round trip's samples, and whatever of it is still in
+ * the ring or the queues. Left as it was, the new page's HELLO (seq 0) is
+ * acked here as one already had, so its end drops it unsent, and everything
+ * ours goes out numbered past what the new page expects, "ahead of a gap"
+ * there for good. Its slot keeps what it holds: frames 0..delay-1 only,
+ * neutral on every phone, since nothing is simulated before the hold
+ * releases. The caller queues our HELLO and the rest again; mid-match
+ * nothing is resumed (this file's head), and eggy_net.c refuses then.
+ * 1 reset, 2 reset though it was settled away here, 0 no session (the ring
+ * is emptied, so a mesh that opens later meets nothing of the old page),
+ * -1 no other human of the match, -3 it left: a BYE, or a link the page
+ * reported failed. */
+int pc_net_mesh_peer_reset(int port) {
+    uint8_t buf[MESH_SLOT_BYTES];
+    if (!m.open || !net.active || !net.mesh) {
+        while (link_recv(buf, sizeof buf) >= 0) {
+        }
+        return 0;
+    }
+    if (!is_peer(port)) {
+        return -1;
+    }
+    MeshPeer* q = &m.peer[port];
+    if (q->bye) {
+        return -3;
+    }
+    const uint64_t now = SDL_GetTicksNS();
+    /* All of the ring, now: what the old page sent goes, the rest is queued
+     * as drain_link would, and dropped as a full queue does. */
+    int n;
+    while ((n = link_recv(buf, sizeof buf)) >= 0) {
+        uint8_t from;
+        const uint8_t* d;
+        size_t len;
+        if (!mesh_addr_unwrap(buf, (size_t)n, &from, &d, &len) || len > MESH_DGRAM_MAX) {
+            m.rx_bad++;
+            continue;
+        }
+        if (from == port) {
+            continue;
+        }
+        if (m.q_n == MESH_RXQ) {
+            m.rx_full++;
+            continue;
+        }
+        MeshRx* r = &m.q[(m.q_head + m.q_n++) % MESH_RXQ];
+        r->ns = now;
+        r->from = from;
+        r->len = (uint16_t)len;
+        memcpy(r->data, d, len);
+    }
+    int kept = 0;
+    for (int i = 0; i < m.q_n; i++) {
+        const MeshRx* r = &m.q[(m.q_head + i) % MESH_RXQ];
+        if (r->from != port) {
+            if (kept != i) {
+                m.q[(m.q_head + kept) % MESH_RXQ] = *r;
+            }
+            kept++;
+        }
+    }
+    m.q_n = kept;
+    kept = 0;
+    for (int i = 0; i < m.call_n; i++) {
+        const MeshCall* c = &m.call[(m.call_head + i) % MESH_REL_Q];
+        if (c->from != port) {
+            if (kept != i) {
+                m.call[(m.call_head + kept) % MESH_REL_Q] = *c;
+            }
+            kept++;
+        }
+    }
+    m.call_n = kept;
+
+    const int slot = q->slot;
+    const uint32_t rtt_us = q->rtt_us; /* the same phone on the same path: a fair first guess */
+    const uint16_t tx_seq = q->tx_seq;
+    const bool warned = q->warned;
+    memset(q, 0, sizeof *q);
+    q->slot = slot;
+    q->rtt_us = rtt_us;
+    q->tx_seq = tx_seq;
+    q->warned = warned;
+    q->heard_ns = now; /* the new page's datagram that brought us here */
+    for (int i = 0; i < MESH_PORTS; i++) {
+        q->have[i] = -1;
+    }
+    for (int i = 0; i < RING; i++) {
+        q->ck[i].frame = -1;
+    }
+    q->ck_checked = -1;
+    m.last_max[port] = -1;
+    m.max_moved_ns[port] = now;
+    pc_log_line("net: port %d started again (its page reloaded) at frame %d; its lane starts over",
+        port + 1, net.frame);
+    return settled(port) ? 2 : 1;
+}
+
+/* After pc_net_mesh_peer_reset: every AWAY this phone knows of, to `port`
+ * again, its own included, so a page that started again learns who is out
+ * of the match and a settled one that it is. */
+void pc_net_mesh_resend_away(int port) {
+    if (!m.open || !is_peer(port) || m.peer[port].bye) {
+        return;
+    }
+    for (int p = 0; p < MESH_PORTS; p++) {
+        if (settled(p)) {
+            uint8_t msg[MESH_AWAY_LEN];
+            mesh_away_encode(msg, (uint8_t)p, m.settle[p]);
+            lane_queue(port, MESH_REL_AWAY, msg, sizeof msg);
+        }
+    }
+}
+
 int pc_net_mesh_recv(int* from, uint8_t* type, void* payload, int max) {
     return mesh_recv_reliable(from, type, payload, max);
 }
