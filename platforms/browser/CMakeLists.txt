@@ -55,7 +55,9 @@ target_link_libraries(melee_browser PRIVATE aurora::core aurora::gx aurora::gd a
 set(EGGY_EXPORTS _eggy_config_buffer _eggy_load _eggy_go _eggy_pad _eggy_hud _eggy_results _eggy_abort
  _eggy_checksum _eggy_audio _eggy_costumes _eggy_team_costume _eggy_net_stats
  _eggy_snapshot_begin _eggy_snapshot_size _eggy_snapshot_buffer _eggy_snapshot_frame
- _eggy_snapshot_reserve _eggy_snapshot_apply _eggy_test_desync _eggy_view _eggy_fighter _eggy_tap _eggy_perf _eggy_draw_every)
+ _eggy_snapshot_reserve _eggy_snapshot_apply _eggy_test_desync _eggy_view _eggy_fighter _eggy_tap _eggy_perf _eggy_draw_every
+ _eggy_lite _eggy_graphics_ready _eggy_compile_cap _eggy_background_builds _eggy_pipeline_cache_flush
+ _eggy_preroll_min _eggy_graphics_stats _eggy_perf_words _eggy_net_peer_reset _eggy_heap_layout)
 list(JOIN EGGY_EXPORTS "," EGGY_EXPORTS)
 # MELEE_STATE_SECTIONS: the netplay snapshot ranges (tools/browser/wasm_state_sections.py).
 target_compile_definitions(melee_browser PRIVATE TARGET_PC=1 MELEE_PC=1 MELEE_USE_BUILTIN_SHA1 MELEE_STATE_SECTIONS=1)
