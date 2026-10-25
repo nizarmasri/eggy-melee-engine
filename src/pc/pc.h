@@ -19,9 +19,10 @@ void pc_platform_init(void);
 /* Frame boundary: presents the current frame, pumps events, starts the next
  * frame and runs due OSAlarms. Called from VIWaitForRetrace. */
 void pc_frame_boundary(void);
-/* A frame boundary after a frame that drew nothing: the screen keeps the last
- * picture (src/pc/vi.c). */
-void pc_frame_boundary_undrawn(void);
+/* While set, a frame boundary keeps aurora's frame open: the frame waiting on
+ * it drew nothing, and the screen keeps the last picture (src/pc/vi.c,
+ * HSD_VISkipXFBAsync). */
+void pc_frame_set_undrawn(bool undrawn);
 /* Simulation frame period the boundary paces to (60.000 Hz), src/pc/vi.c. */
 uint64_t pc_sim_period_ns(void);
 /* Sleep (at most 1 ms) toward the next due OSAlarm instead of spinning for it,
