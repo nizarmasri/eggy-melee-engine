@@ -391,9 +391,27 @@ Vec3* lbVector_WorldToScreen(HSD_CObj* cobj, const Vec3* pos3d,
                  (void*) pos3d, pos3d->x, pos3d->y, pos3d->z,
                  *(u32*) &pos3d->x, *(u32*) &pos3d->y, *(u32*) &pos3d->z);
     }
+#ifdef TARGET_PC
+    /* PORT: a bad position was a PANIC that ended the match on the phone
+     * that met it (one met x=-428443616, its bytes the other way round,
+     * while y and z were sound). The bad parts read as 0 instead; a sound
+     * position is untouched, so every phone of a match still agrees. */
+    Vec3 sound = *pos3d;
+    if (!(sound.x > -50000.0F && sound.x < 50000.0F)) {
+        sound.x = 0.0F;
+    }
+    if (!(sound.y > -50000.0F && sound.y < 50000.0F)) {
+        sound.y = 0.0F;
+    }
+    if (!(sound.z > -50000.0F && sound.z < 50000.0F)) {
+        sound.z = 0.0F;
+    }
+    pos3d = &sound;
+#else
     HSD_ASSERT(677, pos3d->x>-50000.0F&&pos3d->x<50000.0F);
     HSD_ASSERT(678, pos3d->y>-50000.0F&&pos3d->y<50000.0F);
     HSD_ASSERT(679, pos3d->z>-50000.0F&&pos3d->z<50000.0F);
+#endif
 
     point = *pos3d;
     switch (HSD_CObjGetProjectionType(cobj)) {
