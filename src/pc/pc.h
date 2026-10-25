@@ -19,6 +19,9 @@ void pc_platform_init(void);
 /* Frame boundary: presents the current frame, pumps events, starts the next
  * frame and runs due OSAlarms. Called from VIWaitForRetrace. */
 void pc_frame_boundary(void);
+/* A boundary that presents nothing and comes ten times a second, for an engine
+ * parked between matches (src/pc/vi.c). */
+void pc_frame_idle(void);
 /* While set, a frame boundary keeps aurora's frame open: the frame waiting on
  * it drew nothing, and the screen keeps the last picture (src/pc/vi.c,
  * HSD_VISkipXFBAsync). */
@@ -143,7 +146,7 @@ const char* pc_textures_get_path(void);
 
 /* Pipeline prewarm (src/pc/vi.c): blocks up to max_wait_ms while background
  * shader-pipeline compiles drain, returns how many are still pending. Call
- * from a load screen; 0 only polls. */
+ * from a load screen; 0 only polls, and the browser only ever polls. */
 uint32_t pc_gfx_prewarm(uint32_t max_wait_ms);
 
 #ifdef __cplusplus

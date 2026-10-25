@@ -18,6 +18,7 @@
 #include "gx_fmt.hpp"
 
 #include <absl/container/flat_hash_map.h>
+#include <absl/container/flat_hash_set.h>
 #include <tracy/Tracy.hpp>
 
 #include <atomic>
@@ -52,7 +53,14 @@ wgpu::PipelineLayout sPipelineLayout;
 absl::flat_hash_map<gfx::PipelineRef, std::shared_ptr<wgpu::RenderPipeline>> sBrowserPipelines;
 // Asked of the browser and not compiled yet (aurora_browser_pipelines_compiling).
 uint32_t sBrowserCompiling = 0;
+// Refused by the browser: never asked again, and their draws stay skipped.
+absl::flat_hash_set<gfx::PipelineRef> sBrowserFailed;
+// Finished compilations and the time each spent in the GPU process, request to
+// result, for the host's frame report (aurora_compile_ms_total).
+uint32_t sBrowserFinished = 0;
+double sBrowserCompileMs = 0;
 #endif
+bool sFogEnabled = true;
 
 std::atomic<int> sPendingViewportPolicy{-1};
 std::atomic<float> sPendingPresentationAspect{-1.f};
@@ -390,19 +398,30 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
   };
 #ifdef __EMSCRIPTEN__
   // Same key as the pipeline cache's runtime ref (resolve_pipeline).
-  const auto ref = xxh3_hash(layout.key, xxh3_hash(config, static_cast<HashType>(gfx::ShaderType::GX)));
+  const auto cacheKey = xxh3_hash(config, static_cast<HashType>(gfx::ShaderType::GX));
+  const auto ref = xxh3_hash(layout.key, cacheKey);
   auto pending = std::make_shared<wgpu::RenderPipeline>();
   sBrowserPipelines[ref] = pending;
   ++sBrowserCompiling;
-  g_device.CreateRenderPipelineAsync(&descriptor, wgpu::CallbackMode::AllowSpontaneous,
-      [pending](wgpu::CreatePipelineAsyncStatus status, wgpu::RenderPipeline pipeline, wgpu::StringView) {
+  const double requested = emscripten_get_now();
+  g_device.CreateRenderPipelineAsync(
+      &descriptor, wgpu::CallbackMode::AllowSpontaneous,
+      [pending, ref, cacheKey, requested](wgpu::CreatePipelineAsyncStatus status, wgpu::RenderPipeline pipeline,
+                                          wgpu::StringView message) {
         if (sBrowserCompiling != 0) --sBrowserCompiling;
-        if (status == wgpu::CreatePipelineAsyncStatus::Success) {
+        const bool ok = status == wgpu::CreatePipelineAsyncStatus::Success;
+        if (ok) {
           *pending = std::move(pipeline);
-        } else {
-          Log.error("Browser GPU pipeline compilation failed");
-          EM_ASM({ Module.onAbort?.('GPU pipeline compilation failed'); });
+          ++sBrowserFinished;
+          sBrowserCompileMs += emscripten_get_now() - requested;
+        } else if (sBrowserFailed.insert(ref).second && sBrowserFailed.size() <= 8) {
+          /* One refused pipeline used to abort the page (Module.onAbort). Only
+           * its draws are lost: they stay skipped, nothing asks for it again,
+           * and the device row is never written (pipeline_cache.cpp), so the
+           * next boot does not ask either. */
+          Log.error("Browser GPU pipeline compilation failed ({}): {}", static_cast<int>(status), message);
         }
+        gfx::browser_pipeline_settled(ref, cacheKey, ok);
       });
   return {};
 #else
@@ -420,17 +439,35 @@ bool take_browser_pipeline(gfx::PipelineRef ref, wgpu::RenderPipeline& pipeline)
 }
 
 uint32_t browser_pipelines_compiling() { return sBrowserCompiling; }
+bool browser_pipeline_failed(gfx::PipelineRef ref) { return sBrowserFailed.contains(ref); }
 // For the host page's frame report (src/pc/eggy/eggy_perf.c).
 extern "C" uint32_t aurora_browser_pipelines_compiling() { return sBrowserCompiling; }
+// The page reads these for its logs, so they stay exported.
+extern "C" EMSCRIPTEN_KEEPALIVE uint32_t aurora_pipelines_finished() { return sBrowserFinished; }
+extern "C" EMSCRIPTEN_KEEPALIVE uint32_t aurora_pipelines_failed() {
+  return static_cast<uint32_t>(sBrowserFailed.size());
+}
+extern "C" EMSCRIPTEN_KEEPALIVE uint32_t aurora_compile_ms_total() { return static_cast<uint32_t>(sBrowserCompileMs); }
 #endif
+
+bool fog_enabled() noexcept { return sFogEnabled; }
+
+void set_fog_enabled(bool enabled) noexcept {
+  if (sFogEnabled == enabled) {
+    return;
+  }
+  sFogEnabled = enabled;
+  // The draw cache holds a populated config; the next draw populates afresh.
+  g_gxState.dirty |= DirtyPipeline | DirtyUniform;
+}
 
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept {
   ZoneScoped;
 
   const auto& vtxFmt = g_gxState.vtxFmts[fmt];
   config.shaderConfig = {};
-  config.shaderConfig.fogType = g_gxState.fog.type;
-  config.shaderConfig.fogRangeEnabled = g_gxState.fog.rangeEnabled;
+  config.shaderConfig.fogType = sFogEnabled ? g_gxState.fog.type : GX_FOG_NONE;
+  config.shaderConfig.fogRangeEnabled = sFogEnabled && g_gxState.fog.rangeEnabled;
   config.shaderConfig.zTexOp = static_cast<u8>(g_gxState.zTexOp);
   config.shaderConfig.zTexFmt = g_gxState.zTexFmt;
   config.shaderConfig.zTexBias = g_gxState.zTexBias;
@@ -652,6 +689,7 @@ void initialize() noexcept {
 void shutdown() noexcept {
 #ifdef __EMSCRIPTEN__
   sBrowserPipelines.clear();
+  sBrowserFailed.clear();
 #endif
   // TODO we should probably store this all in g_state.gx instead
   sSamplerBindGroupLayout = {};

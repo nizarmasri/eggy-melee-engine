@@ -1,4 +1,7 @@
 #include "lbshadow.h"
+#ifdef TARGET_PC
+#include "pc/eggy/eggy.h"
+#endif
 
 #include "lbvector.h"
 #include "types.h"
@@ -163,6 +166,10 @@ void lbShadow_8000EEE0(HSD_GObj* gobj)
             bool var_r4 = lbshadow->x0_b0 || lbshadow->x0_b1 ||
                           lbshadow->x0_b2 || lbshadow->x0_b3 ||
                           lbshadow->x0_b4 || lbshadow->x0_b5;
+#ifdef TARGET_PC
+            /* MELEE_EGGY's lite mode (eggy_lite): no fighter shadows. */
+            var_r4 = var_r4 || pc_eggy_lite_no_shadows();
+#endif
             if (!var_r4 && ftLib_CastsShadow(gobj)) {
                 HSD_ShadowSetActive(lbshadow->shadow, 1);
             } else {
@@ -339,6 +346,23 @@ void lbShadow_8000F38C(s32 arg0)
 
     noLight = 0;
     nextGx = NULL;
+
+#ifdef TARGET_PC
+    /* MELEE_EGGY's lite mode (eggy_lite): no fighter casts a shadow, so none
+     * is rendered and no ground draws one. Presentation only, as the shadow
+     * pass is: it runs from the camera's display callback. */
+    if (pc_eggy_lite_no_shadows()) {
+        for (gobj = HSD_GObjPLinkHead[HSD_GOBJ_PLINK_FIGHTER]; gobj != NULL;
+             gobj = gobj->next)
+        {
+            LbShadow* lbs = ftLib_GetShadow(gobj);
+            if (lbs != NULL && lbs->shadow != NULL) {
+                HSD_ShadowSetActive(lbs->shadow, 0);
+            }
+        }
+        return;
+    }
+#endif
 
     for (
 #ifdef MUST_MATCH

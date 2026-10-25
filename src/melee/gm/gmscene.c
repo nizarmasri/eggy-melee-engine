@@ -378,6 +378,36 @@ static bool scene_end_gate(struct gm_80479D58_t* st)
     }
     return false;
 }
+
+/* One frame's render pass and its XFB hand-off, where the frame meets its
+ * retrace (HSD_VICopyXFBAsync, waiting for a free XFB): the scene loop's, and
+ * MELEE_EGGY's pre-roll of a match held at frame 0 (src/pc/eggy/eggy.c), which
+ * draws it before its first tick. The render reads the scene and writes
+ * nothing a tick reads; MELEE_NET_RENDER_AUDIT checks a netplay frame's
+ * checksum around it when `audit`. */
+void gm_DrawFrame(bool audit)
+{
+    u64 began;
+
+    if (audit) {
+        pc_net_render_audit(false);
+    }
+    const int perf_draw = pc_eggy_perf_enter(EGGY_PERF_DRAW);
+    lb_800195D0();
+    began = pc_monotonic_ns();
+    GXInvalidateVtxCache();
+    GXInvalidateTexAll();
+    HSD_StartRender(HSD_RP_SCREEN);
+    HSD_GObj_80390FC0();
+    HSD_Init_803755A8();
+    HSD_PerfSetDrawTime();
+    pc_eggy_drew(pc_monotonic_ns() - began);
+    HSD_VICopyXFBAsync(HSD_RP_SCREEN);
+    pc_eggy_perf_enter(perf_draw);
+    if (audit) {
+        pc_net_render_audit(true);
+    }
+}
 #endif
 
 void gm_801A4D34(void (*on_frame)(void), GameSceneInfo* info)
@@ -416,6 +446,16 @@ void gm_801A4D34(void (*on_frame)(void), GameSceneInfo* info)
 #endif
         }
         lb_800195D0();
+#ifdef TARGET_PC
+        /* MELEE_EGGY, a match on this phone alone: its first passes after GO
+         * run one tick each, the queued samples merged into it, so a slow
+         * first frame is not followed by ticks run at once and never seen
+         * (src/pc/eggy/eggy.c). Netplay's pads come from its session. */
+        if (pc_eggy_start_one_tick() && pad_queue_count > 1) {
+            HSD_PadFlushQueue(HSD_PAD_FLUSH_QUEUE_MERGE);
+            pad_queue_count = 1;
+        }
+#endif
 
         if (HSD_PadGetResetSwitch()) {
             gmMainLib_8046B0F0.resetting = true;
@@ -486,9 +526,9 @@ void gm_801A4D34(void (*on_frame)(void), GameSceneInfo* info)
             lb_800195D0();
             HSD_VISkipXFBAsync();
         } else {
-        pc_net_render_audit(false);
-        const int perf_draw = pc_eggy_perf_enter(EGGY_PERF_DRAW);
-#endif
+            gm_DrawFrame(true);
+        }
+#else
         lb_800195D0();
         GXInvalidateVtxCache();
         GXInvalidateTexAll();
@@ -497,10 +537,6 @@ void gm_801A4D34(void (*on_frame)(void), GameSceneInfo* info)
         HSD_Init_803755A8();
         HSD_PerfSetDrawTime();
         HSD_VICopyXFBAsync(HSD_RP_SCREEN);
-#ifdef TARGET_PC
-        pc_eggy_perf_enter(perf_draw);
-        pc_net_render_audit(true);
-        }
 #endif
         if (temp_r25->unk_4 != -2U) {
             temp_r25->unk_4++;

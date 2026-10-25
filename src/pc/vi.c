@@ -49,11 +49,25 @@ static bool s_in_frame;
  * the last picture instead of presenting an empty one. */
 static bool s_undrawn;
 
+/* When the next simulated frame is due (pc_frame_boundary's pacing); 0 starts
+ * the schedule over at the next boundary. */
+static u64 next_sim_ns;
+
 void pc_os_run_alarms(void);
 void aurora_heap_check(void);
+/* aurora's pipeline cache: starts whatever browser compiles its cap allows
+ * (normally from the end of each frame, which a parked engine has none of). */
+extern void aurora_pump_pipelines(void);
 
 uint32_t pc_gfx_prewarm(uint32_t max_wait_ms) {
+#ifdef __EMSCRIPTEN__
+    /* Never blocks on the browser: its compiles are asynchronous and capped
+     * (aurora's pipeline cache), and waiting here only froze the page. */
+    (void)max_wait_ms;
+    return aurora_wait_pipelines(0);
+#else
     return aurora_wait_pipelines(max_wait_ms);
+#endif
 }
 
 uint64_t pc_monotonic_ns(void) {
@@ -291,7 +305,6 @@ void pc_frame_boundary(void) {
      * displays, aurora_begin_frame() unblocks at monitor refresh rate. Without this check,
      * the simulation would run at 2x-4x speed. Pacing strictly to 60.000 Hz ensures physics,
      * hitboxes, and timers remain bit-identical. */
-    static u64 next_sim_ns;
     const u64 sim_period = pc_sim_period_ns();
     u64 now = SDL_GetTicksNS();
     /* How far behind its schedule this boundary is, and how much of that to
@@ -438,6 +451,74 @@ void VIWaitForRetrace(void) {
     while (pc_menu_is_open() && !pc_exit_requested) {
         pc_frame_boundary();
     }
+}
+
+#define PC_IDLE_MS 100
+
+/* A boundary that presents nothing, for MELEE_EGGY parked between matches
+ * (src/pc/eggy/eggy.c park): the frame still open is presented once, then no
+ * frame is begun or ended until the engine draws again, and the boundaries
+ * come every PC_IDLE_MS instead of 60 a second. The canvas keeps its last
+ * picture; the page's latches, events, alarms and the retrace callbacks still
+ * run, the page's picture size still applies (no frame is open, so
+ * pc_eggy_frame_end resizes between frames as ever), and the browser's
+ * pipeline compiles are started from here, since no frame ends to start them.
+ * The next VIWaitForRetrace begins a frame and paces from scratch. */
+void pc_frame_idle(void) {
+    if (pc_menu_is_open()) {
+        VIWaitForRetrace(); /* the overlay draws: real frames */
+        return;
+    }
+    pc_eggy_perf_boundary(false);
+    const int perf_caller = pc_eggy_perf_enter(EGGY_PERF_OTHER);
+    if (s_in_frame && !s_undrawn) {
+        pc_eggy_perf_enter(EGGY_PERF_SUBMIT);
+        aurora_end_frame();
+        pc_eggy_perf_enter(EGGY_PERF_OTHER);
+        s_in_frame = false;
+    }
+#ifdef __EMSCRIPTEN__
+    extern void pc_audio_pump(void);
+    pc_audio_pump();
+#endif
+    if (!s_in_frame) {
+        pc_eggy_frame_end();
+    }
+    pc_widescreen_update();
+    pc_handle_events(aurora_update());
+    pc_menu_update();
+    aurora_preserve_frame_buffer(pc_menu_is_open() || pc_eggy_hold_frame());
+    pc_keyboard_apply();
+    if (pc_exit_requested) {
+        pc_net_match_stop();
+        pc_net_disconnect();
+        pc_lan_stop();
+        exit(0);
+    }
+    aurora_pump_pipelines();
+    next_sim_ns = 0;
+    pc_eggy_perf_enter(EGGY_PERF_SPARE);
+#ifdef __EMSCRIPTEN__
+    emscripten_sleep(PC_IDLE_MS);
+#else
+    SDL_Delay(PC_IDLE_MS);
+#endif
+    pc_eggy_perf_enter(EGGY_PERF_OTHER);
+    s_retrace_count++;
+#ifdef __EMSCRIPTEN__
+    // clang-format off
+    EM_ASM({if(Module.onFrame)Module.onFrame($0);},s_retrace_count);
+    // clang-format on
+#endif
+    pc_os_run_alarms();
+    if (s_pre_cb) {
+        s_pre_cb(s_retrace_count);
+    }
+    s_current_fb = s_next_fb;
+    if (s_post_cb) {
+        s_post_cb(s_retrace_count);
+    }
+    pc_eggy_perf_enter(perf_caller);
 }
 
 /* The retraces of a frame the game did not draw (gmscene.c, MELEE_EGGY's

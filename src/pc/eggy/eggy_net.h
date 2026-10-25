@@ -79,6 +79,25 @@ void eggy_hold_done(EggyHold* h, int action);
 /* A LOADED, ARMED or GO from the phone on port `from`; anything else, or
  * from no other phone, is ignored. */
 void eggy_hold_receive(EggyHold* h, int type, int from);
+/* The phone on `port` started again (its page reloaded before the match,
+ * eggy_net_peer_reset): its LOADED and ARMED were the old page's, so it is
+ * waited for again. */
+void eggy_hold_forget(EggyHold* h, int port);
+/* What of ours a phone that started again has to hear again, in the order
+ * it first went out: LOADED, then ARMED, as far as this phone got. Fills
+ * `out` and returns how many (0..2). Never GO: once it is out, the match is
+ * under way and nothing is resumed. */
+int eggy_hold_resend(const EggyHold* h, uint8_t out[2]);
+/* The match is agreed: our HELLO is out and every other phone's arrived,
+ * a phone settled away excepted (a page that started again learns who is
+ * out from the AWAYs sent after its HELLO), with one phone left to play. */
+bool eggy_net_agreed(bool hello_sent, uint8_t hello_got, uint8_t others, uint8_t away);
+/* How long the acting leader holds its own release after it sends GO: half
+ * the worst round trip to the phones it plays (`ports`; a ping of -1 is
+ * unmeasured), so every phone leaves frame 0 within about a frame of the
+ * others instead of the leader starting a trip ahead. */
+#define EGGY_GO_HOLD_MAX_MS 150
+int eggy_go_hold_ms(const int32_t ping_ms[EGGY_PORTS], uint8_t ports);
 
 /* ---- the session (eggy_net.c, game thread) ---------------------------- */
 
@@ -109,6 +128,33 @@ void eggy_net_drop(bool failed);
 /* A session is open. */
 bool eggy_net_open(void);
 const int32_t* eggy_net_stats_words(void);
+
+/* The page at `port` started again (Eggy's net.ts saw a new epoch on that
+ * link) and nothing of the new page has reached the engine yet:
+ * eggy_net_peer_reset, an export. Before the match the new page is waited
+ * for from its HELLO, as if it had never been here; once the hold has
+ * released, nothing is done. */
+enum EggyPeerReset {
+    EGGY_PEER_RESET_NONE = 0,      /* no session up: nothing held of it (the link's ring emptied) */
+    EGGY_PEER_RESET_DONE = 1,      /* waited for again from its HELLO */
+    EGGY_PEER_RESET_TOLD = 2,      /* it was settled away here: told so again, so it leaves */
+    EGGY_PEER_RESET_PORT = -1,     /* no other human of this match */
+    EGGY_PEER_RESET_FIGHTING = -2, /* the match is under way: nothing is resumed */
+    EGGY_PEER_RESET_LEFT = -3,     /* it left (a BYE, or a link the page reported failed) */
+};
+int eggy_net_peer_reset(int port);
+
+/* What a resync snapshot needs of this phone's memory to restore another's
+ * (net.c resync_unusable): eggy_heap_layout, an export, for comparing a
+ * fresh page entering a match with one on its fifth. Words: [0] a digest of
+ * exactly what that check compares, [1] the number of regions, [2] where the
+ * random seed lives, then per region its id (0..3 the fixed ones: heap
+ * descriptors either side of the audio heap's, .data, .bss; 16 + n heap n),
+ * address and length. Only the fixed regions' lengths are in the digest: a
+ * heap grows. */
+#define EGGY_HEAP_LAYOUT_REGIONS 12
+#define EGGY_HEAP_LAYOUT_WORDS (3 + 3 * EGGY_HEAP_LAYOUT_REGIONS)
+const uint32_t* eggy_heap_layout(void);
 
 #ifdef __cplusplus
 }

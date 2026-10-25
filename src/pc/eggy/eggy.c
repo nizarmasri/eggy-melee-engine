@@ -40,6 +40,7 @@
 #include <SDL3/SDL_hints.h>
 #include <SDL3/SDL_properties.h>
 #include <SDL3/SDL_stdinc.h>
+#include <SDL3/SDL_timer.h>
 #include <SDL3/SDL_video.h>
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wscalar-storage-order" /* disc-struct unions in lb/types.h */
@@ -148,43 +149,115 @@ void pc_eggy_preinit(void) {
      * page keystroke is captured or default-prevented (SDL3 accepts "#none"
      * for this hint; it must be set before the window exists). */
     SDL_SetHint(SDL_HINT_EMSCRIPTEN_KEYBOARD_ELEMENT, "#none");
+    /* The engine boots while people pick: nothing builds ahead until the page
+     * says it may (eggy_background_builds), or the boot's compiles stall the
+     * pick screen in the GPU process. */
+    extern void aurora_set_background_builds(bool on);
+    aurora_set_background_builds(false);
 }
 
-/* The cached pipelines building behind the frames (MELEE_PIPELINES_BACKGROUND,
- * aurora's pipeline_cache.cpp) stop while a match is played: the fight's own
- * pipelines come first, and a compile in the GPU process slows every frame. */
-extern void aurora_background_pipelines(uint32_t max_in_flight);
+/* aurora's pipeline cache (extern/aurora/lib/gfx/pipeline_cache.cpp): every
+ * browser compile goes through one capped queue, the ones a draw asked for
+ * first, then the cache's known pipelines "in the background". */
+extern void aurora_pump_pipelines(void);
+extern void aurora_set_compile_cap(uint32_t n);
+extern void aurora_set_background_builds(bool on);
+extern uint32_t aurora_demanded_pipelines_pending(void);
+extern uint32_t aurora_draws_skipped(void);
+extern uint32_t aurora_texture_uploads(void);
+extern void aurora_mark_go(void);
+extern uint32_t aurora_demanded_after_go(void);
+extern uint32_t aurora_pipelines_finished(void);
+extern uint32_t aurora_pipelines_failed(void);
+extern uint32_t aurora_compile_ms_total(void);
+extern int aurora_pipeline_cache_flush(void);
+extern void aurora_set_fog_enabled(bool on);
+extern void aurora_set_pipeline_tags(const uint32_t* tags, uint32_t count);
+extern void aurora_prebuild_tagged(void);
+/* src/pc/audio.c: nothing is mixed while held, and the release starts clean. */
+extern void pc_audio_set_held(bool held);
 
-static void background_pipelines(bool on) {
-    static int in_flight = -1;
-    if (in_flight < 0) {
-        const char* n = getenv("MELEE_PIPELINES_BACKGROUND");
-        in_flight = n != NULL ? atoi(n) : 0;
-        if (in_flight < 0) {
-            in_flight = 0;
-        }
-    }
-    if (in_flight > 0) {
-        aurora_background_pipelines(on ? (uint32_t)in_flight : 0);
-    }
+/* The cache's known pipelines build only while parked, and only while the page
+ * allows it (eggy_background_builds: off until it says, and it says no while
+ * people pick): a compile in the GPU process slows every frame, and a loading
+ * or played match's own pipelines come first. */
+static bool s_background_ok = false;
+static bool s_audio_held;
+
+static void background_builds_follow(void) {
+    aurora_set_background_builds(
+        s_background_ok && (s_state == EGGY_STATE_PARKED || s_state == EGGY_STATE_ERROR));
 }
 
 static void set_state(int state) {
     s_state = state;
     s_hud[0] = state;
-    background_pipelines(state != EGGY_STATE_FIGHTING);
+    background_builds_follow();
+    /* A loaded match's stage music and crowd are started by the VS scene; held
+     * at frame 0 they stay silent, and start from the top at GO. */
+    const bool held = state == EGGY_STATE_LOADED;
+    if (held != s_audio_held) {
+        s_audio_held = held;
+        pc_audio_set_held(held);
+    }
 }
 
 static bool fighting(void) {
     return s_scene_live && (s_state == EGGY_STATE_LOADED || s_state == EGGY_STATE_FIGHTING);
 }
 
+/* ---- pre-roll -----------------------------------------------------------
+ * A loaded match waits at frame 0 (the holds below) for as long as the page,
+ * or the slowest phone, takes. While it waits, the held frame is drawn: the
+ * render pass only (gm_DrawFrame), no tick, no input, nothing the simulation
+ * reads, so every pipeline, texture and buffer the fight's first frames need
+ * is made behind the load screen and not at GO. VS's on_enter has already
+ * built the camera, the fighters, the stage and the HUD the draw reads. The
+ * seed is put back after, should any display callback draw a random number:
+ * netplay re-seeds entering frame 0 anyway (net.c), and so a phone alone
+ * starts the same match however long it pre-rolled.
+ *
+ * Ready (eggy_graphics_ready) once nothing a draw asked for is still queued
+ * or compiling, the last PREROLL_CLEAN draws made nothing new and their frame
+ * times are steady; or, should something keep moving (a pipeline that failed
+ * is skipped on every draw), steady after PREROLL_SETTLE draws, or whatever
+ * the times after PREROLL_GIVE_UP. Then the hold presents that picture again
+ * (pc_eggy_hold_frame) and draws it once a second, and pre-rolls again when
+ * that draw asks for a pipeline or uploads a texture, or the page's picture
+ * size changes. */
+#define PREROLL_CLEAN 30
+#define PREROLL_SETTLE 300
+#define PREROLL_GIVE_UP 600
+#define PREROLL_REDRAW_EVERY 60
+
+typedef struct Preroll {
+    bool active; /* a hold is under way */
+    bool ready;
+    bool view_changed; /* the page's picture size changed since the last look */
+    uint32_t seed;     /* the RNG as the hold found it */
+    int32_t boundaries;
+    int32_t draws;
+    int32_t clean; /* draws in a row that made nothing new */
+    bool uploaded; /* the last draw uploaded a texture */
+    int32_t since_draw;
+    uint64_t last_ns; /* the last draw's start, for the next one's frame time */
+    uint32_t times_us[PREROLL_CLEAN];
+    int32_t times_n;
+    int32_t median_us;
+    int32_t p90_us;
+} Preroll;
+
+static Preroll s_pre;
+static int s_preroll_min; /* eggy_preroll_min */
+
 bool pc_eggy_hold_frame(void) {
     /* Parked, the last picture (GAME! or the results screen) stays up. Not
      * while a match loads or holds: those frames clear to black, so frame 0
-     * draws into a cleared colour and depth buffer, not over the last one. */
+     * draws into a cleared colour and depth buffer, not over the last one.
+     * Once the held frame is pre-rolled, that picture stays up instead. */
     return pc_eggy_enabled() &&
-           (s_state == EGGY_STATE_PARKED || s_state == EGGY_STATE_ERROR || s_net_closing);
+           (s_state == EGGY_STATE_PARKED || s_state == EGGY_STATE_ERROR || s_net_closing ||
+               (s_state == EGGY_STATE_LOADED && s_pre.active && s_pre.ready));
 }
 
 bool pc_eggy_music_off(void) {
@@ -320,6 +393,42 @@ bool pc_eggy_skip_draw(void) {
     return s_draw_count++ % (uint32_t)s_draw_every != 0;
 }
 
+/* eggy_lite (eggy.h), taken while parked for the matches after it: a phone's
+ * own, like the picture's size. */
+static int s_lite;
+
+bool pc_eggy_lite_no_shadows(void) {
+    return pc_eggy_enabled() && (s_lite & EGGY_LITE_NO_SHADOWS) != 0;
+}
+
+/* What drawing a match costs this phone (eggy_graphics_stats [13], [14]), so
+ * lite's flags can be weighed on and off. */
+static uint64_t s_draw_ns;
+static int32_t s_drawn;
+
+void pc_eggy_drew(uint64_t ns) {
+    if (s_state == EGGY_STATE_FIGHTING) {
+        s_draw_ns += ns;
+        s_drawn++;
+    }
+}
+
+/* A match on this phone alone runs one tick in each of its first passes after
+ * GO (gmscene.c): however long the first frames take, the fight does not open
+ * with ticks run at once and never drawn. Netplay keeps its session's pace. */
+#define START_ONE_TICK_PASSES 3
+static int s_start_passes = START_ONE_TICK_PASSES;
+
+bool pc_eggy_start_one_tick(void) {
+    if (!pc_eggy_enabled() || s_cfg.netplay || s_state != EGGY_STATE_FIGHTING ||
+        s_start_passes >= START_ONE_TICK_PASSES)
+    {
+        return false;
+    }
+    s_start_passes++;
+    return true;
+}
+
 void pc_eggy_frame_end(void) {
     if (!pc_eggy_enabled() || s_view_w == 0) {
         return;
@@ -345,6 +454,7 @@ void pc_eggy_frame_end(void) {
         }
         if (now_w != w || now_h != h) {
             SDL_SetWindowSize(windows[0], w, h);
+            s_pre.view_changed = true;
         }
     }
     SDL_free(windows);
@@ -552,6 +662,172 @@ static void build_match(StartMeleeData* start) {
     s_start = *start;
 }
 
+/* The match's tags in aurora's pipeline cache (eggy.h "Pipeline tags"): what
+ * it first needs is filed under them, and what is filed under any of them
+ * already is built while it loads, ahead of the pre-roll that asks for it. */
+static void pipeline_tags(void) {
+    uint32_t tags[2 + 2 * EGGY_PORTS];
+    uint32_t n = 0;
+    tags[n++] = EGGY_TAG_STAGE | (uint32_t)s_cfg.stage;
+    if (s_cfg.item_freq >= 0 && s_cfg.item_mask != 0) {
+        tags[n++] = EGGY_TAG_ITEMS;
+    }
+    for (int port = 0; port < EGGY_PORTS; port++) {
+        const EggyPort* p = &s_cfg.ports[port];
+        if (p->kind == EGGY_PORT_NONE) {
+            continue;
+        }
+        /* Zelda and Sheik are one fighter changing back and forth. */
+        const int32_t also = p->ckind == CKind_Zelda ? CKind_Seak :
+                             p->ckind == CKind_Seak  ? CKind_Zelda :
+                                                       -1;
+        const int32_t kinds[2] = {p->ckind, also};
+        for (int k = 0; k < 2; k++) {
+            if (kinds[k] < 0) {
+                continue;
+            }
+            const uint32_t tag = EGGY_TAG_FIGHTER | (uint32_t)kinds[k];
+            uint32_t i = 0;
+            while (i < n && tags[i] != tag) {
+                i++;
+            }
+            if (i == n) {
+                tags[n++] = tag;
+            }
+        }
+    }
+    aurora_set_pipeline_tags(tags, n);
+    aurora_prebuild_tagged();
+}
+
+static void preroll_begin(void) {
+    memset(&s_pre, 0, sizeof s_pre);
+    s_pre.active = true;
+    s_pre.seed = *HSD_RandSeedPtr;
+}
+
+static int compare_u32(const void* a, const void* b) {
+    const uint32_t x = *(const uint32_t*)a;
+    const uint32_t y = *(const uint32_t*)b;
+    return x < y ? -1 : x > y;
+}
+
+/* Whether the held frame is drawn and nothing for it is still being made. */
+static bool preroll_judge(void) {
+    if (s_pre.draws < 1 || s_pre.draws < s_preroll_min || aurora_demanded_pipelines_pending() != 0)
+    {
+        return false;
+    }
+    bool steady = false;
+    if (s_pre.times_n >= PREROLL_CLEAN) {
+        uint32_t sorted[PREROLL_CLEAN];
+        memcpy(sorted, s_pre.times_us, sizeof sorted);
+        qsort(sorted, PREROLL_CLEAN, sizeof sorted[0], compare_u32);
+        s_pre.median_us = (int32_t)sorted[PREROLL_CLEAN / 2];
+        s_pre.p90_us = (int32_t)sorted[PREROLL_CLEAN * 9 / 10];
+        /* A frame of jitter at the 90th percentile is a phone's ordinary pace
+         * (a vsync missed now and then), never a compile or an upload. */
+        const int32_t half_again = s_pre.median_us + s_pre.median_us / 2;
+        const int32_t one_more = s_pre.median_us + 17000;
+        steady = s_pre.p90_us <= (half_again > one_more ? half_again : one_more);
+    }
+    if (steady && (s_pre.clean >= PREROLL_CLEAN || s_pre.draws >= PREROLL_SETTLE)) {
+        return true;
+    }
+    return s_pre.draws >= PREROLL_GIVE_UP;
+}
+
+/* The held frame, drawn: the render pass and its XFB hand-off, then the
+ * boundary when the hand-off did not meet one (the hold leaves every XFB
+ * free), so each pass of a hold is one frame boundary. */
+static void preroll_draw(void) {
+    const uint64_t began = SDL_GetTicksNS();
+    const uint32_t retraces = VIGetRetraceCount();
+    const uint32_t skipped = aurora_draws_skipped();
+    const uint32_t uploads = aurora_texture_uploads();
+    gm_DrawFrame(false);
+    if (VIGetRetraceCount() == retraces) {
+        VIWaitForRetrace();
+    }
+    s_pre.draws++;
+    s_pre.uploaded = aurora_texture_uploads() != uploads;
+    const bool made = aurora_draws_skipped() != skipped || s_pre.uploaded;
+    s_pre.clean = made ? 0 : s_pre.clean + 1;
+    if (s_pre.last_ns != 0) {
+        const uint64_t us = (began - s_pre.last_ns) / 1000u;
+        s_pre.times_us[s_pre.times_n % PREROLL_CLEAN] = us > UINT32_MAX ? UINT32_MAX : (uint32_t)us;
+        s_pre.times_n++;
+    }
+    s_pre.last_ns = began;
+}
+
+/* One pass of a hold at frame 0: one frame boundary, the held frame drawn
+ * until it is ready, then that picture kept up and drawn once a second. */
+static void hold_frame(void) {
+    if (s_pre.view_changed) {
+        /* Another picture size: its frames are made, and weighed, again. */
+        s_pre.view_changed = false;
+        s_pre.ready = false;
+        s_pre.clean = 0;
+        s_pre.times_n = 0;
+        s_pre.last_ns = 0;
+    }
+    if (s_pre.boundaries++ == 0) {
+        VIWaitForRetrace(); /* the page's picture size first (pc_eggy_frame_end) */
+        return;
+    }
+    if (s_pre.ready) {
+        if (++s_pre.since_draw < PREROLL_REDRAW_EVERY) {
+            VIWaitForRetrace();
+            return;
+        }
+        s_pre.since_draw = 0;
+        s_pre.last_ns = 0; /* a second since the last draw is no frame time */
+        preroll_draw();
+        /* A draw skipped for a pipeline that failed is skipped every time:
+         * only new work (a pipeline asked for, a texture) undoes ready. */
+        if (s_pre.uploaded || aurora_demanded_pipelines_pending() != 0) {
+            s_pre.ready = false;
+            s_pre.times_n = 0;
+            pc_log_line("eggy: the held frame asked for more after %d pre-roll draws", s_pre.draws);
+        }
+        return;
+    }
+    preroll_draw();
+    if (preroll_judge()) {
+        s_pre.ready = true;
+        s_pre.since_draw = 0;
+        pc_log_line("eggy: graphics ready after %d pre-roll draws (%d made nothing new, frames "
+                    "%.1f ms, 90%% under %.1f ms)",
+            s_pre.draws, s_pre.clean, s_pre.median_us / 1000.0, s_pre.p90_us / 1000.0);
+    }
+}
+
+static void preroll_end(void) {
+    if (s_pre.draws > 0 && *HSD_RandSeedPtr != s_pre.seed) {
+        pc_log_line("eggy: pre-roll drew random numbers (seed %08x -> %08x), put back",
+            (unsigned)s_pre.seed, (unsigned)*HSD_RandSeedPtr);
+        *HSD_RandSeedPtr = s_pre.seed;
+    }
+    s_pre.active = false;
+}
+
+static void graphics_log_go(void) {
+    pc_log_line("eggy: go after %d pre-roll draws (%s), lite %d: %u pipelines waiting, %u "
+                "compiled, %u failed, %u ms compiling, %u draws skipped, %u textures",
+        s_pre.draws, s_pre.ready ? "ready" : "not ready", s_lite,
+        (unsigned)aurora_demanded_pipelines_pending(), (unsigned)aurora_pipelines_finished(),
+        (unsigned)aurora_pipelines_failed(), (unsigned)aurora_compile_ms_total(),
+        (unsigned)aurora_draws_skipped(), (unsigned)aurora_texture_uploads());
+}
+
+static void graphics_log_match(void) {
+    pc_log_line("eggy: the match drew %d frames at %.2f ms each (lite %d), and asked for %u "
+                "pipelines after go",
+        s_drawn, s_drawn > 0 ? (double)s_draw_ns / 1e6 / s_drawn : 0.0, s_lite,
+        (unsigned)aurora_demanded_after_go());
+}
+
 static void net_resync_event(int event, int32_t a, int32_t b);
 
 /* Netplay: open the session for the config just taken (eggy_net.c), the
@@ -608,8 +884,10 @@ static void park(void) {
         }
         hud_update();
         eggy_js_state(JS_PARKED, s_serial, 0);
+        /* Nothing is drawn here, so no frame is presented either: the canvas
+         * keeps the last picture and the page its time (pc_frame_idle). */
         while (!s_pending_ok) {
-            VIWaitForRetrace();
+            pc_frame_idle();
         }
         s_cfg = s_pending;
         s_serial = s_pending_serial;
@@ -622,6 +900,7 @@ static void park(void) {
         s_results_ticks = 0;
         memset(s_results, 0, sizeof s_results);
         memset(s_tick_pads, 0, sizeof s_tick_pads);
+        pipeline_tags();
         set_state(EGGY_STATE_LOADING);
         hud_update();
         if (!s_cfg.netplay) {
@@ -700,7 +979,7 @@ static void net_hold(void) {
             eggy_js_state(JS_NET_ERROR, -r, s_serial);
             return;
         }
-        VIWaitForRetrace();
+        hold_frame();
     }
 }
 
@@ -741,18 +1020,29 @@ void pc_eggy_scene_begin(int scene_kind) {
     if (scene_kind != GS_VS || s_state != EGGY_STATE_LOADING) {
         return;
     }
-    /* Loaded: the very first tick of the match is next. */
+    /* Loaded: the very first tick of the match is next. Held here, it is
+     * pre-rolled (hold_frame). A go latched while it loaded releases it with
+     * no pre-roll at all. */
     set_state(EGGY_STATE_LOADED);
     hud_update();
+    preroll_begin();
     if (s_cfg.netplay) {
         net_hold();
     } else if (!s_abort) {
         eggy_js_state(JS_LOADED, s_serial, 0);
         while (!s_go && !s_abort) {
-            VIWaitForRetrace();
+            hold_frame();
         }
     }
+    preroll_end();
     s_go = false;
+    s_start_passes = 0;
+    s_draw_ns = 0;
+    s_drawn = 0;
+    aurora_mark_go();
+    if (!s_abort) {
+        graphics_log_go();
+    }
     set_state(EGGY_STATE_FIGHTING);
 }
 
@@ -855,6 +1145,7 @@ static void finish(const MatchEnd* end) {
     if (s_end_frame == 0) {
         s_end_frame = s_frame_base; /* no GAME! was called: the last tick */
     }
+    graphics_log_match();
     fill_results(end, outcome);
     set_state(EGGY_STATE_ENDED);
     hud_update();
@@ -865,6 +1156,7 @@ static void finish(const MatchEnd* end) {
 }
 
 static void finish_aborted(void) {
+    graphics_log_match();
     memset(s_results, 0, sizeof s_results);
     s_results[0] = s_frame_base;
     s_results[1] = s_net_failed ? EGGY_OUTCOME_DISCONNECTED : EGGY_OUTCOME_ABORTED;
@@ -1111,4 +1403,80 @@ EMSCRIPTEN_KEEPALIVE void eggy_audio(int music_volume, int sfx_volume) {
     const int sfx = sfx_volume < 0 ? 0 : sfx_volume > 127 ? 127 : sfx_volume;
     pc_audio_set_music_volume((float)music / 127.0f);
     pc_audio_set_sfx_volume((float)sfx / 127.0f);
+}
+
+/* ---- graphics (eggy.h "Pre-roll", "Graphics") ---- */
+
+/* How many words eggy_perf() fills, for a page that reads more than one engine. */
+EMSCRIPTEN_KEEPALIVE int eggy_perf_words(void) {
+    return EGGY_PERF_WORDS;
+}
+
+static bool parked(void) {
+    return s_state == EGGY_STATE_PARKED || s_state == EGGY_STATE_ERROR;
+}
+
+EMSCRIPTEN_KEEPALIVE int eggy_lite(int flags) {
+    if (pc_eggy_enabled() && parked()) {
+        const int lite = flags & (EGGY_LITE_NO_SHADOWS | EGGY_LITE_NO_FOG);
+        if (lite != s_lite) {
+            s_lite = lite;
+            aurora_set_fog_enabled((lite & EGGY_LITE_NO_FOG) == 0);
+            pc_log_line("eggy: lite %d (shadows %s, fog %s)", lite,
+                lite & EGGY_LITE_NO_SHADOWS ? "off" : "on", lite & EGGY_LITE_NO_FOG ? "off" : "on");
+        }
+    }
+    return s_lite;
+}
+
+EMSCRIPTEN_KEEPALIVE int eggy_graphics_ready(void) {
+    return pc_eggy_enabled() && s_state == EGGY_STATE_LOADED && s_pre.active && s_pre.ready;
+}
+
+EMSCRIPTEN_KEEPALIVE int eggy_compile_cap(int n) {
+    if (n < 0 || n > 16) {
+        return -1;
+    }
+    aurora_set_compile_cap((uint32_t)n);
+    return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int eggy_background_builds(int on) {
+    s_background_ok = on != 0;
+    background_builds_follow();
+    return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int eggy_pipeline_cache_flush(void) {
+    return aurora_pipeline_cache_flush();
+}
+
+EMSCRIPTEN_KEEPALIVE int eggy_preroll_min(int n) {
+    if (n < 0 || n > 100000) {
+        return -1;
+    }
+    s_preroll_min = n;
+    return 0;
+}
+
+static int32_t s_graphics[EGGY_GRAPHICS_WORDS];
+
+EMSCRIPTEN_KEEPALIVE const int32_t* eggy_graphics_stats(void) {
+    memset(s_graphics, 0, sizeof s_graphics);
+    s_graphics[0] = (int32_t)aurora_demanded_pipelines_pending();
+    s_graphics[1] = (int32_t)aurora_draws_skipped();
+    s_graphics[2] = (int32_t)aurora_texture_uploads();
+    s_graphics[3] = (int32_t)aurora_demanded_after_go();
+    s_graphics[4] = (int32_t)aurora_pipelines_finished();
+    s_graphics[5] = (int32_t)aurora_pipelines_failed();
+    s_graphics[6] = (int32_t)aurora_compile_ms_total();
+    s_graphics[7] = s_pre.draws;
+    s_graphics[8] = eggy_graphics_ready();
+    s_graphics[9] = s_pre.clean;
+    s_graphics[10] = s_pre.median_us;
+    s_graphics[11] = s_pre.p90_us;
+    s_graphics[12] = s_lite;
+    s_graphics[13] = s_draw_ns / 1000u > INT32_MAX ? INT32_MAX : (int32_t)(s_draw_ns / 1000u);
+    s_graphics[14] = s_drawn;
+    return s_graphics;
 }

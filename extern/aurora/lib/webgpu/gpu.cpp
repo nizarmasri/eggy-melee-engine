@@ -304,6 +304,8 @@ uint32_t viewport_extent(float value) noexcept {
 
 bool vsync_enabled() noexcept { return g_vsyncEnabled.load(std::memory_order_acquire); }
 
+bool device_lost() noexcept { return g_deviceLost.load(std::memory_order_acquire); }
+
 wgpu::PresentMode select_present_mode(const wgpu::SurfaceCapabilities& capabilities) noexcept {
   const auto supports = [&capabilities](const wgpu::PresentMode candidate) {
     for (size_t i = 0; i < capabilities.presentModeCount; ++i) {
