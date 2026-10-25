@@ -123,6 +123,16 @@ keeping a view across frames.
 | `int eggy_view(int width, int height)` | 0, or -1 out of 64..4096 | the render size in pixels, and so the picture's shape; taken at the next frame boundary, against the canvas's own size (SDL keeps the window in CSS pixels) |
 | `const int32_t* eggy_perf(void)` | the frame report words | where the frame time went since the last read (ticks, re-run ticks, drawing, submitting, waiting for the GPU, spare, yielded), the longest frame and the late ones, draws, pipelines compiled and still compiling, and the last frame's vertex, index and uniform data; each read starts the next window (see `eggy.h`) |
 | `int eggy_draw_every(int n)` | 0, or -1 out of 1..4 | quality: while a match is played, one frame in `n` is drawn and the rest skip their render pass (the screen keeps the last picture); every tick still runs, 60 a second. Each phone may pick its own |
+| `int eggy_perf_words(void)` | how many words `eggy_perf` fills | 26; [25] is the time netplay spent blocked on the other phones (`wait_remote`, `resync_hold`), which an older engine counted in [10] |
+| `int eggy_graphics_ready(void)` | 1 or 0 | 1 while a loaded match holds at frame 0 and its pre-roll is done (see Pipelines in the browser); the page waits for it before it says it is ready |
+| `const int32_t* eggy_graphics_stats(void)` | 16 words | [0] pipelines a draw asked for, not built yet; [1] draws skipped for one not ready and [2] textures uploaded, since boot; [3] pipelines first asked for since GO; [4] compiled, [5] refused, [6] ms compiling, since boot; [7] pre-roll draws of this hold; [8] ready; [9] pre-roll draws in a row that made nothing new; [10] median and [11] 90th-percentile pre-roll frame, µs; [12] lite flags in force; [13] drawing µs and [14] frames drawn since GO |
+| `int eggy_compile_cap(int n)` | 0, or -1 out of 0..16 | pipelines compiling at once in the browser; 0 is the engine's own (2 on Safari and every iOS browser, 6 elsewhere) |
+| `int eggy_background_builds(int on)` | 0 | whether the pipeline cache may build ahead while parked (default on); the page turns it off while people pick |
+| `int eggy_lite(int flags)` | the flags in force | bit 0 no fighter shadows, bit 1 no fog; taken while parked, so a match keeps one set of pipelines |
+| `int eggy_pipeline_cache_flush(void)` | 0 written, 1 still writing, -1 no cache | the pipeline cache's writer drained (up to 500 ms), so the page may `FS.syncfs` `/cache` |
+| `int eggy_preroll_min(int n)` | 0, or -1 out of range | for tests: graphics-ready waits for at least `n` pre-roll draws |
+| `int eggy_net_peer_reset(int port)` | 1 waited for again, 2 it was settled away (it is told), 0 no session yet, -1 not a human of this match, -2 the fight is on, -3 it left | the page calls it when the phone playing `port` turns up with a new epoch, its page reloaded before GO (see Netplay) |
+| `const uint32_t* eggy_heap_layout(void)` | 3 + 3n words | for tests: what a resync snapshot needs of this memory: a digest, the region count, the seed's address, then id, address and length per region |
 | `const int32_t* eggy_fighter(int port)` | the fighter words | for tests: motion state, airborne, facing, position, ground speed, the stick as read, jumps used, and every motion state entered and the highest point reached since the last read, tick by tick, so a slow machine's skipped frames hide nothing (see `eggy.h`) |
 
 They are `Module._eggy_*` (EXPORTED_FUNCTIONS in `platforms/browser/CMakeLists.txt`).
@@ -351,6 +361,11 @@ A full analog press of L or R is the digital bit plus 255 on the trigger.
   music and sound-effect gains).
 - **Parking** after a match stops the music and keys off every sound effect,
   as a match end does.
+- **Held at frame 0:** while a match is LOADED, `pc_audio_set_held` stops the
+  pump, so nothing is mixed and AX's frame callback does not run. The stage
+  music starts in the last line of VS's on_enter, just before the hold; it
+  plays from the top at GO on every phone, with no backlog. No load waits on
+  the AX callback, but LOADING is not held.
 - **The AudioWorklet** is a static file in the release,
   `melee-audio.worklet.js`. The page names it with `Module.meleeAudioWorkletUrl`
   or resolves it with its `Module.locateFile`. With neither (melee-web's own
@@ -560,6 +575,24 @@ reads its own 9: a mesh phone that hears an M2 one fails with 7. Until a phone
 answers in the mesh's protocol, the mesh also sends it a 16-byte BYE in the M2
 wire's own format, carrying protocol 10, which an M2 engine refuses as another
 version: it fails with 7 too (its page delivering it without the port byte).
+
+### A page that reloads before GO
+
+A reloaded page's reliable lane starts again at sequence 0: the others acked
+its new HELLO as one they had, it dropped its HELLO and LOADED unsent, and
+their later messages sat ahead of a gap on the new page for good. Each page
+sends with an epoch of its own; when the phone playing `port` turns up with a
+new one, the page calls `eggy_net_peer_reset(port)` before handing the
+datagram over. That phone's lane (both ways), what it said it holds, its
+phase and round-trip samples, its checksum ring, and its HELLO, DONE, loaded
+and armed bits start over, so nobody reports or sends GO without it; this
+phone's HELLO, LOADED and ARMED (as far as it got) and its leave notices go to
+it again, in order. Once GO is out the fight is on and a reset is refused:
+nothing is resumed mid-match yet.
+
+**GO:** the leader holds its own release for half its worst round trip to the
+phones still in (at most 150 ms), so every phone leaves frame 0 within about a
+frame of the others.
 
 ### Stats
 
@@ -807,18 +840,46 @@ browser build neither aborts:
   `WGPUErrorType` (2 validation, 3 out of memory, 4 internal). The frame is
   drawn past; after an OutOfMemory, what it couldn't make is missing.
 
-### Pipelines on Safari
+### Pipelines in the browser
 
 Safari compiles each WebGPU pipeline into Metal in its GPU process, about
-50 ms apiece on an iPhone 11. `browser_prepare_graphics` building the whole
-cache (865 rows) before the first frame took 47 s there, and both iPhones that
-did it lost that process soon after; with no cache at all, a match started
-black and filled in over its first minute while every frame waited on the
-compiles. `MELEE_PIPELINES_BACKGROUND=<n>` keeps the cache but builds it
-behind the frames, `n` compilations in flight at most, two started per frame,
-while the engine is parked, loading or holding at frame 0; a match being played
-builds only what it draws (`pc_eggy` turns the background off and on again
-with `aurora_background_pipelines`). `eggy_perf` [20] is what is left.
+50 ms apiece on an iPhone. A first frame that asked for hundreds at once (the
+held frame drew nothing, so GO was the match's first render) lost an iPhone
+15's GPU process at every match start. So:
+
+- **One gate.** A draw only queues the pipeline it needs; `browser_pump` is
+  the only thing that creates GX pipelines, at most 2 at once on Safari and
+  every iOS browser, 6 elsewhere (`eggy_compile_cap`,
+  `MELEE_PIPELINES_INFLIGHT`). What a draw asked for goes first, oldest first;
+  the cache's own rows only when nothing a draw wants waits, and only while
+  background builds are on (parked, and the page allows it). Nothing starts
+  after a device loss. Clear pipelines are made at once, outside the gate.
+- **A refused compile** is logged (the first eight), never retried, and not
+  fatal: only its own draws are missing.
+- **The cache.** The shipped seed (`initial_pipeline_cache.db`) is read on
+  every boot, after the prune, and never merged into the phone's own database,
+  `/cache/pipeline_cache.db`, which keeps only configs that compiled. A
+  database that fails `PRAGMA quick_check` or a read is recreated. The page
+  calls `eggy_pipeline_cache_flush` and then syncs `/cache` (IDBFS) after a
+  match, so the next boot has what this phone built.
+- **Tags.** Each match tags its configs with its stage, fighters (Zelda and
+  Sheik both) and items (`EGGY_TAG_*`, `eggy.h`); a load queues every config
+  that shares a tag, as if a draw had asked, so a fighter's second match has
+  its effects built before GO.
+- **Pre-roll.** While a loaded match holds at frame 0, it draws the held frame
+  (`gm_DrawFrame`, no tick) until nothing a draw asked for is pending, 30 draws
+  in a row made nothing new (or 300 steady draws, or 600 in all), and the frame
+  times are steady (90th percentile at most 1.5 times the median, or the median
+  plus 17 ms). Then `eggy_graphics_ready` is 1 and the hold keeps that picture,
+  redrawn once a second. A draw only reads the game; the seed is put back after
+  the hold all the same, and a log line says if it had moved.
+- **Lite** (`eggy_lite`): no fog makes every new config fogless, so fog's
+  variants are never asked for; no shadows leaves every fighter's shadow off.
+- **Parked**, the engine presents no frames at all (`pc_frame_idle`, ten
+  boundaries a second): it still runs audio, the picture size, alarms and the
+  pipeline pump.
+- `browser_prepare_graphics` never blocks; `eggy_perf` [20] is what the cache
+  has left to build.
 
 ### Yielding on Safari
 
@@ -836,6 +897,11 @@ a phone's core for most of a frame.
 `eggy_render_size` is not built. Aurora has no public resize call, and the
 render size is still the canvas's at boot.
 
+A phone whose page reloads mid-match is not taken back: with two phones the
+other one ends the match, with more it is settled away. `eggy_heap_layout`
+is there to find out whether a fresh boot's memory matches a long-lived
+engine's, which a snapshot restore needs.
+
 ## Upstream files touched
 
 Each change is behind `MELEE_EGGY` (`pc_eggy_enabled()`), which is false
@@ -847,7 +913,7 @@ that keep their defaults unless `src/pc/eggy` sets them.
 | `src/melee/gm/forward.h` | `GM_EGGY` before `GM_COUNT` | the mode Eggy matches run in |
 | `src/melee/gm/gmscdata.c` | the `GM_EGGY` entry in the mode table | its states are `gm_Mode_Eggy_States` (`src/pc/eggy/eggy.c`) |
 | `src/melee/gm/gmboot.c` | `MELEE_BOOT_SCENE=eggy` maps to `GM_EGGY` | boot straight into it |
-| `src/melee/gm/gmscene.c` | `pc_eggy_scene_begin` at the start of `gm_801A4D34`, `pc_eggy_after_tick` at the end of `gm_RunSimTick`; the frame report's sections around the ticks and the render pass; the render pass skipped for `eggy_draw_every` | the hold at frame 0 (before the pad-queue flush); the HUD, abort and results timer per tick; `eggy_perf`; quality |
+| `src/melee/gm/gmscene.c` | `pc_eggy_scene_begin` at the start of `gm_801A4D34`, `pc_eggy_after_tick` at the end of `gm_RunSimTick`; the frame report's sections around the ticks and the render pass; the render pass skipped for `eggy_draw_every`; the render pass as `gm_DrawFrame`; a solo match's first three passes after GO run one tick each | the hold at frame 0 (before the pad-queue flush); the HUD, abort and results timer per tick; `eggy_perf`; quality; pre-roll draws the held frame; overdue ticks the player never saw |
 | `src/sysdolphin/baselib/video.c` | `HSD_VISkipXFBAsync`: `HSD_VICopyXFBAsync`'s XFB hand-off without the copy, for a frame `eggy_draw_every` does not draw | a frame meets its retrace waiting for an XFB: one that skipped the hand-off left the next an XFB already free, which then drew with no retrace into the aurora frame of the one before, until its index pool overflowed |
 | `src/melee/lb/lbvector.c` | `lbVector_WorldToScreen` reads the bad parts of an out-of-range position as 0 instead of asserting | a phone met x=-428443616 (its bytes the other way round) at a match's start, and the assert's PANIC ended the match; a sound position is untouched |
 | `src/melee/ft/kinds/ftPikachu/ftpikachuspeciallw.c` | `ftPk_SpecialLw_8012765C` reads the bolt only while its chain stays in MEM1 (`pc_in_mem1`) | the bolt's destroy callback leaves the fighter pointing at the freed item; once that memory went to something else an iPhone trapped out of bounds on Pikachu's aerial down-B |
@@ -855,13 +921,17 @@ that keep their defaults unless `src/pc/eggy` sets them.
 | `platforms/browser/scheduler.c` | `browser_yield` lets an animation frame through when none came for 50 ms | Yielding on Safari |
 | `extern/aurora/lib/internal.hpp`, `extern/aurora/lib/gx/command_processor.cpp` | `ByteBuffer` checks capacity inline; `prepare_idx_buffer` writes straight into room made once | the hottest loop of a frame |
 | `extern/aurora/lib/window.cpp` | the browser window's minimum size is 64x64, not 640x480 | the page picks the render size (`eggy_view`); a step down to 360 lines kept 480 of them, only the width following, and stretched the picture |
-| `extern/aurora/lib/gfx/pipeline_cache.cpp`, `extern/aurora/lib/gx/gx.cpp` | `MELEE_PIPELINES_BACKGROUND`, `aurora_background_pipelines`, the compilations in flight | Pipelines on Safari |
+| `extern/aurora/lib/gfx/pipeline_cache.cpp`, `extern/aurora/lib/gx/gx.cpp`, `extern/aurora/lib/gfx/texture.cpp`, `extern/aurora/lib/webgpu/gpu.cpp` | the browser's one compile gate and its cap; refused compiles not fatal; the seed read each boot, the device database of compiled configs, its tags and flush; the fog switch; the counters `eggy_graphics_stats` reads | Pipelines in the browser |
+| `src/melee/lb/lbshadow.c` | no fighter shadows under lite | `eggy_lite` |
+| `src/melee/gr/grdisplay.c` | the "oioi" print is not built for PC | it printed every frame |
+| `src/pc/audio.c` | `pc_audio_set_held` | Sound, held at frame 0 |
+| `src/pc/net.c` `wait_remote`, `resync_hold` | timed as their own section | `eggy_perf` [25] |
 | `platforms/browser/asyncify-remove.json` | new | Asyncify |
 | `src/melee/gm/gmvs.c` | Zelda/Sheik hold-A swap off | the config names her outright |
 | `src/melee/gm/gm_1601.c` | `gm_GetNumCostumesForCKind` uncapped | every costume |
 | `src/melee/lb/lbaudio_ax.c` | `lbAudioAx_80023F28` returns early with music off | no music file read on that device |
 | `src/pc/net.c` | `capture_local_sample` brackets its `PADRead` with `pc_eggy_sampling` | the session's local sample takes `eggy_tap`'s one-tick presses |
-| `src/pc/vi.c` | the frame buffer is preserved while parked; `pc_eggy_frame_end()` after each presented frame; the frame report's sections in the boundary; `pc_frame_set_undrawn` keeps aurora's frame open across the retrace of a frame that drew nothing | the last picture stays up; a load or hold clears to black, so frame 0 draws into cleared buffers; the page's picture size is taken between two frames; `eggy_perf` |
+| `src/pc/vi.c` | the frame buffer is preserved while parked; `pc_eggy_frame_end()` after each presented frame; the frame report's sections in the boundary; `pc_frame_set_undrawn` keeps aurora's frame open across the retrace of a frame that drew nothing; `pc_frame_idle`, a boundary that presents nothing, for the parked engine; `pc_gfx_prewarm` only polls in the browser | the last picture stays up; a load or hold clears to black, so frame 0 draws into cleared buffers; the page's picture size is taken between two frames; `eggy_perf` |
 | `extern/aurora/lib/webgpu/gpu.cpp` | a lost device or a WebGPU error calls `Module.onGpuTrouble` instead of aborting (any browser page, not only `MELEE_EGGY`) | The GPU |
 | `src/pc/audio.c` | the worklet loads from a static file first; the page's AudioContext is used | Eggy's CSP; iOS's unlocked context (any page, not only `MELEE_EGGY`) |
 | `platforms/browser/main.c` | `pc_eggy_preinit()` before `aurora_initialize`; no memory card | SDL keyboard off; one card-absent save everywhere |
@@ -886,7 +956,9 @@ Tests:
 - `tests/eggy/eggy_net_test.c`: the hold's rules between two, three and four
   simulated phones (all loaded before `loaded`, a go only arms, the leader
   releases on GO, a phone settled away is not waited for, a leader settled
-  away before its GO is replaced), roles, and the HELLO payload.
+  away before its GO is replaced), roles, the HELLO payload, a reload during
+  the hold (no GO without the new page, the resend order, both release), the
+  handshake with a settled phone, and the leader's GO hold.
 - `tests/eggy/eggy_mesh_test.c`: the mesh's wire codec and the ring's port
   byte (the 512 bytes include it), the M2 probe, the leader, quorum and
   settlement rules, and a simulated mesh of two to four phones: one going
