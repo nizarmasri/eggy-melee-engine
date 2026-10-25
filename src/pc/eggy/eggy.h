@@ -88,8 +88,9 @@
  * which is its shape too (widescreen follows the window); taken at the next
  * frame boundary. 64..4096 each, else -1. Each phone may pick its own.
  *
- * Frame report (int32 words at eggy_perf(); totals since the last read, and
- * each read starts the next; src/pc/eggy/eggy_perf.c). Times in microseconds:
+ * Frame report (int32 words at eggy_perf(), eggy_perf_words() of them; totals
+ * since the last read, and each read starts the next; src/pc/eggy/eggy_perf.c).
+ * Times in microseconds:
  *   [0] frames drawn (frame boundaries), [1] ticks simulated fresh, [2] ticks
  *   re-simulated (rollback, sync test)
  *   [3] in fresh ticks, [4] in re-run ticks, [5] drawing (the game's render
@@ -346,6 +347,7 @@ int eggy_test_desync(void);
 int eggy_view(int width, int height);
 const int32_t* eggy_fighter(int port);
 const int32_t* eggy_perf(void);
+int eggy_perf_words(void);
 int eggy_draw_every(int n);
 int eggy_lite(int flags);
 int eggy_graphics_ready(void);

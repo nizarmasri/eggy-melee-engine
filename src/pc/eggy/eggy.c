@@ -217,8 +217,9 @@ static bool fighting(void) {
  * times are steady; or, should something keep moving (a pipeline that failed
  * is skipped on every draw), steady after PREROLL_SETTLE draws, or whatever
  * the times after PREROLL_GIVE_UP. Then the hold presents that picture again
- * (pc_eggy_hold_frame) and draws it once a second, or again from the start
- * when the page's picture size changes. */
+ * (pc_eggy_hold_frame) and draws it once a second, and pre-rolls again when
+ * that draw asks for a pipeline or uploads a texture, or the page's picture
+ * size changes. */
 #define PREROLL_CLEAN 30
 #define PREROLL_SETTLE 300
 #define PREROLL_GIVE_UP 600
@@ -232,6 +233,7 @@ typedef struct Preroll {
     int32_t boundaries;
     int32_t draws;
     int32_t clean; /* draws in a row that made nothing new */
+    bool uploaded; /* the last draw uploaded a texture */
     int32_t since_draw;
     uint64_t last_ns; /* the last draw's start, for the next one's frame time */
     uint32_t times_us[PREROLL_CLEAN];
@@ -743,7 +745,8 @@ static void preroll_draw(void) {
         VIWaitForRetrace();
     }
     s_pre.draws++;
-    const bool made = aurora_draws_skipped() != skipped || aurora_texture_uploads() != uploads;
+    s_pre.uploaded = aurora_texture_uploads() != uploads;
+    const bool made = aurora_draws_skipped() != skipped || s_pre.uploaded;
     s_pre.clean = made ? 0 : s_pre.clean + 1;
     if (s_pre.last_ns != 0) {
         const uint64_t us = (began - s_pre.last_ns) / 1000u;
@@ -776,7 +779,9 @@ static void hold_frame(void) {
         s_pre.since_draw = 0;
         s_pre.last_ns = 0; /* a second since the last draw is no frame time */
         preroll_draw();
-        if (s_pre.clean == 0 || aurora_demanded_pipelines_pending() != 0) {
+        /* A draw skipped for a pipeline that failed is skipped every time:
+         * only new work (a pipeline asked for, a texture) undoes ready. */
+        if (s_pre.uploaded || aurora_demanded_pipelines_pending() != 0) {
             s_pre.ready = false;
             s_pre.times_n = 0;
             pc_log_line("eggy: the held frame asked for more after %d pre-roll draws", s_pre.draws);
@@ -1396,6 +1401,11 @@ EMSCRIPTEN_KEEPALIVE void eggy_audio(int music_volume, int sfx_volume) {
 }
 
 /* ---- graphics (eggy.h "Pre-roll", "Graphics") ---- */
+
+/* How many words eggy_perf() fills, for a page that reads more than one engine. */
+EMSCRIPTEN_KEEPALIVE int eggy_perf_words(void) {
+    return EGGY_PERF_WORDS;
+}
 
 static bool parked(void) {
     return s_state == EGGY_STATE_PARKED || s_state == EGGY_STATE_ERROR;
