@@ -44,7 +44,7 @@ static void* s_next_fb;
 static void* s_current_fb;
 static BOOL s_black;
 static bool s_in_frame;
-/* This boundary ends a frame that drew nothing (pc_frame_boundary_undrawn):
+/* This boundary ends a frame that drew nothing (pc_frame_set_undrawn):
  * aurora's frame stays open for the next one to draw into, so the screen keeps
  * the last picture instead of presenting an empty one. */
 static bool s_undrawn;
@@ -440,12 +440,12 @@ void VIWaitForRetrace(void) {
     }
 }
 
-/* The boundary of a frame the game did not draw (gmscene.c, MELEE_EGGY's
- * eggy_draw_every): everything a retrace does, with aurora's frame kept open. */
-void pc_frame_boundary_undrawn(void) {
-    s_undrawn = true;
-    VIWaitForRetrace();
-    s_undrawn = false;
+/* The retraces of a frame the game did not draw (gmscene.c, MELEE_EGGY's
+ * eggy_draw_every): everything a retrace does, with aurora's frame kept open.
+ * They are met where a drawn frame meets them, waiting for an XFB
+ * (HSD_VISkipXFBAsync). */
+void pc_frame_set_undrawn(bool undrawn) {
+    s_undrawn = undrawn;
 }
 
 u32 VIGetRetraceCount(void) {

@@ -333,6 +333,28 @@ void HSD_VICopyXFBAsync(HSD_RenderPass rpass)
     HSD_VIGXSetDrawDone(idx);
 }
 
+#ifdef TARGET_PC
+/* PORT: the XFB hand-off of a frame MELEE_EGGY did not draw (eggy_draw_every,
+ * gmscene.c): HSD_VICopyXFBAsync without the copy. Waiting for an XFB is where
+ * a frame meets its retrace, one a frame. A frame that skipped the hand-off
+ * left the next one an XFB already free, and that one drew without a retrace,
+ * into the aurora frame still holding the one before it, until the frame's
+ * index pool overflowed. */
+void HSD_VISkipXFBAsync(void)
+{
+    int idx;
+
+    if (HSD_VIGetNbXFB() < 2) {
+        return;
+    }
+    pc_frame_set_undrawn(true);
+    idx = HSD_VIWaitXFBDrawEnable();
+    pc_frame_set_undrawn(false);
+    HSD_VISetXFBWaitDone(idx);
+    HSD_VIGXSetDrawDone(idx);
+}
+#endif
+
 void HSD_VIDrawDoneXFB(int idx)
 {
     bool intr;

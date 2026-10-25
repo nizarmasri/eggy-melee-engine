@@ -116,6 +116,9 @@ void HSD_VIGXDrawDone(int arg);
 void HSD_VIGXSetDrawDone(int arg);
 void HSD_VISetXFBWaitDone(int idx);
 void HSD_VICopyXFBAsync(HSD_RenderPass rpass);
+#ifdef TARGET_PC
+void HSD_VISkipXFBAsync(void);
+#endif
 void HSD_VIDrawDoneXFB(int idx);
 void HSD_VIWaitXFBFlush(void);
 void HSD_VIWaitXFBFlushNoYield(void);
