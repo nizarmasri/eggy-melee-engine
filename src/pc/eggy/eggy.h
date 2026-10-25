@@ -97,7 +97,7 @@
  *   encode, upload, present), [7] waiting for the GPU (aurora_begin_frame),
  *   [8] spare (the pacing's sleep and the pad wait: ahead of time), [9]
  *   yielded with no time to spare (the browser's own work between frames),
- *   [10] everything else (audio, alarms, netplay, events)
+ *   [10] everything else (audio, alarms, netplay's own work, events)
  *   [11] the longest frame, boundary to boundary, [12] frames over 20 ms,
  *   [13] over 34 ms
  *   [14] draws in the last frame, [15] of them merged, [16] pipelines created,
@@ -106,6 +106,9 @@
  *   [20] cached pipelines still to build behind the frames
  *   (MELEE_PIPELINES_BACKGROUND), [21] vertex, [22] index and [23] uniform
  *   data of the last frame, in KiB, [24] frames not drawn (eggy_draw_every)
+ *   [25] blocked waiting on the other phones (netplay: an input that has not
+ *   arrived, or the leader's resync hold; never the catch-up ticks after,
+ *   which are [3]). Before this word it was part of [10].
  *
  * Quality: eggy_draw_every(n), n 1..4, draws one frame in n of a match being
  * played and skips the drawing of the rest; every tick still runs, at 60 a
@@ -145,7 +148,7 @@ extern "C" {
 #define EGGY_FIGHTER_WORDS (EGGY_FIGHTER_SEEN_AT + EGGY_FIGHTER_SEEN_WORDS + 1)
 #define EGGY_NET_PHONES_MIN 2
 #define EGGY_NET_PHONES_MAX 4
-#define EGGY_PERF_WORDS 25
+#define EGGY_PERF_WORDS 26
 
 /* Where the clock goes (pc_eggy_perf_enter). */
 enum EggyPerfSection {
@@ -157,7 +160,10 @@ enum EggyPerfSection {
     EGGY_PERF_GPU_WAIT = 5,
     EGGY_PERF_SPARE = 6,
     EGGY_PERF_YIELD = 7,
-    EGGY_PERF_SECTIONS = 8,
+    /* Netplay blocked on the other phones (net.c wait_remote, resync_hold):
+     * time this phone had nothing to do, not time it was too slow for. */
+    EGGY_PERF_WAIT = 8,
+    EGGY_PERF_SECTIONS = 9,
 };
 
 /* CharacterKind 0..25, Sheik included. */

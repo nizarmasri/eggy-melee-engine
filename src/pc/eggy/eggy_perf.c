@@ -109,6 +109,7 @@ EMSCRIPTEN_KEEPALIVE const int32_t* eggy_perf(void) {
     s_words[19] = us(now - s_window_start);
     s_words[20] = (int32_t)aurora_background_pipelines_left();
     s_words[24] = s_undrawn;
+    s_words[25] = us(s_ms[EGGY_PERF_WAIT]);
     memset(s_ms, 0, sizeof s_ms);
     s_window_start = now;
     s_worst_ms = 0;

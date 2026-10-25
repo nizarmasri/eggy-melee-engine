@@ -28,6 +28,7 @@
 #include <SDL3/SDL.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -118,6 +119,20 @@ float pc_audio_get_music_volume(void) {
 
 float pc_audio_get_sfx_volume(void) {
     return s_sfx_volume;
+}
+
+/* MELEE_EGGY's hold at frame 0 (src/pc/eggy/eggy.c): a loaded match waits
+ * there for GO, for as long as the slowest phone takes, with its stage music
+ * and crowd already started by the VS scene. While held nothing is mixed and
+ * AX's frame callback does not run, so the synth, the sequencer and every
+ * voice stand still and none of it is heard; the output drains to silence.
+ * Nothing builds up meanwhile, so the release has no backlog to play
+ * through: the next pump fills its usual 50 ms from where the sound stood,
+ * and the music starts from the top at GO on every phone at once. */
+static atomic_bool s_held;
+
+void pc_audio_set_held(bool held) {
+    atomic_store_explicit(&s_held, held, memory_order_relaxed);
 }
 
 /* Weak fallbacks for pc_get_music_volume and pc_get_sfx_volume when running in
@@ -770,7 +785,11 @@ static void SDLCALL audio_pull(void* userdata, SDL_AudioStream* stream, int addi
     (void)userdata;
     (void)total;
     while (additional > 0) {
-        render_frame(frame);
+        if (atomic_load_explicit(&s_held, memory_order_relaxed)) {
+            memset(frame, 0, sizeof(frame)); /* pc_audio_set_held */
+        } else {
+            render_frame(frame);
+        }
         SDL_PutAudioStreamData(stream, frame, sizeof(frame));
         if (s_dump) {
             fwrite(frame, sizeof(frame), 1, s_dump);
@@ -879,8 +898,10 @@ bool pc_audio_pumping(void) {
     return pumping != 0;
 }
 
+/* Called at every frame boundary (vi.c) and while the game polls a disc read
+ * (platforms/browser/dvd.c DVDGetDriveStatus); both stop here while held. */
 void pc_audio_pump(void) {
-    if (pumping || !s_web_ready)
+    if (pumping || !s_web_ready || atomic_load_explicit(&s_held, memory_order_relaxed))
         return;
     pumping = 1;
     float frame[AX_FRAME * 2];

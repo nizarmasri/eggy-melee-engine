@@ -1780,10 +1780,7 @@ static void resume_end(uint64_t now) {
 static int connect_timeout_ms(void) {
     return net.connect_timeout_ms > 0 ? net.connect_timeout_ms : CONNECT_TIMEOUT_MS;
 }
-static bool wait_remote(int32_t need) {
-    if (s_remote_have >= need) {
-        return true;
-    }
+static bool wait_remote_blocked(int32_t need) {
     uint64_t t0 = SDL_GetTicksNS();
     uint64_t last_send = t0;
     s_stalls++;
@@ -1872,6 +1869,18 @@ static bool wait_remote(int32_t need) {
         s_stall_frame = net.frame;
     }
     return true;
+}
+/* The page's frame report (src/pc/eggy/eggy_perf.c) counts a blocked wait as
+ * its own section, so a phone held back by a slower one does not read as
+ * slow itself; an input already here costs nothing and is not counted. */
+static bool wait_remote(int32_t need) {
+    if (s_remote_have >= need) {
+        return true;
+    }
+    const int perf = pc_eggy_perf_enter(EGGY_PERF_WAIT);
+    const bool ready = wait_remote_blocked(need);
+    pc_eggy_perf_enter(perf);
+    return ready;
 }
 
 /* ---- public ----------------------------------------------------------- */
@@ -3617,6 +3626,7 @@ static bool resync_rollback(void) {
 
 /* The leader holds at S until every receiver has answered. */
 static void resync_hold(void) {
+    const int perf = pc_eggy_perf_enter(EGGY_PERF_WAIT); /* as wait_remote */
     const uint64_t t0 = SDL_GetTicksNS();
     uint64_t last_send = t0;
     bool released = false;
@@ -3640,6 +3650,7 @@ static void resync_hold(void) {
         }
         SDL_DelayNS(500000);
     }
+    pc_eggy_perf_enter(perf);
     const uint64_t held = SDL_GetTicksNS() - t0;
     net.waited_ns += held; /* waiting, not lateness: nothing to catch up */
     s_progress_ns = SDL_GetTicksNS();

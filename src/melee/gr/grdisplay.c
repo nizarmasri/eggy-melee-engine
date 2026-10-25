@@ -82,9 +82,13 @@ void grDisplay_801C5DB0(HSD_GObj* gobj, intptr_t code)
     gp = GET_GROUND(gobj);
     if (gp->x11_flags.b012 == Camera_8003108C()) {
         if (gp->x18 != NULL) {
+#ifndef TARGET_PC
+            /* A GameCube pointer has its top bit set; on PC none has, so
+             * this printed for every ground object on every frame. */
             if (((intptr_t) gp->x18 & ~0x7FFFFFFF) == 0) {
                 OSReport("oioi... %08x\n", gp->x18);
             }
+#endif
             if (HSD_GObj_804D7818->hsd_obj != gp->x18->hsd_obj) {
                 HSD_CObj* cobj;
                 if (gp->x10_flags.b3 == 0) {
