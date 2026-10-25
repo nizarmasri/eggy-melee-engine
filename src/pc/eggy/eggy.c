@@ -38,6 +38,7 @@
 #include <math.h>
 #include <dolphin/vi.h>
 #include <SDL3/SDL_hints.h>
+#include <SDL3/SDL_properties.h>
 #include <SDL3/SDL_stdinc.h>
 #include <SDL3/SDL_video.h>
 #pragma GCC diagnostic push
@@ -63,6 +64,7 @@
 #include <sysdolphin/baselib/random.h>
 
 #include <emscripten.h>
+#include <emscripten/html5.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -328,9 +330,19 @@ void pc_eggy_frame_end(void) {
     int count = 0;
     SDL_Window** windows = SDL_GetWindows(&count);
     if (windows != NULL && count > 0) {
+        /* The canvas's own size, not SDL_GetWindowSize: SDL keeps the window
+         * in CSS pixels, and a render the same size as the stage's CSS (360
+         * lines on a stage 360 pixels tall) matched it while the canvas still
+         * drew 480, so a phone's step down to 360 lines never took. */
         int now_w = 0;
         int now_h = 0;
-        SDL_GetWindowSize(windows[0], &now_w, &now_h);
+        const char* canvas = SDL_GetStringProperty(
+            SDL_GetWindowProperties(windows[0]), SDL_PROP_WINDOW_EMSCRIPTEN_CANVAS_ID_STRING, NULL);
+        if (canvas == NULL ||
+            emscripten_get_canvas_element_size(canvas, &now_w, &now_h) != EMSCRIPTEN_RESULT_SUCCESS)
+        {
+            now_w = now_h = 0;
+        }
         if (now_w != w || now_h != h) {
             SDL_SetWindowSize(windows[0], w, h);
         }
