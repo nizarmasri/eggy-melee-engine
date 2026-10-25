@@ -110,8 +110,8 @@ void eggy_hold_forget(EggyHold* h, int port) {
     if (port < 0 || port >= EGGY_PORTS || port == h->self) {
         return;
     }
-    h->loaded &= (uint8_t)~(1u << port);
-    h->armed &= (uint8_t)~(1u << port);
+    h->loaded = (uint8_t)(h->loaded & ~(1u << port));
+    h->armed = (uint8_t)(h->armed & ~(1u << port));
 }
 
 int eggy_hold_resend(const EggyHold* h, uint8_t out[2]) {
