@@ -15,6 +15,7 @@ extern "C" void browser_upload_pools(void* queue, const unsigned* entries, unsig
 #include "resource_cache.hpp"
 #include "tex_copy_conv.hpp"
 #include "tex_palette_conv.hpp"
+#include "texture.hpp"
 #include "texture_replacement.hpp"
 #include "../gx/gx.hpp"
 #ifdef AURORA_ENABLE_RMLUI
@@ -773,8 +774,16 @@ void end_frame(EndFrameCallback callback) {
     upload(g_resources.uniformBuffer, packet.uniforms, UniformBufferSize);
     upload(g_resources.indexBuffer, packet.indices, IndexBufferSize);
     upload(g_resources.storageBuffer, packet.storage, StorageBufferSize);
-    if constexpr (UseTextureBuffer) upload(g_stagingBuffers[stagingSlot], packet.textureUpload, TextureUploadSize);
     browser_upload_pools(g_queue.Get(), entries, count);
+    if constexpr (UseTextureBuffer) {
+      // The staged textures' queue write on its own, timed as texture work (aurora_texture_us).
+      count = 0;
+      upload(g_stagingBuffers[stagingSlot], packet.textureUpload, TextureUploadSize);
+      if (entries[2] != 0) {
+        const TextureTimeScope timed;
+        browser_upload_pools(g_queue.Get(), entries, count);
+      }
+    }
 #else
     g_stagingBuffers[stagingSlot].Unmap();
 #endif

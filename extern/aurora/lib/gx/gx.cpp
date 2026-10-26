@@ -59,6 +59,10 @@ absl::flat_hash_set<gfx::PipelineRef> sBrowserFailed;
 // result, for the host's frame report (aurora_compile_ms_total).
 uint32_t sBrowserFinished = 0;
 double sBrowserCompileMs = 0;
+// Compiles asked of the browser, and settled (compiled or refused), since
+// boot: the host's hitch ring counts them per frame (src/pc/eggy/eggy_perf.c).
+uint32_t sBrowserStarted = 0;
+uint32_t sBrowserSettled = 0;
 #endif
 bool sFogEnabled = true;
 
@@ -403,12 +407,14 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
   auto pending = std::make_shared<wgpu::RenderPipeline>();
   sBrowserPipelines[ref] = pending;
   ++sBrowserCompiling;
+  ++sBrowserStarted;
   const double requested = emscripten_get_now();
   g_device.CreateRenderPipelineAsync(
       &descriptor, wgpu::CallbackMode::AllowSpontaneous,
       [pending, ref, cacheKey, requested](wgpu::CreatePipelineAsyncStatus status, wgpu::RenderPipeline pipeline,
                                           wgpu::StringView message) {
         if (sBrowserCompiling != 0) --sBrowserCompiling;
+        ++sBrowserSettled;
         const bool ok = status == wgpu::CreatePipelineAsyncStatus::Success;
         if (ok) {
           *pending = std::move(pipeline);
@@ -448,6 +454,8 @@ extern "C" EMSCRIPTEN_KEEPALIVE uint32_t aurora_pipelines_failed() {
   return static_cast<uint32_t>(sBrowserFailed.size());
 }
 extern "C" EMSCRIPTEN_KEEPALIVE uint32_t aurora_compile_ms_total() { return static_cast<uint32_t>(sBrowserCompileMs); }
+extern "C" uint32_t aurora_browser_compiles_started() { return sBrowserStarted; }
+extern "C" uint32_t aurora_browser_compiles_settled() { return sBrowserSettled; }
 #endif
 
 bool fog_enabled() noexcept { return sFogEnabled; }

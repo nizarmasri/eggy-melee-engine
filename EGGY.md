@@ -121,11 +121,13 @@ keeping a view across frames.
 | `int eggy_snapshot_apply(const uint8_t* ptr, int len, int32_t frame)` | 0 taken, or a resync error | a receiver hands the snapshot over; `resync` follows once applied |
 | `int eggy_test_desync(void)` | 1 armed | `MELEE_EGGY_TEST=1` only: this phone's fighter takes 10% the others never see, so it desyncs. `MELEE_EGGY_TEST=1` also makes every CPU Melee's Stay CPU, which never attacks, for the control tests |
 | `int eggy_view(int width, int height)` | 0, or -1 out of 64..4096 | the render size in pixels, and so the picture's shape; taken at the next frame boundary, against the canvas's own size (SDL keeps the window in CSS pixels) |
-| `const int32_t* eggy_perf(void)` | the frame report words | where the frame time went since the last read (ticks, re-run ticks, drawing, submitting, waiting for the GPU, spare, yielded), the longest frame and the late ones, draws, pipelines compiled and still compiling, and the last frame's vertex, index and uniform data; each read starts the next window (see `eggy.h`) |
+| `const int32_t* eggy_perf(void)` | the frame report words | where the frame time went since the last read (ticks, re-run ticks, drawing, submitting, waiting for the GPU, spare, yielded), the longest frame and the late ones, draws, pipelines compiled and still compiling, the last frame's vertex, index and uniform data, and the time spent on new textures; each read starts the next window (see `eggy.h`) |
+| `const int32_t* eggy_hitches(void)` | the hitch ring | the last 8 frames longer than 50 ms, each with its sections and what happened in it (see Hitches) |
 | `int eggy_draw_every(int n)` | 0, or -1 out of 1..4 | quality: while a match is played, one frame in `n` is drawn and the rest skip their render pass (the screen keeps the last picture); every tick still runs, 60 a second. Each phone may pick its own |
-| `int eggy_perf_words(void)` | how many words `eggy_perf` fills | 26; [25] is the time netplay spent blocked on the other phones (`wait_remote`, `resync_hold`), which an older engine counted in [10] |
+| `int eggy_perf_words(void)` | how many words `eggy_perf` fills | 27; [25] is the time netplay spent blocked on the other phones (`wait_remote`, `resync_hold`), which an older engine counted in [10]; [26], µs spent on textures new to aurora's caches (converting and staging them in the render pass, writing them to the GPU queue at the frame's end: part of [5] and [6]). Words are only appended, so a reader of 26 reads what it always did |
 | `int eggy_graphics_ready(void)` | 1 or 0 | 1 while a loaded match holds at frame 0 and its pre-roll is done (see Pipelines in the browser); the page waits for it before it says it is ready |
-| `const int32_t* eggy_graphics_stats(void)` | 16 words | [0] pipelines a draw asked for, not built yet; [1] draws skipped for one not ready and [2] textures uploaded, since boot; [3] pipelines first asked for since GO; [4] compiled, [5] refused, [6] ms compiling, since boot; [7] pre-roll draws of this hold; [8] ready; [9] pre-roll draws in a row that made nothing new; [10] median and [11] 90th-percentile pre-roll frame, µs; [12] lite flags in force; [13] drawing µs and [14] frames drawn since GO; [15] the cache's known pipelines not built yet |
+| `const int32_t* eggy_graphics_stats(void)` | `eggy_graphics_words()` words (18) | [0] pipelines a draw asked for, not built yet; [1] draws skipped for one not ready and [2] textures uploaded, since boot; [3] pipelines first asked for since GO; [4] compiled, [5] refused, [6] ms compiling, since boot; [7] pre-roll draws of this hold; [8] ready; [9] pre-roll draws in a row that made nothing new; [10] median and [11] 90th-percentile pre-roll frame, µs; [12] lite flags in force; [13] drawing µs and [14] frames drawn since GO; [15] the cache's known pipelines not built yet; of [3], [16] configs a cache knew (the seed, this phone's rows, an earlier draw) but had not built and [17] configs no cache held, new to this phone ([3] = [16] + [17]) |
+| `int eggy_graphics_words(void)` | 18 | how many words `eggy_graphics_stats` fills; an engine without this export fills 16 |
 | `int eggy_compile_cap(int n)` | 0, or -1 out of 0..16 | pipelines compiling at once in the browser; 0 is the engine's own (2 on Safari and every iOS browser, 6 elsewhere) |
 | `int eggy_background_builds(int on)` | 0 | whether the pipeline cache may build ahead while parked (default on); the page turns it off while people pick |
 | `int eggy_lite(int flags)` | the flags in force | bit 0 no fighter shadows, bit 1 no fog; taken while parked, so a match keeps one set of pipelines |
@@ -855,6 +857,12 @@ held frame drew nothing, so GO was the match's first render) lost an iPhone
   background builds are on (parked, or holding a loaded match at frame 0,
   and the page allows it): the hold builds the fight's effects before GO. Nothing starts
   after a device loss. Clear pipelines are made at once, outside the gate.
+  The gate pumps at each frame's end, when a draw queues something, and when
+  a compile settles, so the cap stays full between a parked engine's
+  boundaries (ten a second: two at Safari's cap were about 20 compiles a
+  second where its GPU process settles about 44). A compile that settles
+  inside its own start finds the pump running and leaves the slot to it:
+  never two pumps on the stack.
 - **A refused compile** is logged (the first eight), never retried, and not
   fatal: only its own draws are missing.
 - **The cache.** The shipped seed (`initial_pipeline_cache.db`) is read on
@@ -867,6 +875,21 @@ held frame drew nothing, so GO was the match's first render) lost an iPhone
   Sheik both) and items (`EGGY_TAG_*`, `eggy.h`); a load queues every config
   that shares a tag, as if a draw had asked, so a fighter's second match has
   its effects built before GO.
+- **Common.** A config's tags are every match's that needed it; its meet
+  (`pipeline_meet`) is only the tags all those matches shared. Once two
+  matches with nothing in common have both needed it, the meet is empty and
+  the config is common (hit sparks, shields, KO, the HUD): every load queues
+  it too, first, and the background builds take common configs before the
+  rest, then by the frame each was first needed in. A fighter's or a stage's
+  own configs keep that tag in their meet however often they are played, so
+  they never become common. `pipeline_meet` is a table added beside the
+  others, not a new schema: a phone's database keeps every row and builds
+  nothing again, and its meets start from its next match. An older engine
+  never reads the table.
+- **After GO.** `eggy_graphics_stats` [3] splits into [16], configs a cache
+  knew but had not built (a background build that came too late), and [17],
+  configs no cache held (new to this phone: only a recording or a tag can
+  have them built before GO).
 - **Pre-roll.** While a loaded match holds at frame 0, it draws the held frame
   (`gm_DrawFrame`, no tick) until nothing a draw asked for is pending, 30 draws
   in a row made nothing new (or 300 steady draws, or 600 in all), and the frame
@@ -892,6 +915,55 @@ front and no animation frame has come for 50 ms, `browser_yield` resumes after
 the next one. The pad wait (`pc_os_wait_alarm`) sleeps on a timer when the
 next alarm is 5 ms or more away instead of yielding over and over, which spun
 a phone's core for most of a frame.
+
+## Hitches
+
+`eggy_perf`'s windows say how much went where, not what one long frame was:
+a 226 ms frame in a two-second window with one texture upload could be the
+upload or anything else. So every frame longer than 50 ms (`EGGY_HITCH_MS`),
+boundary to boundary, is recorded as it ends, with its own sections and what
+happened in it, in a ring of the last 8 at `eggy_hitches()` (int32 words,
+`HEAP32[ptr >> 2]`; `src/pc/eggy/eggy_report.c`). A parked engine's
+boundaries (ten a second, on purpose) and the frame after one are never
+recorded; the loading screen's and the hold's long frames are, with their
+state, so the page keeps the fight's (state 3). It costs a few counters read
+per boundary: nothing allocated, nothing logged.
+
+| Word | |
+|---|---|
+| [0] | hitches recorded since boot |
+| [1] | words per entry, 24 |
+| [2] | entries kept, 8 |
+| [3 + 24 * slot] | the entries; the n-th hitch is in slot (n - 1) % 8 |
+
+Each entry:
+
+| +word | |
+|---|---|
+| +0 | n, its number (0: an empty slot) |
+| +1 | the retrace (`VIGetRetraceCount`) |
+| +2, +3 | the HUD's state and match frame as the last tick left them (2 holding, 3 fighting) |
+| +4 | `performance.now()` when it ended, ms |
+| +5 | the frame, µs |
+| +6..+14 | its sections, µs, in `eggy_perf`'s order: fresh ticks, re-run ticks, drawing, submitting, GPU wait, spare, yielded, other, netplay wait; they add up to +5 |
+| +15, +16 | ticks simulated fresh, and re-simulated (the rollback's depth) |
+| +17, +18, +19 | browser pipeline compiles started, settled (compiled or refused), and still compiling at its end |
+| +20, +21 | textures uploaded, and µs spent on them (as `eggy_perf` [26]) |
+| +22 | draws skipped for a pipeline not ready |
+| +23 | 1 if the frame was not drawn (`eggy_draw_every`) |
+
+Read the newest first: n from [0] down to [0] - 7 (while above 0), each at
+slot (n - 1) % 8, keeping those whose +0 is n and that are newer than the
+last n read. The page reads between frames, so an entry is never half
+written.
+
+Texture work is synchronous, on the game thread (the page's main thread): a
+texture new to aurora's caches is converted from its GX format to RGBA8 (every
+GX format but the PC ones, CMPR included), created and staged in the draw that
+first binds it, and at that frame's end the staged bytes are copied into a
+scratch array and written to the GPU queue, which copies them again. Hashing a
+texture object the object cache does not hold (text, particles) is per draw
+and not counted.
 
 ## Not done
 
@@ -922,7 +994,8 @@ that keep their defaults unless `src/pc/eggy` sets them.
 | `platforms/browser/scheduler.c` | `browser_yield` lets an animation frame through when none came for 50 ms | Yielding on Safari |
 | `extern/aurora/lib/internal.hpp`, `extern/aurora/lib/gx/command_processor.cpp` | `ByteBuffer` checks capacity inline; `prepare_idx_buffer` writes straight into room made once | the hottest loop of a frame |
 | `extern/aurora/lib/window.cpp` | the browser window's minimum size is 64x64, not 640x480 | the page picks the render size (`eggy_view`); a step down to 360 lines kept 480 of them, only the width following, and stretched the picture |
-| `extern/aurora/lib/gfx/pipeline_cache.cpp`, `extern/aurora/lib/gx/gx.cpp`, `extern/aurora/lib/gfx/texture.cpp`, `extern/aurora/lib/webgpu/gpu.cpp` | the browser's one compile gate and its cap; refused compiles not fatal; the seed read each boot, the device database of compiled configs, its tags and flush; the fog switch; the counters `eggy_graphics_stats` reads | Pipelines in the browser |
+| `extern/aurora/lib/gfx/pipeline_cache.cpp`, `extern/aurora/lib/gfx/pipeline_rules.hpp` (new), `extern/aurora/lib/gx/gx.cpp`, `extern/aurora/lib/gfx/texture.cpp`, `extern/aurora/lib/webgpu/gpu.cpp` | the browser's one compile gate and its cap, pumped again as each compile settles; refused compiles not fatal; the seed read each boot, the device database of compiled configs, its tags, meets (common configs, built first) and flush; the fog switch; the counters `eggy_graphics_stats` and the hitch ring read, and what after GO was known or new | Pipelines in the browser, Hitches |
+| `extern/aurora/lib/gfx/texture.hpp`, `extern/aurora/lib/gfx/texture.cpp`, `extern/aurora/lib/gx/texture.cpp`, `extern/aurora/lib/gfx/frame.cpp` | `TextureTimeScope` around a new texture's conversion, creation and staging, and the staged textures' queue write at the frame's end, done apart from the other buffers' | `eggy_perf` [26], Hitches |
 | `src/melee/lb/lbshadow.c` | no fighter shadows under lite | `eggy_lite` |
 | `src/melee/gr/grdisplay.c` | the "oioi" print is not built for PC | it printed every frame |
 | `src/pc/audio.c` | `pc_audio_set_held` | Sound, held at frame 0 |
@@ -932,7 +1005,7 @@ that keep their defaults unless `src/pc/eggy` sets them.
 | `src/melee/gm/gm_1601.c` | `gm_GetNumCostumesForCKind` uncapped | every costume |
 | `src/melee/lb/lbaudio_ax.c` | `lbAudioAx_80023F28` returns early with music off | no music file read on that device |
 | `src/pc/net.c` | `capture_local_sample` brackets its `PADRead` with `pc_eggy_sampling` | the session's local sample takes `eggy_tap`'s one-tick presses |
-| `src/pc/vi.c` | the frame buffer is preserved while parked; `pc_eggy_frame_end()` after each presented frame; the frame report's sections in the boundary; `pc_frame_set_undrawn` keeps aurora's frame open across the retrace of a frame that drew nothing; `pc_frame_idle`, a boundary that presents nothing, for the parked engine; `pc_gfx_prewarm` only polls in the browser | the last picture stays up; a load or hold clears to black, so frame 0 draws into cleared buffers; the page's picture size is taken between two frames; `eggy_perf` |
+| `src/pc/vi.c` | the frame buffer is preserved while parked; `pc_eggy_frame_end()` after each presented frame; the frame report's sections in the boundary; `pc_frame_set_undrawn` keeps aurora's frame open across the retrace of a frame that drew nothing; `pc_frame_idle`, a boundary that presents nothing, for the parked engine, which tells the frame report so (`pc_eggy_perf_idle`); `pc_gfx_prewarm` only polls in the browser | the last picture stays up; a load or hold clears to black, so frame 0 draws into cleared buffers; the page's picture size is taken between two frames; `eggy_perf`; a parked wait is never a hitch |
 | `extern/aurora/lib/webgpu/gpu.cpp` | a lost device or a WebGPU error calls `Module.onGpuTrouble` instead of aborting (any browser page, not only `MELEE_EGGY`) | The GPU |
 | `src/pc/audio.c` | the worklet loads from a static file first; the page's AudioContext is used | Eggy's CSP; iOS's unlocked context (any page, not only `MELEE_EGGY`) |
 | `platforms/browser/main.c` | `pc_eggy_preinit()` before `aurora_initialize`; no memory card | SDL keyboard off; one card-absent save everywhere |

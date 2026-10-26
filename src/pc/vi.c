@@ -469,7 +469,7 @@ void pc_frame_idle(void) {
         VIWaitForRetrace(); /* the overlay draws: real frames */
         return;
     }
-    pc_eggy_perf_boundary(false);
+    pc_eggy_perf_idle(); /* a boundary, never a hitch (eggy_hitches) */
     const int perf_caller = pc_eggy_perf_enter(EGGY_PERF_OTHER);
     if (s_in_frame && !s_undrawn) {
         pc_eggy_perf_enter(EGGY_PERF_SUBMIT);

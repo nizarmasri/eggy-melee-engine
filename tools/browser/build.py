@@ -21,6 +21,7 @@ def main():
     args = parser.parse_args()
     tools = ROOT / 'tools/browser'
 
+    run([sys.executable, ROOT / 'tools/eggy/host_tests.py'])
     run([sys.executable, ROOT / 'tests/browser/test_execution_charset.py'])
     run([sys.executable, tools / 'build_lower.py'])
     run([sys.executable, tools / 'test_disc_lower.py'])
