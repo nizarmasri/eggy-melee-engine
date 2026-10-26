@@ -110,6 +110,35 @@
  *   [25] blocked waiting on the other phones (netplay: an input that has not
  *   arrived, or the leader's resync hold; never the catch-up ticks after,
  *   which are [3]). Before this word it was part of [10].
+ *   [26] spent on textures new to aurora's caches: converting and staging
+ *   them in the render pass, and writing the staged bytes to the GPU queue at
+ *   the end of the frame (part of [5] and [6]; not the hashing a texture
+ *   object the object cache does not hold costs). Words are only ever
+ *   appended: a reader of the first 26 reads what it always did.
+ *
+ * Hitches (int32 words at eggy_hitches(), src/pc/eggy/eggy_report.c): every
+ * frame longer than EGGY_HITCH_MS, boundary to boundary, recorded as it ends;
+ * the last EGGY_HITCH_CAPACITY kept. Not the boundaries of a parked engine
+ * (ten a second, pc_frame_idle) nor the frame after one. A header, then the
+ * entries:
+ *   [0] hitches recorded since boot, [1] words per entry (24), [2] entries
+ *   kept (8)
+ *   [3 + 24 * slot], slot = (n - 1) % 8 for the n-th hitch:
+ *     +0 n (0: an empty slot), +1 the retrace (VIGetRetraceCount), +2 the HUD
+ *     state and +3 match frame as the last tick left them (HUD [0], [1]: a
+ *     hold is 2, a fight 3), +4 performance.now() when it ended, ms, +5 the
+ *     frame, µs
+ *     +6..+14 its sections in µs, eggy_perf's order: fresh ticks, re-run
+ *     ticks, drawing, submitting, GPU wait, spare, yielded, other, netplay
+ *     wait (they add up to +5)
+ *     +15 ticks simulated fresh, +16 re-simulated (rollback depth)
+ *     +17 browser pipeline compiles started, +18 settled (compiled or
+ *     refused), +19 still compiling at its end
+ *     +20 textures uploaded, +21 µs on textures (as perf [26]), +22 draws
+ *     skipped for a pipeline not ready, +23 1 if the frame was not drawn
+ *     (eggy_draw_every)
+ *   The newest is slot (header[0] - 1) % 8: read from n = header[0] down to
+ *   header[0] - 7 (while above 0), checking each entry's +0 is its n.
  *
  * Quality: eggy_draw_every(n), n 1..4, draws one frame in n of a match being
  * played and skips the drawing of the rest; every tick still runs, at 60 a
@@ -147,12 +176,20 @@
  *   [14] frames drawn since GO
  *   [15] the cache's known pipelines not built yet (they build while
  *        parked and while a loaded match holds at frame 0)
+ *   [16] of [3], configs a cache knew (the shipped seed, this phone's rows,
+ *        or an earlier draw) and had not built yet, and [17] configs no
+ *        cache held, new to this phone: [3] = [16] + [17]
+ *   eggy_graphics_words() says how many words there are (18); an engine
+ *   without it fills 16.
  *
  * Pipeline tags (aurora's pipeline cache): every pipeline a match first needs
  * is filed under the match's stage, fighters and items, and loading a match
  * builds every known pipeline filed under any of its own first:
  * EGGY_TAG_STAGE | StKind, EGGY_TAG_FIGHTER | CharacterKind (Zelda and Sheik
- * both, for either), EGGY_TAG_ITEMS.
+ * both, for either), EGGY_TAG_ITEMS. A pipeline that two matches with no tag
+ * in common both needed is common (hit sparks, shields, KO, the HUD): every
+ * match builds it before GO too, and the background builds take common ones
+ * first.
  *
  * Results (int32 words at eggy_results(), filled before onState('ended')):
  *   [0] end frame: the match frame on which GAME! or TIME! came
@@ -187,13 +224,19 @@ extern "C" {
 #define EGGY_FIGHTER_WORDS (EGGY_FIGHTER_SEEN_AT + EGGY_FIGHTER_SEEN_WORDS + 1)
 #define EGGY_NET_PHONES_MIN 2
 #define EGGY_NET_PHONES_MAX 4
-#define EGGY_GRAPHICS_WORDS 16
+#define EGGY_GRAPHICS_WORDS 18
 #define EGGY_LITE_NO_SHADOWS 1
 #define EGGY_LITE_NO_FOG 2
 #define EGGY_TAG_STAGE (1u << 24)
 #define EGGY_TAG_FIGHTER (2u << 24)
 #define EGGY_TAG_ITEMS (3u << 24)
-#define EGGY_PERF_WORDS 26
+#define EGGY_PERF_WORDS 27
+/* eggy_hitches(): a frame over EGGY_HITCH_MS is recorded. */
+#define EGGY_HITCH_MS 50
+#define EGGY_HITCH_HEADER 3
+#define EGGY_HITCH_ENTRY_WORDS 24
+#define EGGY_HITCH_CAPACITY 8
+#define EGGY_HITCH_RING_WORDS (EGGY_HITCH_HEADER + EGGY_HITCH_CAPACITY * EGGY_HITCH_ENTRY_WORDS)
 
 /* Where the clock goes (pc_eggy_perf_enter). */
 enum EggyPerfSection {
@@ -357,6 +400,8 @@ int eggy_background_builds(int on);
 int eggy_pipeline_cache_flush(void);
 int eggy_preroll_min(int n);
 const int32_t* eggy_graphics_stats(void);
+int eggy_graphics_words(void);
+const int32_t* eggy_hitches(void);
 
 /* ---- hooks the engine calls -------------------------------------------- */
 
@@ -387,6 +432,12 @@ int pc_eggy_perf_enter(int section);
 /* gmscene.c, per simulated tick; vi.c, per frame boundary. */
 void pc_eggy_perf_tick(bool rerun);
 void pc_eggy_perf_boundary(bool undrawn);
+/* vi.c pc_frame_idle: a parked boundary, which with the frame after it is no
+ * hitch (it waits on purpose). */
+void pc_eggy_perf_idle(void);
+/* eggy_perf.c, for a hitch entry: the HUD's state and match frame as the
+ * last tick left them. */
+void pc_eggy_frame_facts(int32_t* state, int32_t* match_frame);
 /* gmscene.c, before a frame's render pass: true to skip its drawing
  * (eggy_draw_every). */
 bool pc_eggy_skip_draw(void);

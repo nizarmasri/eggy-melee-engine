@@ -167,6 +167,8 @@ extern uint32_t aurora_draws_skipped(void);
 extern uint32_t aurora_texture_uploads(void);
 extern void aurora_mark_go(void);
 extern uint32_t aurora_demanded_after_go(void);
+extern uint32_t aurora_demanded_after_go_known(void);
+extern uint32_t aurora_demanded_after_go_new(void);
 extern uint32_t aurora_pipelines_finished(void);
 extern uint32_t aurora_background_pipelines_left(void);
 extern uint32_t aurora_pipelines_failed(void);
@@ -828,9 +830,10 @@ static void graphics_log_go(void) {
 
 static void graphics_log_match(void) {
     pc_log_line("eggy: the match drew %d frames at %.2f ms each (lite %d), and asked for %u "
-                "pipelines after go",
+                "pipelines after go (%u known but not built, %u new to this phone)",
         s_drawn, s_drawn > 0 ? (double)s_draw_ns / 1e6 / s_drawn : 0.0, s_lite,
-        (unsigned)aurora_demanded_after_go());
+        (unsigned)aurora_demanded_after_go(), (unsigned)aurora_demanded_after_go_known(),
+        (unsigned)aurora_demanded_after_go_new());
 }
 
 static void net_resync_event(int event, int32_t a, int32_t b);
@@ -1484,5 +1487,17 @@ EMSCRIPTEN_KEEPALIVE const int32_t* eggy_graphics_stats(void) {
     s_graphics[13] = s_draw_ns / 1000u > INT32_MAX ? INT32_MAX : (int32_t)(s_draw_ns / 1000u);
     s_graphics[14] = s_drawn;
     s_graphics[15] = (int32_t)aurora_background_pipelines_left();
+    s_graphics[16] = (int32_t)aurora_demanded_after_go_known();
+    s_graphics[17] = (int32_t)aurora_demanded_after_go_new();
     return s_graphics;
+}
+
+/* How many words eggy_graphics_stats() fills: an engine without this fills 16. */
+EMSCRIPTEN_KEEPALIVE int eggy_graphics_words(void) {
+    return EGGY_GRAPHICS_WORDS;
+}
+
+void pc_eggy_frame_facts(int32_t* state, int32_t* match_frame) {
+    *state = s_hud[0];
+    *match_frame = s_hud[1];
 }

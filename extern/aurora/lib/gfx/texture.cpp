@@ -11,10 +11,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <utility>
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 #include <fmt/format.h>
 #include <tracy/Tracy.hpp>
 #include <webgpu/webgpu_cpp.h>
@@ -101,10 +105,38 @@ u16 wgpu_aniso(GXAnisotropy aniso) {
 
 // GX textures uploaded since boot, for the host's graphics-ready test (aurora_texture_uploads).
 static std::atomic_uint32_t g_textureUploads{0};
+// TextureTimeScope's time since boot, and the scopes open on this thread.
+static std::atomic_uint64_t g_textureNs{0};
+static thread_local int t_textureScopes = 0;
+
+static double texture_clock_us() noexcept {
+#ifdef __EMSCRIPTEN__
+  return emscripten_get_now() * 1000.0;
+#else
+  return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count();
+#endif
+}
+
+TextureTimeScope::TextureTimeScope() noexcept : m_outer(t_textureScopes++ == 0) {
+  if (m_outer) {
+    m_startUs = texture_clock_us();
+  }
+}
+
+TextureTimeScope::~TextureTimeScope() noexcept {
+  --t_textureScopes;
+  if (m_outer) {
+    const double us = texture_clock_us() - m_startUs;
+    if (us > 0) {
+      g_textureNs.fetch_add(static_cast<uint64_t>(us * 1000.0), std::memory_order_relaxed);
+    }
+  }
+}
 
 TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 format, ArrayRef<uint8_t> data,
                                     bool tlut, const char* label) noexcept {
   ZoneScoped;
+  const TextureTimeScope timed;
   ++g_textureUploads;
 
   auto handle = new_dynamic_texture_2d(width, height, mips, format, label);
@@ -264,6 +296,7 @@ TextureHandle new_conv_texture(uint32_t width, uint32_t height, u32 gxFormat, co
 
 void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept {
   ZoneScoped;
+  const TextureTimeScope timed;
 
   ConvertedTexture converted;
   if (ref.gxFormat != InvalidTextureFormat) {
@@ -360,3 +393,7 @@ wgpu::SamplerDescriptor TextureBind::get_descriptor() const noexcept {
 #define AURORA_PAGE_EXPORT
 #endif
 extern "C" AURORA_PAGE_EXPORT uint32_t aurora_texture_uploads(void) { return aurora::gfx::g_textureUploads.load(); }
+// Microseconds of aurora::gfx::TextureTimeScope since boot, wrapping: the host reads differences.
+extern "C" uint32_t aurora_texture_us(void) {
+  return static_cast<uint32_t>(aurora::gfx::g_textureNs.load(std::memory_order_relaxed) / 1000);
+}

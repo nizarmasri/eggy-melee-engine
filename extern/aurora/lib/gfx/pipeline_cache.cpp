@@ -20,6 +20,7 @@ EM_JS(int, browser_is_webkit, (), {
 });
 #endif
 #include "pipeline_cache.hpp"
+#include "pipeline_rules.hpp"
 
 #include "clear.hpp"
 #include "frame_packet.hpp"
@@ -88,6 +89,8 @@ struct PipelineCacheWrite {
   bool deviceBuilt = false; // only marks (type, hash) in pipeline_device
   bool tagRow = false;      // only (hash, tag) in pipeline_tags
   uint32_t tag = 0;
+  bool meetRow = false; // only (hash, its meet) in pipeline_meet
+  std::vector<uint32_t> meet;
 };
 
 using SavedPipelineConfig = std::variant<gx::PipelineConfig, clear::PipelineConfig
@@ -142,11 +145,11 @@ static std::atomic_uint32_t g_drawsSkipped{0};
 static uint32_t g_browserCompileCap = 0;  // aurora_set_compile_cap; 0 is the browser's default
 static bool g_browserBackgroundOn = true; // aurora_set_background_builds
 static std::deque<PendingPipeline> g_backgroundFogParked; // background fog configs while fog is off
-/* Asked for by a draw and not compiled yet; the second set only those first
- * asked for after aurora_mark_go. */
-static absl::flat_hash_set<PipelineRef> g_browserWanted;
-static absl::flat_hash_set<PipelineRef> g_browserWantedAfterGo;
-static bool g_browserAfterGo = false;
+/* Asked for by a draw and not compiled yet, and of those first asked for
+ * after aurora_mark_go, the ones whose config no cache held. */
+static rules::WantBook<absl::flat_hash_set<PipelineRef>> g_browserWants;
+// browser_pump running further up the stack (rules::PumpGate).
+static rules::PumpGate g_browserPumpGate;
 /* The device database keeps only configs this browser has compiled: a row is
  * held here until its first compile succeeds, and dropped if it is refused,
  * so a config that took the GPU process down is never asked for at boot. */
@@ -155,10 +158,14 @@ static absl::flat_hash_set<HashType> g_browserBuiltKeys;
 /* Which configs a match needed, by the host's tags for it (its fighters and
  * stage): pipeline_tags in the device database, and here by tag. The next
  * match sharing a tag builds them all before GO (aurora_prebuild_tagged), the
- * effects that only appear after GO with them. */
-static std::vector<uint32_t> g_matchTags;
+ * effects that only appear after GO with them. A config's tags are every
+ * match's that needed it; its meet (pipeline_meet, rules::Meet) is only what
+ * they all shared, and once that is nothing the config is common: every
+ * match builds it before GO, and the background builds take it first. */
+static rules::TagSet g_matchTags;
 static absl::flat_hash_set<HashType> g_matchTagged;
 static absl::flat_hash_map<uint32_t, absl::flat_hash_set<HashType>> g_tagConfigs;
+static absl::flat_hash_map<HashType, rules::Meet> g_tagMeet;
 #endif
 static std::atomic_bool g_gpuCachePrunePending = false;
 /* Android warms only pipelines this device has already built. The seed is
@@ -211,6 +218,7 @@ static sqlite3_stmt* g_pipelineCacheLoadStmt = nullptr;
 static sqlite3_stmt* g_pipelineCacheUpsertStmt = nullptr;
 static sqlite3_stmt* g_pipelineDeviceStmt = nullptr;
 static sqlite3_stmt* g_pipelineTagStmt = nullptr;
+static sqlite3_stmt* g_pipelineMeetStmt = nullptr;
 static bool g_pipelineCacheBroken = false;
 static std::thread g_pipelineCacheWriterThread;
 static std::condition_variable g_pipelineCacheWriterCv;
@@ -641,13 +649,17 @@ static void notify_pipeline_ready(bool queued) {
   g_pipelineReadyCv.notify_all();
 }
 
+/* Returns whether the config was new to every cache (the seed, this device's
+ * rows and every config met since boot). */
 template <typename Config>
-static void remember_pipeline_config(ShaderType type, const Config& config, uint32_t firstFrameUsed, bool persist) {
+static bool remember_pipeline_config(ShaderType type, const Config& config, uint32_t firstFrameUsed, bool persist) {
   const auto cacheKey = xxh3_hash(config, static_cast<HashType>(type));
   bool changed = false;
+  bool fresh = false;
   {
     std::lock_guard lock{g_pipelineMutex};
     auto [it, inserted] = g_knownPipelines.try_emplace(cacheKey, KnownPipeline{type, config, firstFrameUsed});
+    fresh = inserted;
     changed = inserted || firstFrameUsed < it->second.firstFrameUsed;
     it->second.firstFrameUsed = std::min(it->second.firstFrameUsed, firstFrameUsed);
 #ifdef __EMSCRIPTEN__
@@ -657,6 +669,12 @@ static void remember_pipeline_config(ShaderType type, const Config& config, uint
           enqueue_pipeline_cache_write(PipelineCacheWrite{.type = type, .hash = cacheKey, .tagRow = true, .tag = tag});
         }
       }
+      // Once per match and config, and a row only when what they share changed.
+      auto& meet = g_tagMeet[cacheKey];
+      if (rules::fold(meet, g_matchTags)) {
+        enqueue_pipeline_cache_write(
+            PipelineCacheWrite{.type = type, .hash = cacheKey, .meetRow = true, .meet = meet.tags});
+      }
     }
     // Written once a compile of it succeeds (browser_pipeline_settled).
     if (persist && changed && type == ShaderType::GX && !g_browserBuiltKeys.contains(cacheKey)) {
@@ -664,24 +682,23 @@ static void remember_pipeline_config(ShaderType type, const Config& config, uint
         g_browserUnbuiltRows.insert_or_assign(cacheKey,
                                               make_pipeline_cache_write(type, cacheKey, config, firstFrameUsed));
       }
-      return;
+      return fresh;
     }
 #endif
   }
   if (persist && changed) {
     enqueue_pipeline_cache_write(make_pipeline_cache_write(type, cacheKey, config, firstFrameUsed));
   }
+  return fresh;
 }
 
 #ifdef __EMSCRIPTEN__
 static void browser_pump();
 
-// Under g_pipelineMutex: a draw asked for a GX pipeline that is not compiled.
-static void browser_want(PipelineRef ref) {
-  if (g_browserWanted.insert(ref).second && g_browserAfterGo) {
-    g_browserWantedAfterGo.insert(ref);
-  }
-}
+/* Under g_pipelineMutex: a draw asked for a GX pipeline that is not compiled;
+ * `known`, its config was in a cache before the draw (aurora_demanded_after_go
+ * and its split). */
+static void browser_want(PipelineRef ref, bool known) { g_browserWants.want(ref, known); }
 #endif
 
 // Under g_pipelineMutex: a draw found its pipeline not ready and was skipped.
@@ -690,16 +707,17 @@ static void note_skipped_draw(PipelineRef ref) {
   if (gx::browser_pipeline_failed(ref)) {
     return; // refused for good: not a draw still waiting on its pipeline
   }
-  browser_want(ref);
+  browser_want(ref, true); // the draw that asked for it first came through find_pipeline_impl
 #endif
   ++g_drawsSkipped;
 }
 
 /* gated: a GX pipeline, which the browser compiles asynchronously; those are
  * only ever queued there, for browser_pump. Clear pipelines are created
- * synchronously and stay inline, or the screen goes uncleared behind a queue. */
+ * synchronously and stay inline, or the screen goes uncleared behind a queue.
+ * known: the config was in a cache before this draw asked for it. */
 static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallback&& cb, PipelinePriority priority,
-                                      bool gated, bool fog) {
+                                      bool gated, bool fog, bool known) {
   ZoneScoped;
 
   const bool blocking = priority == PipelinePriority::Blocking;
@@ -710,6 +728,7 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallbac
   const bool queueOnly = false;
   const bool inlineAlways = false;
   (void)gated;
+  (void)known;
 #endif
   bool notifyWorker = false;
   bool pipelineReady = false;
@@ -722,7 +741,7 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallbac
       g_demandedPipelines.insert(runtimeKey);
 #ifdef __EMSCRIPTEN__
       if (gated) {
-        browser_want(runtimeKey);
+        browser_want(runtimeKey, known);
       }
 #endif
     }
@@ -791,7 +810,7 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallbac
 }
 
 static PipelineRef resolve_pipeline(ShaderType type, const gx::PipelineConfig& config, const RenderTargetLayout& layout,
-                                    PipelinePriority priority) {
+                                    PipelinePriority priority, bool known = true) {
   const auto cacheKey = xxh3_hash(config, static_cast<HashType>(type));
   return find_pipeline_impl(
       xxh3_hash(layout.key, cacheKey),
@@ -800,7 +819,7 @@ static PipelineRef resolve_pipeline(ShaderType type, const gx::PipelineConfig& c
         mark_device_built(type, cacheKey);
         return pipeline;
       },
-      priority, true, config.shaderConfig.fogType != GX_FOG_NONE);
+      priority, true, config.shaderConfig.fogType != GX_FOG_NONE, known);
 }
 
 static PipelineRef resolve_pipeline(ShaderType type, const clear::PipelineConfig& config,
@@ -813,7 +832,7 @@ static PipelineRef resolve_pipeline(ShaderType type, const clear::PipelineConfig
         mark_device_built(type, cacheKey);
         return pipeline;
       },
-      priority, false, false);
+      priority, false, false, true);
 }
 
 #ifdef AURORA_ENABLE_RMLUI
@@ -827,7 +846,7 @@ static PipelineRef resolve_pipeline(ShaderType type, const rmlui::PipelineConfig
         mark_device_built(type, cacheKey);
         return pipeline;
       },
-      priority, false, false);
+      priority, false, false, true);
 }
 #endif
 
@@ -848,6 +867,10 @@ static void pipeline_cache_abort() {
   if (g_pipelineTagStmt != nullptr) {
     sqlite3_finalize(g_pipelineTagStmt);
     g_pipelineTagStmt = nullptr;
+  }
+  if (g_pipelineMeetStmt != nullptr) {
+    sqlite3_finalize(g_pipelineMeetStmt);
+    g_pipelineMeetStmt = nullptr;
   }
   if (g_pipelineCacheDb != nullptr) {
     sqlite3_close(g_pipelineCacheDb);
@@ -1228,6 +1251,23 @@ INSERT INTO aurora_schema VALUES ({});)",
     pipeline_cache_abort();
     return false;
   }
+  /* What every match that needed a config shared (rules::Meet). Added beside
+   * the other tables of schema 1, not a new schema: a database from before it
+   * gains the table empty and keeps every row, and an older engine never
+   * reads it. */
+  ret = sqlite::exec(g_pipelineCacheDb, "CREATE TABLE IF NOT EXISTS pipeline_meet ("
+                                        "hash INTEGER NOT NULL PRIMARY KEY, tags BLOB NOT NULL);");
+  if (ret == SQLITE_OK) {
+    ret = sqlite3_prepare_v3(g_pipelineCacheDb,
+                             "INSERT INTO pipeline_meet (hash, tags) VALUES (?, ?) "
+                             "ON CONFLICT(hash) DO UPDATE SET tags = excluded.tags",
+                             -1, SQLITE_PREPARE_PERSISTENT, &g_pipelineMeetStmt, nullptr);
+  }
+  if (ret != SQLITE_OK) {
+    Log.error("Failed to prepare pipeline_meet table: {}", sqlite3_errmsg(g_pipelineCacheDb));
+    pipeline_cache_abort();
+    return false;
+  }
 #endif
 
 #ifndef __EMSCRIPTEN__
@@ -1400,6 +1440,25 @@ static bool write_tag_record(const PipelineCacheWrite& write) {
   return ret == SQLITE_OK;
 }
 
+static bool write_meet_record(const PipelineCacheWrite& write) {
+  int ret = sqlite3_bind_int64(g_pipelineMeetStmt, 1, static_cast<sqlite3_int64>(write.hash));
+  if (ret == SQLITE_OK) {
+    // A common config's meet is empty: a zero-length blob, never NULL.
+    const auto bytes = rules::encode(write.meet);
+    ret = bytes.empty() ? sqlite3_bind_zeroblob(g_pipelineMeetStmt, 2, 0)
+                        : sqlite3_bind_blob64(g_pipelineMeetStmt, 2, bytes.data(), bytes.size(), SQLITE_TRANSIENT);
+  }
+  if (ret == SQLITE_OK) {
+    ret = sqlite3_step(g_pipelineMeetStmt) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+  }
+  if (ret != SQLITE_OK) {
+    Log.error("Failed to write what a pipeline's matches shared: {}", sqlite3_errmsg(g_pipelineCacheDb));
+  }
+  sqlite3_reset(g_pipelineMeetStmt);
+  sqlite3_clear_bindings(g_pipelineMeetStmt);
+  return ret == SQLITE_OK;
+}
+
 static void pipeline_cache_writer() {
 #ifdef TRACY_ENABLE
   tracy::SetThreadName("Pipeline cache writer thread");
@@ -1427,6 +1486,7 @@ static void pipeline_cache_writer() {
       } else {
         for (const auto& write : batch) {
           const bool written = write.tagRow        ? write_tag_record(write)
+                               : write.meetRow     ? write_meet_record(write)
                                : write.deviceBuilt ? write_device_built_record(write)
                                                    : write_pipeline_cache_record(write);
           if (!written) {
@@ -1525,13 +1585,15 @@ static uint32_t browser_compile_cap() {
  * pipeline a draw asked for first, the known configs (seed and device rows)
  * only when nothing a draw wants is waiting, and only while the host allows
  * them. Cheap when nothing is queued or the cap is full. A lost device is
- * asked for nothing. */
+ * asked for nothing. Called with g_pipelineMutex free: at a frame's end, when
+ * something is queued, and when a compile settles (browser_pipeline_settled),
+ * which keeps the cap full between a parked engine's boundaries. Never more
+ * than one on the stack (rules::PumpGate). */
 static void browser_pump() {
-  if (webgpu::device_lost()) {
-    return;
-  }
-  const uint32_t cap = browser_compile_cap();
-  while (aurora_browser_pipelines_compiling() < cap) {
+  g_browserPumpGate.run([] {
+    if (webgpu::device_lost() || aurora_browser_pipelines_compiling() >= browser_compile_cap()) {
+      return false;
+    }
     PendingPipeline pending;
     {
       std::lock_guard lock{g_pipelineMutex};
@@ -1540,19 +1602,20 @@ static void browser_pump() {
         g_pipelineQueue.pop_front();
       } else {
         if (!g_browserBackgroundOn) {
-          return;
+          return false;
         }
         while (!g_backgroundPipelineQueue.empty() && g_backgroundPipelineQueue.front().fog && !gx::fog_enabled()) {
           g_backgroundFogParked.emplace_back(pop_background());
         }
         if (g_backgroundPipelineQueue.empty()) {
-          return;
+          return false;
         }
         pending = pop_background();
       }
     }
     build_pending_pipeline(pending);
-  }
+    return true;
+  });
 }
 #endif
 
@@ -1645,6 +1708,29 @@ static size_t load_device_pipeline_cache() {
   } else if (tags != 0) {
     Log.info("Read {} pipeline tags for {} matches' fighters and stages", tags, g_tagConfigs.size());
   }
+  size_t met = 0;
+  size_t common = 0;
+  sqlite3_stmt* meetStmt = nullptr;
+  int step = sqlite3_prepare_v2(g_pipelineCacheDb, "SELECT hash, tags FROM pipeline_meet", -1, &meetStmt, nullptr);
+  if (step == SQLITE_OK) {
+    while ((step = sqlite3_step(meetStmt)) == SQLITE_ROW) {
+      const auto* bytes = static_cast<const uint8_t*>(sqlite3_column_blob(meetStmt, 1));
+      const auto size = static_cast<size_t>(sqlite3_column_bytes(meetStmt, 1));
+      rules::Meet meet{.seen = true};
+      if (!rules::decode(bytes, size, meet.tags)) {
+        continue;
+      }
+      common += rules::common(meet) ? 1 : 0;
+      g_tagMeet.insert_or_assign(static_cast<HashType>(sqlite3_column_int64(meetStmt, 0)), std::move(meet));
+      ++met;
+    }
+  }
+  if (step != SQLITE_DONE) {
+    Log.warn("Failed to read what pipelines' matches shared: {}", sqlite3_errmsg(g_pipelineCacheDb));
+  } else if (met != 0) {
+    Log.info("Read what {} pipelines' matches shared: {} common to every match", met, common);
+  }
+  sqlite3_finalize(meetStmt);
 #endif
   return acceptedRows;
 }
@@ -1771,9 +1857,9 @@ PipelineRef find_pipeline(const clear::PipelineConfig& config, const RenderTarge
  * its tiles; the worker pool makes that window a few frames wide. MELEE_PIPELINE_SYNC
  * restores the blocking behaviour for A/B. */
 PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout) {
-  remember_pipeline_config(ShaderType::GX, config, current_frame(), true);
+  const bool fresh = remember_pipeline_config(ShaderType::GX, config, current_frame(), true);
   return resolve_pipeline(ShaderType::GX, config, layout,
-                          g_pipelineSync ? PipelinePriority::Blocking : PipelinePriority::Normal);
+                          g_pipelineSync ? PipelinePriority::Blocking : PipelinePriority::Normal, !fresh);
 }
 
 #ifdef AURORA_ENABLE_RMLUI
@@ -1792,19 +1878,36 @@ void rebuild_pipeline_cache() {
   detail::finalize_render_target_layout(offscreen);
   g_pipelineLayoutKey = scene.key;
 
-  std::vector<KnownPipeline> known;
+  struct Queued {
+    bool common;
+    KnownPipeline pipeline;
+  };
+  std::vector<Queued> known;
+  size_t common = 0;
   {
     std::lock_guard lock{g_pipelineMutex};
     known.reserve(g_knownPipelines.size());
     for (const auto& [hash, pipeline] : g_knownPipelines) {
-      known.push_back(pipeline);
+#ifdef __EMSCRIPTEN__
+      const auto meetIt = g_tagMeet.find(hash);
+      const bool isCommon = meetIt != g_tagMeet.end() && rules::common(meetIt->second);
+#else
+      const bool isCommon = false;
+#endif
+      common += isCommon ? 1 : 0;
+      known.push_back(Queued{isCommon, pipeline});
     }
   }
-  std::ranges::sort(known, {}, &KnownPipeline::firstFrameUsed);
+  // The background queue is first in, first out: the common configs build first.
+  std::ranges::sort(known, [](const Queued& a, const Queued& b) {
+    return rules::builds_before(a.common, a.pipeline.firstFrameUsed, b.common, b.pipeline.firstFrameUsed);
+  });
   /* Rare (startup, MSAA or normal-buffer changes) and it re-queues every
    * known config, so it belongs next to the build counts. */
-  Log.info("Queueing {} known pipeline configs for render target layout {:016x}", known.size(), scene.key);
-  for (const auto& pipeline : known) {
+  Log.info("Queueing {} known pipeline configs ({} common to every match first) for render target layout {:016x}",
+           known.size(), common, scene.key);
+  for (const auto& queued : known) {
+    const KnownPipeline& pipeline = queued.pipeline;
     std::visit(
         [&](const auto& config) {
           resolve_pipeline(pipeline.type, config, scene, PipelinePriority::Background);
@@ -1879,14 +1982,13 @@ void shutdown_pipeline_cache() {
   g_deviceBuilt.clear();
 #ifdef __EMSCRIPTEN__
   g_backgroundFogParked.clear();
-  g_browserWanted.clear();
-  g_browserWantedAfterGo.clear();
-  g_browserAfterGo = false;
+  g_browserWants.clear();
   g_browserUnbuiltRows.clear();
   g_browserBuiltKeys.clear();
   g_matchTags.clear();
   g_matchTagged.clear();
   g_tagConfigs.clear();
+  g_tagMeet.clear();
 #endif
   g_drawsSkipped = 0;
 
@@ -1974,7 +2076,7 @@ void browser_pipeline_settled(PipelineRef ref, HashType cacheKey, bool ok) {
   std::optional<PipelineCacheWrite> row;
   {
     std::lock_guard lock{g_pipelineMutex};
-    g_browserWanted.erase(ref);
+    g_browserWants.settled(ref);
     if (ok) {
       g_browserBuiltKeys.insert(cacheKey);
     }
@@ -1988,6 +2090,12 @@ void browser_pipeline_settled(PipelineRef ref, HashType cacheKey, bool ok) {
   if (row) {
     enqueue_pipeline_cache_write(std::move(*row));
   }
+  /* A slot is free: the next queued compile starts now, not at the next
+   * frame's end, which a parked engine reaches ten times a second (two compiles
+   * per boundary at Safari's cap, about 20 a second where its GPU process
+   * settles about 44). The lock is free here; a settle inside a compile's own
+   * start finds browser_pump running and leaves the slot to it. */
+  browser_pump();
 }
 #endif
 
@@ -2077,7 +2185,7 @@ extern "C" void aurora_set_background_builds(bool on) {
 extern "C" AURORA_PAGE_EXPORT uint32_t aurora_demanded_pipelines_pending(void) {
 #ifdef __EMSCRIPTEN__
   std::lock_guard lock{g_pipelineMutex};
-  return static_cast<uint32_t>(g_browserWanted.size());
+  return g_browserWants.pending();
 #else
   return 0;
 #endif
@@ -2088,15 +2196,34 @@ extern "C" AURORA_PAGE_EXPORT uint32_t aurora_draws_skipped(void) { return g_dra
 extern "C" void aurora_mark_go(void) {
 #ifdef __EMSCRIPTEN__
   std::lock_guard lock{g_pipelineMutex};
-  g_browserAfterGo = true;
-  g_browserWantedAfterGo.clear();
+  g_browserWants.go();
 #endif
 }
 
 extern "C" AURORA_PAGE_EXPORT uint32_t aurora_demanded_after_go(void) {
 #ifdef __EMSCRIPTEN__
   std::lock_guard lock{g_pipelineMutex};
-  return static_cast<uint32_t>(g_browserWantedAfterGo.size());
+  return g_browserWants.after_go();
+#else
+  return 0;
+#endif
+}
+
+/* Of aurora_demanded_after_go: configs a cache knew (the seed, this device's
+ * rows, an earlier draw) and had not built, and configs no cache held. */
+extern "C" uint32_t aurora_demanded_after_go_known(void) {
+#ifdef __EMSCRIPTEN__
+  std::lock_guard lock{g_pipelineMutex};
+  return g_browserWants.after_go_known();
+#else
+  return 0;
+#endif
+}
+
+extern "C" uint32_t aurora_demanded_after_go_new(void) {
+#ifdef __EMSCRIPTEN__
+  std::lock_guard lock{g_pipelineMutex};
+  return g_browserWants.after_go_new();
 #else
   return 0;
 #endif
@@ -2137,7 +2264,7 @@ extern "C" AURORA_PAGE_EXPORT int aurora_pipeline_cache_flush(void) {
 extern "C" void aurora_set_pipeline_tags(const uint32_t* tags, uint32_t count) {
 #ifdef __EMSCRIPTEN__
   std::lock_guard lock{g_pipelineMutex};
-  g_matchTags.assign(tags, tags + (tags != nullptr ? count : 0));
+  g_matchTags = rules::tag_set(tags, tags != nullptr ? count : 0);
   g_matchTagged.clear();
 #else
   (void)tags;
@@ -2145,30 +2272,45 @@ extern "C" void aurora_set_pipeline_tags(const uint32_t* tags, uint32_t count) {
 #endif
 }
 
-/* Asks, as a draw would, for every known config an earlier match sharing a tag
- * with this one needed, so they compile ahead of the background builds and
- * count as wanted until they have: the host's graphics-ready waits for them. */
+/* Asks, as a draw would, for every known config common to every match, and
+ * every one an earlier match sharing a tag with this one needed, so they
+ * compile ahead of the background builds and count as wanted until they have:
+ * the host's graphics-ready waits for them. Common ones first: hit sparks and
+ * the like come soonest after GO. */
 extern "C" void aurora_prebuild_tagged(void) {
 #ifdef __EMSCRIPTEN__
   const auto scene = scene_render_target_layout();
   std::vector<aurora::gx::PipelineConfig> configs;
+  size_t common = 0;
   {
     std::lock_guard lock{g_pipelineMutex};
     absl::flat_hash_set<aurora::HashType> seen;
+    const auto take = [&](aurora::HashType key) {
+      const auto it = g_knownPipelines.find(key);
+      if (!seen.insert(key).second || it == g_knownPipelines.end()) {
+        return false;
+      }
+      if (const auto* config = std::get_if<aurora::gx::PipelineConfig>(&it->second.config);
+          config != nullptr && (aurora::gx::fog_enabled() || config->shaderConfig.fogType == GX_FOG_NONE)) {
+        configs.push_back(*config);
+        return true;
+      }
+      return false;
+    };
+    if (!g_matchTags.empty()) {
+      for (const auto& [key, meet] : g_tagMeet) {
+        if (rules::common(meet) && take(key)) {
+          ++common;
+        }
+      }
+    }
     for (const uint32_t tag : g_matchTags) {
       const auto tagIt = g_tagConfigs.find(tag);
       if (tagIt == g_tagConfigs.end()) {
         continue;
       }
       for (const aurora::HashType key : tagIt->second) {
-        const auto it = g_knownPipelines.find(key);
-        if (!seen.insert(key).second || it == g_knownPipelines.end()) {
-          continue;
-        }
-        if (const auto* config = std::get_if<aurora::gx::PipelineConfig>(&it->second.config);
-            config != nullptr && (aurora::gx::fog_enabled() || config->shaderConfig.fogType == GX_FOG_NONE)) {
-          configs.push_back(*config);
-        }
+        take(key);
       }
     }
   }
@@ -2176,7 +2318,9 @@ extern "C" void aurora_prebuild_tagged(void) {
     resolve_pipeline(ShaderType::GX, config, scene, PipelinePriority::Normal);
   }
   if (!configs.empty()) {
-    Log.info("Prebuilding {} pipelines matches with these fighters and stage needed before", configs.size());
+    Log.info("Prebuilding {} pipelines: {} common to every match, the rest needed before by matches with these "
+             "fighters and stage",
+             configs.size(), common);
   }
 #endif
 }

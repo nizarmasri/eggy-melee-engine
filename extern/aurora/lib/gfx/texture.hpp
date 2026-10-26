@@ -62,6 +62,23 @@ TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t m
 TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept;
 TextureHandle new_conv_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept;
 void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept;
+
+/* Times aurora's work on textures new to its caches, on this thread:
+ * converting a GX texture, creating it and staging its bytes in the render
+ * pass, and writing the staged bytes to the GPU queue at the frame's end
+ * (frame.cpp). Nested scopes count once. For the host's frame report
+ * (aurora_texture_us). */
+class TextureTimeScope {
+public:
+  TextureTimeScope() noexcept;
+  ~TextureTimeScope() noexcept;
+  TextureTimeScope(const TextureTimeScope&) = delete;
+  TextureTimeScope& operator=(const TextureTimeScope&) = delete;
+
+private:
+  double m_startUs = 0;
+  bool m_outer = false;
+};
 }; // namespace aurora::gfx
 
 struct GXTexObj_ {

@@ -11,16 +11,29 @@
  * free XFB), so a boundary's sections nest inside "draw" and hand the clock
  * back to it after: nothing is counted twice.
  *
+ * Each frame, boundary to boundary, also keeps its own books: its sections,
+ * its ticks, and what aurora's counters say happened in it. One longer than
+ * EGGY_HITCH_MS goes into the hitch ring (eggy_hitches), so the page can tell
+ * what a single long frame was, which a window's totals cannot. A few
+ * counters read per boundary, nothing allocated, nothing logged.
+ *
  * Presentation only: nothing here is read by the simulation.
  */
 #include "pc/eggy/eggy.h"
+#include "pc/eggy/eggy_report.h"
 
 #include <aurora/gfx.h>
+#include <dolphin/vi.h>
 #include <emscripten.h>
 #include <string.h>
 
 extern uint32_t aurora_browser_pipelines_compiling(void);
 extern uint32_t aurora_background_pipelines_left(void);
+extern uint32_t aurora_browser_compiles_started(void);
+extern uint32_t aurora_browser_compiles_settled(void);
+extern uint32_t aurora_texture_uploads(void);
+extern uint32_t aurora_texture_us(void);
+extern uint32_t aurora_draws_skipped(void);
 
 static int s_section = EGGY_PERF_OTHER;
 static double s_since;
@@ -34,16 +47,31 @@ static int32_t s_late_34;
 static int32_t s_ticks;
 static int32_t s_reruns;
 static int32_t s_undrawn;
+static uint32_t s_texture_us_read; /* aurora_texture_us() at the last eggy_perf() */
 static int32_t s_words[EGGY_PERF_WORDS];
 
-int pc_eggy_perf_enter(int section) {
-    const double now = emscripten_get_now();
+/* The frame being played, since the last boundary. */
+static double s_frame_ms[EGGY_PERF_SECTIONS];
+static int32_t s_frame_ticks;
+static int32_t s_frame_reruns;
+static EggyFrameCounters s_frame_began;
+static bool s_frame_judged; /* false after a parked boundary: that wait is no frame */
+static int32_t s_hitches[EGGY_HITCH_RING_WORDS] = {0, EGGY_HITCH_ENTRY_WORDS, EGGY_HITCH_CAPACITY};
+
+/* The running section's share up to `now`, to the window and the frame. */
+static void account(double now) {
     if (s_since != 0) {
-        s_ms[s_section] += now - s_since;
+        const double ms = now - s_since;
+        s_ms[s_section] += ms;
+        s_frame_ms[s_section] += ms;
     } else {
         s_window_start = now;
     }
     s_since = now;
+}
+
+int pc_eggy_perf_enter(int section) {
+    account(emscripten_get_now());
     const int previous = s_section;
     s_section = section;
     return previous;
@@ -52,14 +80,27 @@ int pc_eggy_perf_enter(int section) {
 void pc_eggy_perf_tick(bool rerun) {
     if (rerun) {
         s_reruns++;
+        s_frame_reruns++;
     } else {
         s_ticks++;
+        s_frame_ticks++;
     }
 }
 
-void pc_eggy_perf_boundary(bool undrawn) {
+static void frame_counters(EggyFrameCounters* c) {
+    c->started = aurora_browser_compiles_started();
+    c->settled = aurora_browser_compiles_settled();
+    c->uploads = aurora_texture_uploads();
+    c->texture_us = aurora_texture_us();
+    c->skipped = aurora_draws_skipped();
+}
+
+static void boundary(bool undrawn, bool idle) {
     const double now = emscripten_get_now();
+    account(now); /* so the frame's sections add up to it */
     s_undrawn += undrawn;
+    EggyFrameCounters counters;
+    frame_counters(&counters);
     if (s_last_boundary != 0) {
         const double frame = now - s_last_boundary;
         if (frame > s_worst_ms) {
@@ -67,52 +108,78 @@ void pc_eggy_perf_boundary(bool undrawn) {
         }
         s_late_20 += frame > 20.0;
         s_late_34 += frame > 34.0;
+        if (s_frame_judged && !idle && eggy_hitch_is(frame)) {
+            EggyFrame f;
+            memset(&f, 0, sizeof f);
+            f.retrace = VIGetRetraceCount();
+            pc_eggy_frame_facts(&f.state, &f.match_frame);
+            f.at_ms = now;
+            f.frame_ms = frame;
+            memcpy(f.ms, s_frame_ms, sizeof f.ms);
+            f.ticks = s_frame_ticks;
+            f.reruns = s_frame_reruns;
+            f.began = s_frame_began;
+            f.ended = counters;
+            f.compiling = (int32_t)aurora_browser_pipelines_compiling();
+            f.undrawn = undrawn;
+            eggy_hitch_record(s_hitches, &f);
+        }
     }
+    s_frame_judged = !idle;
+    memset(s_frame_ms, 0, sizeof s_frame_ms);
+    s_frame_ticks = 0;
+    s_frame_reruns = 0;
+    s_frame_began = counters;
     s_last_boundary = now;
     s_frames++;
 }
 
-static int32_t us(double ms) {
-    return ms <= 0 ? 0 : ms >= 2.0e6 ? 2000000000 : (int32_t)(ms * 1000.0);
+void pc_eggy_perf_boundary(bool undrawn) {
+    boundary(undrawn, false);
+}
+
+void pc_eggy_perf_idle(void) {
+    boundary(false, true);
 }
 
 EMSCRIPTEN_KEEPALIVE const int32_t* eggy_perf(void) {
     /* Close the running section's share up to now, then start a new window. */
     pc_eggy_perf_enter(s_section);
     const double now = s_since;
-    memset(s_words, 0, sizeof s_words);
-    s_words[0] = s_frames;
-    s_words[1] = s_ticks;
-    s_words[2] = s_reruns;
-    s_words[3] = us(s_ms[EGGY_PERF_TICK]);
-    s_words[4] = us(s_ms[EGGY_PERF_RERUN]);
-    s_words[5] = us(s_ms[EGGY_PERF_DRAW]);
-    s_words[6] = us(s_ms[EGGY_PERF_SUBMIT]);
-    s_words[7] = us(s_ms[EGGY_PERF_GPU_WAIT]);
-    s_words[8] = us(s_ms[EGGY_PERF_SPARE]);
-    s_words[9] = us(s_ms[EGGY_PERF_YIELD]);
-    s_words[10] = us(s_ms[EGGY_PERF_OTHER]);
-    s_words[11] = us(s_worst_ms);
-    s_words[12] = s_late_20;
-    s_words[13] = s_late_34;
+    EggyPerfWindow w;
+    memset(&w, 0, sizeof w);
+    w.frames = s_frames;
+    w.ticks = s_ticks;
+    w.reruns = s_reruns;
+    memcpy(w.ms, s_ms, sizeof w.ms);
+    w.worst_ms = s_worst_ms;
+    w.late_20 = s_late_20;
+    w.late_34 = s_late_34;
     const AuroraStats* stats = aurora_get_stats();
     if (stats != NULL) {
-        s_words[14] = (int32_t)stats->drawCallCount;
-        s_words[15] = (int32_t)stats->mergedDrawCallCount;
-        s_words[16] = (int32_t)stats->createdPipelines;
-        s_words[17] = (int32_t)stats->queuedPipelines;
-        s_words[21] = (int32_t)(stats->lastVertSize / 1024);
-        s_words[22] = (int32_t)(stats->lastIndexSize / 1024);
-        s_words[23] = (int32_t)(stats->lastUniformSize / 1024);
+        w.draws = (int32_t)stats->drawCallCount;
+        w.merged = (int32_t)stats->mergedDrawCallCount;
+        w.created = (int32_t)stats->createdPipelines;
+        w.queued = (int32_t)stats->queuedPipelines;
+        w.vert_kib = (int32_t)(stats->lastVertSize / 1024);
+        w.index_kib = (int32_t)(stats->lastIndexSize / 1024);
+        w.uniform_kib = (int32_t)(stats->lastUniformSize / 1024);
     }
-    s_words[18] = (int32_t)aurora_browser_pipelines_compiling();
-    s_words[19] = us(now - s_window_start);
-    s_words[20] = (int32_t)aurora_background_pipelines_left();
-    s_words[24] = s_undrawn;
-    s_words[25] = us(s_ms[EGGY_PERF_WAIT]);
+    w.compiling = (int32_t)aurora_browser_pipelines_compiling();
+    w.window_ms = now - s_window_start;
+    w.background_left = (int32_t)aurora_background_pipelines_left();
+    w.undrawn = s_undrawn;
+    const uint32_t texture_us = aurora_texture_us();
+    w.texture_us = texture_us - s_texture_us_read;
+    s_texture_us_read = texture_us;
+    eggy_perf_pack(s_words, &w);
     memset(s_ms, 0, sizeof s_ms);
     s_window_start = now;
     s_worst_ms = 0;
     s_frames = s_late_20 = s_late_34 = s_ticks = s_reruns = s_undrawn = 0;
     return s_words;
+}
+
+EMSCRIPTEN_KEEPALIVE const int32_t* eggy_hitches(void) {
+    return s_hitches;
 }

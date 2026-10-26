@@ -694,6 +694,8 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
     }
     handle = find_content_texture(keys->contentKey);
     if (!handle) {
+      // The palette's conversion too, not only new_static_texture_2d's (aurora_texture_us).
+      const gfx::TextureTimeScope timed;
       const size_t textureBytes = texture_source_size(obj.format(), obj.width(), obj.height(), obj.mip_count());
       const size_t tlutBytes = tlut_source_size(tlut.numEntries);
       auto converted = gfx::convert_texture_palette(obj.format(), obj.width(), obj.height(), obj.mip_count(),
