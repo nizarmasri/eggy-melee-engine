@@ -125,7 +125,7 @@ keeping a view across frames.
 | `int eggy_draw_every(int n)` | 0, or -1 out of 1..4 | quality: while a match is played, one frame in `n` is drawn and the rest skip their render pass (the screen keeps the last picture); every tick still runs, 60 a second. Each phone may pick its own |
 | `int eggy_perf_words(void)` | how many words `eggy_perf` fills | 26; [25] is the time netplay spent blocked on the other phones (`wait_remote`, `resync_hold`), which an older engine counted in [10] |
 | `int eggy_graphics_ready(void)` | 1 or 0 | 1 while a loaded match holds at frame 0 and its pre-roll is done (see Pipelines in the browser); the page waits for it before it says it is ready |
-| `const int32_t* eggy_graphics_stats(void)` | 16 words | [0] pipelines a draw asked for, not built yet; [1] draws skipped for one not ready and [2] textures uploaded, since boot; [3] pipelines first asked for since GO; [4] compiled, [5] refused, [6] ms compiling, since boot; [7] pre-roll draws of this hold; [8] ready; [9] pre-roll draws in a row that made nothing new; [10] median and [11] 90th-percentile pre-roll frame, µs; [12] lite flags in force; [13] drawing µs and [14] frames drawn since GO |
+| `const int32_t* eggy_graphics_stats(void)` | 16 words | [0] pipelines a draw asked for, not built yet; [1] draws skipped for one not ready and [2] textures uploaded, since boot; [3] pipelines first asked for since GO; [4] compiled, [5] refused, [6] ms compiling, since boot; [7] pre-roll draws of this hold; [8] ready; [9] pre-roll draws in a row that made nothing new; [10] median and [11] 90th-percentile pre-roll frame, µs; [12] lite flags in force; [13] drawing µs and [14] frames drawn since GO; [15] the cache's known pipelines not built yet |
 | `int eggy_compile_cap(int n)` | 0, or -1 out of 0..16 | pipelines compiling at once in the browser; 0 is the engine's own (2 on Safari and every iOS browser, 6 elsewhere) |
 | `int eggy_background_builds(int on)` | 0 | whether the pipeline cache may build ahead while parked (default on); the page turns it off while people pick |
 | `int eggy_lite(int flags)` | the flags in force | bit 0 no fighter shadows, bit 1 no fog; taken while parked, so a match keeps one set of pipelines |
@@ -852,7 +852,8 @@ held frame drew nothing, so GO was the match's first render) lost an iPhone
   every iOS browser, 6 elsewhere (`eggy_compile_cap`,
   `MELEE_PIPELINES_INFLIGHT`). What a draw asked for goes first, oldest first;
   the cache's own rows only when nothing a draw wants waits, and only while
-  background builds are on (parked, and the page allows it). Nothing starts
+  background builds are on (parked, or holding a loaded match at frame 0,
+  and the page allows it): the hold builds the fight's effects before GO. Nothing starts
   after a device loss. Clear pipelines are made at once, outside the gate.
 - **A refused compile** is logged (the first eight), never retried, and not
   fatal: only its own draws are missing.
