@@ -145,7 +145,8 @@
  *   [12] eggy_lite flags in force
  *   [13] drawing since GO (the render pass on this thread), microseconds, and
  *   [14] frames drawn since GO
- *   [15] reserved, 0
+ *   [15] the cache's known pipelines not built yet (they build while
+ *        parked and while a loaded match holds at frame 0)
  *
  * Pipeline tags (aurora's pipeline cache): every pipeline a match first needs
  * is filed under the match's stage, fighters and items, and loading a match

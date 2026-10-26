@@ -168,6 +168,7 @@ extern uint32_t aurora_texture_uploads(void);
 extern void aurora_mark_go(void);
 extern uint32_t aurora_demanded_after_go(void);
 extern uint32_t aurora_pipelines_finished(void);
+extern uint32_t aurora_background_pipelines_left(void);
 extern uint32_t aurora_pipelines_failed(void);
 extern uint32_t aurora_compile_ms_total(void);
 extern int aurora_pipeline_cache_flush(void);
@@ -177,16 +178,20 @@ extern void aurora_prebuild_tagged(void);
 /* src/pc/audio.c: nothing is mixed while held, and the release starts clean. */
 extern void pc_audio_set_held(bool held);
 
-/* The cache's known pipelines build only while parked, and only while the page
- * allows it (eggy_background_builds: off until it says, and it says no while
- * people pick): a compile in the GPU process slows every frame, and a loading
- * or played match's own pipelines come first. */
+/* The cache's known pipelines build only while parked or holding a loaded
+ * match at frame 0, and only while the page allows it (eggy_background_builds:
+ * off until it says, and it says no while people pick): a compile in the GPU
+ * process slows every frame, and a loading or played match's own pipelines
+ * come first. The hold is where most get built, behind the load screen: the
+ * fight's effects are in the cache, and one compiled mid-fight is a hitch on
+ * every phone, and an iPhone's GPU process at risk. */
 static bool s_background_ok = false;
 static bool s_audio_held;
 
 static void background_builds_follow(void) {
     aurora_set_background_builds(
-        s_background_ok && (s_state == EGGY_STATE_PARKED || s_state == EGGY_STATE_ERROR));
+        s_background_ok && (s_state == EGGY_STATE_PARKED || s_state == EGGY_STATE_ERROR ||
+                               s_state == EGGY_STATE_LOADED));
 }
 
 static void set_state(int state) {
@@ -1478,5 +1483,6 @@ EMSCRIPTEN_KEEPALIVE const int32_t* eggy_graphics_stats(void) {
     s_graphics[12] = s_lite;
     s_graphics[13] = s_draw_ns / 1000u > INT32_MAX ? INT32_MAX : (int32_t)(s_draw_ns / 1000u);
     s_graphics[14] = s_drawn;
+    s_graphics[15] = (int32_t)aurora_background_pipelines_left();
     return s_graphics;
 }
