@@ -498,7 +498,10 @@ last match is dropped by the next.
    delay of 8 (`net_pick.c`). How far each phone predicts before it stalls is
    picked the same way once every phone has loaded: 7 frames, or the part of
    the trip the delay leaves plus 4, up to 12 (each one a ~6 MB snapshot more
-   in the ring). The fight's first 10 frames are lockstep; the hold's own
+   in the ring), and again as it releases, on the last second of the link and
+   the delay in force: a phone still compiling when the others loaded reads
+   its own stalls as trip, and gives back the slots it took for them. The
+   fight's first 10 frames are lockstep; the hold's own
    loads, all finished at frame 0, no longer hold it for 120. Time sync slows
    each phone for the one it runs furthest ahead of. A desync is repaired from
    the acting leader's state (Resync).

@@ -3979,6 +3979,9 @@ void pc_net_hold_released(void) {
         return;
     }
     dvd_settle();
+    if (in_fight() && !s_lockstep) {
+        fight_window_settle();
+    }
     if (in_fight() && net.rb_barrier > FIGHT_ENTRY_LEAD) {
         pc_log_line("net: the hold's loads are in: lockstep to frame %d, not %d", FIGHT_ENTRY_LEAD,
             net.rb_barrier);

@@ -366,6 +366,35 @@ void pc_net_fight_window_pick(void) {
         net.window, need, entry_ping_us() / 1000, entry_jitter_us() / 1000, d);
 }
 
+/* The held match leaves frame 0 (net.c pc_net_hold_released): the window
+ * again, on the link as it is now and the delay every phone now plays at.
+ * The pick above is made as the last phone finishes loading, when a phone
+ * still compiling stalls its own main thread for every reply it owes, and
+ * those stalls read as trip and jitter both: on one Mac a page that booted
+ * last measured 336 ms and 194 ms over loopback, against the others' 20 ms,
+ * and took the widest window, and every slot of snapshots that comes with
+ * it. The samples cover the last second or so, and by the GO the pages are
+ * only drawing their held frames. A narrower window gives its spare slots
+ * back; a wider one grows its slots in snapshot_take, as any slot the hold
+ * did not reach does. */
+void fight_window_settle(void) {
+    int need = net_pick_need(entry_ping_us(), entry_jitter_us(), FRAME_US);
+    if (need == 0) {
+        return;
+    }
+    int was = net.window;
+    net.window = net_pick_window(need, net.delay);
+    if (net.window == was) {
+        return;
+    }
+    if (net.window < was) {
+        snaps_trim();
+    }
+    pc_log_line("net: the fight predicts up to %d frames, not %d, on the link at the GO (a trip "
+                "of %d frames: ping %u ms, jitter %u ms, delay %d)",
+        net.window, was, need, entry_ping_us() / 1000, entry_jitter_us() / 1000, net.delay);
+}
+
 /* Eggy's hold, on the acting leader as it sends GO. The fight used to open on
  * the session's guess of 2 and wait for delay_auto's first fight decision,
  * which two phones 450 ms apart got at frame 360: six seconds of a delay plus

@@ -1147,6 +1147,12 @@ static void snapshot_free(Snapshot* s) {
     s->frame = -1;
 }
 
+void snaps_trim(void) {
+    for (int i = ring_slots(); i < SNAPS; i++) {
+        snapshot_free(&s_snaps[i]);
+    }
+}
+
 void snaps_free(void) {
     for (int i = 0; i < SNAPS; i++) {
         snapshot_free(&s_snaps[i]);
