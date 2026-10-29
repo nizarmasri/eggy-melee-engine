@@ -525,6 +525,8 @@ void adv_note(int remote_adv, int local_adv);
 void jitter_note(uint32_t rtt); /* one RTT sample, for the |dRTT| mean */
 uint32_t jitter_us(void);
 void time_sync(void);
+/* Leaving the hold at frame 0: the window for the link as it is now. */
+void fight_window_settle(void);
 /* The host's REL_DELAY announcement (on_rel dispatches it here, like
  * REL_RESUME); game thread. */
 void net_delay_rel(const void* payload, int len);
@@ -610,6 +612,8 @@ Snapshot* snap_slot(int32_t f); /* rollback ring entry for frame f */
 /* Size and page in every rollback slot for the state as it stands, so the
  * first predicted frame pays neither the allocation nor the faults. */
 void snaps_reserve(void);
+/* Free the slots past the window, which a wider one reserved. */
+void snaps_trim(void);
 void snaps_free(void);
 void snap_stats_report(void);
 uint32_t frame_checksum(const PADStatus* head);
