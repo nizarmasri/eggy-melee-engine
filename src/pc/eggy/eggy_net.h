@@ -95,8 +95,10 @@ bool eggy_net_agreed(bool hello_sent, uint8_t hello_got, uint8_t others, uint8_t
 /* How long the acting leader holds its own release after it sends GO: half
  * the worst round trip to the phones it plays (`ports`; a ping of -1 is
  * unmeasured), so every phone leaves frame 0 within about a frame of the
- * others instead of the leader starting a trip ahead. */
-#define EGGY_GO_HOLD_MAX_MS 150
+ * others instead of the leader starting a trip ahead. Capped where no link a
+ * match can be played over reaches: two phones on different networks measured
+ * a 434-510 ms round trip, which 150 left the leader 4-5 frames ahead. */
+#define EGGY_GO_HOLD_MAX_MS 400
 int eggy_go_hold_ms(const int32_t ping_ms[EGGY_PORTS], uint8_t ports);
 
 /* ---- the session (eggy_net.c, game thread) ---------------------------- */

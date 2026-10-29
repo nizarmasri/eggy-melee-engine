@@ -781,6 +781,13 @@ static const WirePad* slot_pad(int k, int32_t f) {
 /* Real input of slot k for frames first..first+count-1. Only contiguous data
  * is taken; a frame already simulated holds the prediction it ran on, and a
  * real input that differs from it marks the rollback. */
+/* A slot takes frames up to half the ring past this phone's own; the furthest
+ * a phone in time with this one writes is its delay plus its window ahead. */
+_Static_assert(
+    2 * NET_FIGHT_DELAY_MAX + NET_WINDOW_MAX - 1 < RING / 2, "the ring holds the window");
+_Static_assert(
+    RESYNC_REPLAY_MAX >= NET_FIGHT_DELAY_MAX + NET_WINDOW_MAX + 1, "a resync re-runs the window");
+
 static void slot_take(int k, int64_t first, int count, const WirePad* pads) {
     int64_t last = first + count - 1;
     const int32_t settle = s_rem_settle[k];
@@ -1584,14 +1591,14 @@ void net_desync_found(int32_t f, uint32_t mine, uint32_t theirs, int port) {
  * the interruption being rolled back as usual.
  *
  * The rings bound what can be resumed and both sides' rings are frozen
- * during the phase: whoever is not parked can only run WINDOW + delay
+ * during the phase: whoever is not parked can only run net.window + delay
  * frames past the other before it parks too, so one check at exchange time
  * cannot go stale.
  *
  * None of this runs in the common case and the frame loop grows no branch
  * for it: the phase is entered from the stall path, the refill rides on the
  * unacked window send_inputs already sends, and a refused exchange is
- * noticed by the very next wait (which is at most WINDOW frames away, since
+ * noticed by the very next wait (which is at most net.window frames away, since
  * a parked peer stops producing input).
  *
  * MELEE_NET_RECONNECT_MS bounds the phase. The default is RECONNECT_MS: a
@@ -1915,8 +1922,14 @@ int pc_net_local_player(void) {
  * frame its scene asked to end on, and both leave on the later of the two
  * plus a lead that covers the reliable round trip. This is the pattern the
  * lobby already uses to hand over to the CSS (pc_lan_start_frame). */
-#define SCENE_HANDOFF 20 /* frames of lead: ~330 ms, menus are lockstep */
-#define SCENE_SLOTS 8    /* announcements kept: the peer may be a scene ahead */
+/* Frames of lead. Every phone goes on ticking until it has every other
+ * phone's announcement, and one that has passed the agreed frame by then
+ * leaves on its own frame: 20 covered a LAN's round trip, but a phone 450 ms
+ * away is 14-17 frames past its own ask before the other's lands, and one
+ * lane resend (200 ms) more is past 20. 60 is one second; the frames it adds
+ * are the GAME! the match has already been decided by. */
+#define SCENE_HANDOFF 60
+#define SCENE_SLOTS 8 /* announcements kept: the peer may be a scene ahead */
 /* How long a scene may wait for the other half of a hand-off before the
  * session is declared dead. Five seconds is far longer than any real
  * hand-off (the announcement is one reliable round trip on top of
@@ -2189,6 +2202,7 @@ static void session_reset(void) {
     s_send_ns = 0;
     s_send_frame = -1;
     net.rb_barrier = -1;
+    net.window = NET_WINDOW_MIN;
     s_scene_last = -1;
     s_scene_first = 0;
     s_rb_lost_logged = false;
@@ -2537,8 +2551,8 @@ static bool connect_impl(
         "net: rollback with %s:%u, local port %u, player P%d, delay %s%d, window %d, "
         "seed %u, session %08x, proto %d, sim loss %d%% delay %d/%d ms jitter %d reorder %d%% "
         "dup %d%% burst %d",
-        ip, port, bind_port, net.local + 1, net.delay_auto ? "auto " : "", net.delay, WINDOW, seed,
-        net.session, WIRE_VERSION, net.sim_loss, (int)(net.sim_delay_ns / 1000000),
+        ip, port, bind_port, net.local + 1, net.delay_auto ? "auto " : "", net.delay, net.window,
+        seed, net.session, WIRE_VERSION, net.sim_loss, (int)(net.sim_delay_ns / 1000000),
         (int)(net.sim_rx_delay_ns / 1000000), net.sim_jitter_ms, net.sim_reorder, net.sim_dup,
         net.sim_burst);
     atomic_store(&s_rx_run, true);
@@ -2644,8 +2658,8 @@ bool pc_net_mesh_connect(
     SDL_UnlockMutex(net.tx_lock);
     pc_log_line("net: mesh of ports %x, this phone port %d, delay %s%d, window %d, seed %u, "
                 "session %08x, mesh proto %d",
-        humans, local_port + 1, net.delay_auto ? "auto " : "", net.delay, WINDOW, seed, net.session,
-        MESH_VERSION);
+        humans, local_port + 1, net.delay_auto ? "auto " : "", net.delay, net.window, seed,
+        net.session, MESH_VERSION);
     return true;
 #endif
 }
@@ -3184,7 +3198,6 @@ static void fight_reseed(int32_t f) {
 
 /* Ports 0-3 of the queue head become the synced inputs for frame f. */
 static void write_head(PADStatus* head, int32_t f) {
-    static const WirePad neutral;
     /* The players' ports (pc_net_set_ports, or a mesh's seats; 0 and 1 for a
      * plain session); every other port reports no controller. */
     for (int i = 0; i < 4; i++) {
@@ -3197,7 +3210,13 @@ static void write_head(PADStatus* head, int32_t f) {
             head[i].err = PAD_ERR_NO_CONTROLLER;
         }
     }
-    const WirePad* mine = f >= net.delay ? &s_local_ring[f & (RING - 1)] : &neutral;
+    /* The ring, always: what went on the wire for f. Frames no sample was
+     * written for (the first `delay` of the session) hold the zeros
+     * session_reset left, which are the neutral pad. Reading neutral for every
+     * f < net.delay instead disagreed with the wire once the fight's entry
+     * pick raised the delay before the first tick: frames 2.. went out with
+     * the first sample and were simulated here as neutral. */
+    const WirePad* mine = &s_local_ring[f & (RING - 1)];
     from_wire(&head[s_local_port], mine);
     for (int k = 0; k < s_nrem; k++) {
         const WirePad* theirs = slot_pad(k, f);
@@ -3332,7 +3351,7 @@ static bool rollback_to(int32_t f) {
  *
  * Holding is what keeps the repair shallow. The leader wrote its input up to
  * S + delay before it held; the others run on what they hold until they need
- * more of it, so each is between S - delay and S + delay + WINDOW + 1 when
+ * more of it, so each is between S - delay and S + delay + net.window + 1 when
  * the bytes land. One at S restores them
  * where the leader took them and plays on; one past S restores them and
  * re-runs the frames since from its input rings, as a rollback does (it has
@@ -3352,7 +3371,7 @@ static bool rollback_to(int32_t f) {
  * silence afresh once the hold is over. A phone
  * still disagreeing after that reports a desync again, and the leader sends
  * another snapshot, RESYNC_SENDS_MAX in a match at most. */
-#define RESYNC_CK_SKIP 8 /* past S + the delay, 2..4 in Eggy (more if it is larger) */
+#define RESYNC_CK_SKIP 8 /* past S + the delay, 2..8 in Eggy (more if it is larger) */
 
 static struct {
     ResyncPolicy pol;
@@ -3935,6 +3954,38 @@ static void dvd_settle(void) {
     }
 }
 
+/* A match held at frame 0 (src/pc/eggy, net.h), each held frame once every
+ * phone has loaded: a slot of the window's snapshot ring paged in per frame
+ * (snaps_reserve), and the archives a fight may load mid-match fetched, while
+ * there is time to spare rather than on the fight's first frames. */
+void pc_net_hold_reserve(void) {
+    if (!net.active || net.frame != 0 || s_lockstep || !in_fight()) {
+        return;
+    }
+    snaps_reserve();
+    pure_loads_fetch();
+}
+
+/* The held match leaves frame 0 (src/pc/eggy). Its scene loaded inside the
+ * hold, at frame 0 and before scene_kind() said VS, so pc_net_note_io raised
+ * the barrier the full IO_QUIET: the first 120 frames of every fight ran in
+ * lockstep, which two phones 450 ms apart played through READY... GO! at ten
+ * ticks a second, eleven seconds of it. Every one of those reads finished
+ * inside the hold (the page's complete in the call, and dvd_settle delivers
+ * any completion still owed), so all the fight still owes is its own entry
+ * lead; a read in the fight raises the barrier again as it always has. */
+void pc_net_hold_released(void) {
+    if (!net.active || net.frame != 0) {
+        return;
+    }
+    dvd_settle();
+    if (in_fight() && net.rb_barrier > FIGHT_ENTRY_LEAD) {
+        pc_log_line("net: the hold's loads are in: lockstep to frame %d, not %d", FIGHT_ENTRY_LEAD,
+            net.rb_barrier);
+        net.rb_barrier = FIGHT_ENTRY_LEAD;
+    }
+}
+
 /* MELEE_NET_STALL_TEST=frame[:ms] (fixture): park the game thread mid-match,
  * standing in for a load the netcode cannot shorten -- a stage, a character,
  * a first-time shader compile. Only the guest does it, so one exported value
@@ -4059,7 +4110,7 @@ static void fresh_tick(PADStatus* head, bool raw) {
             int lead = in_fight() ? FIGHT_ENTRY_LEAD : IO_QUIET;
             barrier_raise(net.frame + lead);
         }
-        /* Predict at most WINDOW frames past the remote, and only in a
+        /* Predict at most net.window frames past the remote, and only in a
          * fight past the barrier (plan §10.4: menus lockstep, rollback
          * armed in GS_VS once the match's own loads have gone quiet).
          *
@@ -4085,7 +4136,8 @@ static void fresh_tick(PADStatus* head, bool raw) {
             snaps_reserve();
             pure_loads_fetch();
         }
-        int32_t need = lockstep ? net.frame : (net.frame >= WINDOW ? net.frame - WINDOW : 0);
+        int32_t need =
+            lockstep ? net.frame : (net.frame >= net.window ? net.frame - net.window : 0);
         if (!wait_input(need, lockstep ? "lockstep" : "window")) {
             return;
         }
@@ -4269,8 +4321,8 @@ void pc_net_sync(void) {
         s_exit_after = ea != NULL ? (int32_t)strtol(ea, NULL, 10) : 0;
         const char* au = getenv("MELEE_NET_RESIM_AUDIT");
         s_audit_k = au != NULL ? atoi(au) : 0;
-        if (s_audit_k > SNAPS) {
-            s_audit_k = SNAPS; /* one snapshot per predicted frame is all there is */
+        if (s_audit_k > NET_WINDOW_MIN + 1) {
+            s_audit_k = NET_WINDOW_MIN + 1; /* the smallest ring a fight lays out */
         }
         const char* po = getenv("MELEE_NET_RESIM_AUDIT_POISON");
         s_audit_poison_want = po != NULL && po[0] == '1';

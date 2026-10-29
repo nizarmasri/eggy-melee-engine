@@ -44,30 +44,139 @@ bool mesh_hdr_decode(const uint8_t* in, size_t len, MeshHdr* h) {
     return h->from < MESH_PORTS && h->to < MESH_PORTS;
 }
 
-static void pad_put(uint8_t* p, const MeshPad* pad) {
-    put16(p, pad->button);
-    p[2] = (uint8_t)pad->stickX;
-    p[3] = (uint8_t)pad->stickY;
-    p[4] = (uint8_t)pad->substickX;
-    p[5] = (uint8_t)pad->substickY;
-    p[6] = pad->triggerLeft;
-    p[7] = pad->triggerRight;
+/* A section's frames, as changes from the frame before (the first from the
+ * neutral pad). Every packet repeats every frame the other phone has not
+ * shown it holds, so a far link's packets carry its whole round trip of them,
+ * 30-45 frames at 450 ms: raw, 8 bytes each, that was 15-25 KB/s up a phone's
+ * link for its input alone. A held stick or button is most frames, and costs
+ * a byte per run of up to PAD_RUN_MAX frames here.
+ *
+ *   1nnnnnnn          the last pad again, n + 1 more frames
+ *   0bbbbbbb fields   a pad that changed: bit 0 button (2 bytes), bits 1-4
+ *                     the sticks' x and y, bits 5-6 the triggers (a byte
+ *                     each), in that order; never 0 */
+#define PAD_RUN 0x80
+#define PAD_RUN_MAX 128
+
+static uint8_t pad_changes(const MeshPad* was, const MeshPad* now) {
+    return (uint8_t)((now->button != was->button ? 0x01 : 0) |
+                     (now->stickX != was->stickX ? 0x02 : 0) |
+                     (now->stickY != was->stickY ? 0x04 : 0) |
+                     (now->substickX != was->substickX ? 0x08 : 0) |
+                     (now->substickY != was->substickY ? 0x10 : 0) |
+                     (now->triggerLeft != was->triggerLeft ? 0x20 : 0) |
+                     (now->triggerRight != was->triggerRight ? 0x40 : 0));
 }
 
-static void pad_get(const uint8_t* p, MeshPad* pad) {
-    pad->button = get16(p);
-    pad->stickX = (int8_t)p[2];
-    pad->stickY = (int8_t)p[3];
-    pad->substickX = (int8_t)p[4];
-    pad->substickY = (int8_t)p[5];
-    pad->triggerLeft = p[6];
-    pad->triggerRight = p[7];
+static size_t change_len(uint8_t m) {
+    size_t n = 1 + ((m & 0x01) ? 2 : 0);
+    for (int bit = 1; bit < 7; bit++) {
+        n += (m >> bit) & 1;
+    }
+    return n;
+}
+
+/* Writes the pads' changes to out (NULL: only counts them); their length. */
+static size_t pads_put(uint8_t* out, const MeshPad* pads, int count) {
+    static const MeshPad neutral;
+    const MeshPad* was = &neutral;
+    size_t at = 0;
+    for (int f = 0; f < count;) {
+        const uint8_t m = pad_changes(was, &pads[f]);
+        if (m == 0) {
+            int run = 1;
+            while (run < PAD_RUN_MAX && f + run < count && pad_changes(was, &pads[f + run]) == 0) {
+                run++;
+            }
+            if (out != NULL) {
+                out[at] = (uint8_t)(PAD_RUN | (run - 1));
+            }
+            at++;
+            f += run;
+            continue;
+        }
+        if (out != NULL) {
+            uint8_t* p = out + at;
+            *p++ = m;
+            if (m & 0x01) {
+                put16(p, pads[f].button);
+                p += 2;
+            }
+            const uint8_t bytes[6] = {(uint8_t)pads[f].stickX, (uint8_t)pads[f].stickY,
+                (uint8_t)pads[f].substickX, (uint8_t)pads[f].substickY, pads[f].triggerLeft,
+                pads[f].triggerRight};
+            for (int bit = 1; bit < 7; bit++) {
+                if (m & (1u << bit)) {
+                    *p++ = bytes[bit - 1];
+                }
+            }
+        }
+        at += change_len(m);
+        was = &pads[f];
+        f++;
+    }
+    return at;
+}
+
+/* Reads `count` pads' changes from in[0..len); the bytes they took, or 0 when
+ * they run past len, a run passes count, or a change names no field. */
+static size_t pads_get(const uint8_t* in, size_t len, MeshPad* pads, int count) {
+    static const MeshPad neutral;
+    MeshPad was = neutral;
+    size_t at = 0;
+    for (int f = 0; f < count;) {
+        if (at >= len) {
+            return 0;
+        }
+        const uint8_t m = in[at];
+        if (m & PAD_RUN) {
+            const int run = (m & 0x7F) + 1;
+            if (f + run > count) {
+                return 0;
+            }
+            for (int i = 0; i < run; i++) {
+                pads[f++] = was;
+            }
+            at++;
+            continue;
+        }
+        if (m == 0 || at + change_len(m) > len) {
+            return 0;
+        }
+        const uint8_t* p = in + at + 1;
+        if (m & 0x01) {
+            was.button = get16(p);
+            p += 2;
+        }
+        if (m & 0x02) {
+            was.stickX = (int8_t)*p++;
+        }
+        if (m & 0x04) {
+            was.stickY = (int8_t)*p++;
+        }
+        if (m & 0x08) {
+            was.substickX = (int8_t)*p++;
+        }
+        if (m & 0x10) {
+            was.substickY = (int8_t)*p++;
+        }
+        if (m & 0x20) {
+            was.triggerLeft = *p++;
+        }
+        if (m & 0x40) {
+            was.triggerRight = *p++;
+        }
+        pads[f++] = was;
+        at += change_len(m);
+    }
+    return count == 0 ? 0 : at;
 }
 
 size_t mesh_input_len(const MeshInput* pk) {
     size_t n = MESH_INPUT_FIXED;
     for (int i = 0; i < pk->nsec && i < MESH_SECTIONS; i++) {
-        n += MESH_SECTION_FIXED + (size_t)pk->sec[i].count * sizeof(MeshPad);
+        const int count = pk->sec[i].count > MESH_RED ? MESH_RED : pk->sec[i].count;
+        n += MESH_SECTION_FIXED + pads_put(NULL, pk->sec[i].pads, count);
     }
     return n;
 }
@@ -104,10 +213,7 @@ size_t mesh_input_encode(const MeshInput* pk, uint8_t* out, size_t cap) {
         put32(out + at + 1, (uint32_t)s->first);
         out[at + 5] = s->count;
         at += MESH_SECTION_FIXED;
-        for (int f = 0; f < s->count; f++) {
-            pad_put(out + at, &s->pads[f]);
-            at += sizeof(MeshPad);
-        }
+        at += pads_put(out + at, s->pads, s->count);
     }
     return n;
 }
@@ -141,14 +247,15 @@ bool mesh_input_decode(const uint8_t* in, size_t len, MeshInput* out) {
         s->first = (int32_t)get32(in + at + 1);
         s->count = in[at + 5];
         at += MESH_SECTION_FIXED;
-        if (s->port >= MESH_PORTS || s->count > MESH_RED || s->first < 0 ||
-            at + (size_t)s->count * sizeof(MeshPad) > len)
-        {
+        if (s->port >= MESH_PORTS || s->count > MESH_RED || s->first < 0) {
             return false;
         }
-        for (int f = 0; f < s->count; f++) {
-            pad_get(in + at, &s->pads[f]);
-            at += sizeof(MeshPad);
+        if (s->count > 0) {
+            const size_t took = pads_get(in + at, len - at, s->pads, s->count);
+            if (took == 0) {
+                return false;
+            }
+            at += took;
         }
     }
     return at == len;

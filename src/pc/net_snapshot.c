@@ -1076,11 +1076,19 @@ bool synctest_after_tick(void) {
 
 /* ---- rollback ring ----------------------------------------------------
  * One snapshot per predicted frame (Slippi cadence), taken right before the
- * tick that consumes the prediction (net.c snap_predicted / rollback_to). */
+ * tick that consumes the prediction (net.c snap_predicted / rollback_to).
+ * A fight uses net.window + 1 of the slots: a far link's window costs its
+ * snapshots (~6 MB each), a near one's never touches them. */
 static Snapshot s_snaps[SNAPS];
 
+static int ring_slots(void) {
+    return net.window + 1;
+}
+
 Snapshot* snap_slot(int32_t f) {
-    return &s_snaps[f & (SNAPS - 1)];
+    const int32_t n = ring_slots();
+    const int32_t i = f % n;
+    return &s_snaps[i < 0 ? i + n : i];
 }
 
 /* Behind the barrier, on the lockstep frames just before a fight can
@@ -1093,8 +1101,9 @@ Snapshot* snap_slot(int32_t f) {
  * its state cells.
  *
  * One slot per call: all eight at once is ~50 MB written in one frame, a
- * hitch of its own. The fight's entry barrier gives ten lockstep frames, and
- * a slot not reached by then just grows in snapshot_take as before. Once the
+ * hitch of its own. The fight's entry barrier gives ten lockstep frames, the
+ * Eggy hold one a frame before that (pc_net_hold_reserve), and a slot not
+ * reached by then just grows in snapshot_take as before. Once the
  * heaps stop growing every call is a no-op: nothing is allocated or written
  * unless the need outgrew what that slot has already paged in. A slot keeps
  * its contents (realloc carries them, and only bytes past everything it ever
@@ -1107,7 +1116,7 @@ void snaps_reserve(void) {
     for (int i = 0; i < n; i++) {
         need += r[i].len;
     }
-    for (int i = 0; i < SNAPS; i++) {
+    for (int i = 0; i < ring_slots(); i++) {
         Snapshot* s = &s_snaps[i];
         if (need <= s->faulted) {
             continue;

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build and run the Eggy host tests: the engine's pure parts with the host compilers.
 
-src/pc/eggy/eggy_config.c, eggy_hold.c, eggy_report.c, src/pc/net_mesh_wire.c
+src/pc/eggy/eggy_config.c, eggy_hold.c, eggy_report.c, src/pc/net_mesh_wire.c, net_pick.c
 and net_resync.c are pure C (no game or session state), and aurora's
 lib/gfx/pipeline_rules.hpp is std-only C++, so gcc and g++ build them against
 their tests in tests/eggy. tools/browser/build.py runs this before anything
@@ -30,6 +30,7 @@ C_TESTS = [
     ('eggy_mesh_test', 'tests/eggy/eggy_mesh_test.c', ['src/pc/net_mesh_wire.c']),
     ('eggy_resync_test', 'tests/eggy/eggy_resync_test.c', ['src/pc/net_resync.c']),
     ('eggy_report_test', 'tests/eggy/eggy_report_test.c', ['src/pc/eggy/eggy_report.c']),
+    ('eggy_pick_test', 'tests/eggy/eggy_pick_test.c', ['src/pc/net_pick.c']),
 ]
 CXX_TESTS = [
     ('eggy_pipeline_rules_test', 'tests/eggy/eggy_pipeline_rules_test.cpp', []),

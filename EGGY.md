@@ -404,8 +404,9 @@ starts with one byte naming the other end.
 
 - `Module.meleeNetLinkReady`, set before the runtime starts. The engine calls it
   once with `Module.meleeNetLink` (`{buffer, tx, rx, generation, slots, bytes,
-  mesh}`) in place. `mesh` is the mesh protocol this engine speaks (10); an M2
-  engine has no `mesh`, and its rings carry no port byte.
+  mesh}`) in place. `mesh` is the mesh protocol this engine speaks (11; 10
+  before a section carried 48 frames). From 10 on the rings carry the port
+  byte; an M2 engine has no `mesh`, and its rings carry none.
 - `tx`: `[destination engine port, datagram...]`. The page sends the datagram
   (without the byte) to the phone on that port. `rx`: the page puts
   `[source engine port, datagram...]`. The 512-byte slot includes the byte, so
@@ -489,13 +490,21 @@ last match is dropped by the next.
    the rest release when GO arrives. The first tick is session frame 0 on every
    phone. A phone that has run ahead waits for the others' first inputs.
 6. The match plays under rollback over every remote port. Input delay is auto
-   from the worst phone's ping unless [53] fixes it; the leader decides it in
-   the fight's first seconds (`net_sync.c`). Time sync slows each phone for the
-   one it runs furthest ahead of. A desync is repaired from the acting leader's
-   state (Resync).
+   from the worst phone's ping unless [53] fixes it: the leader picks it from
+   what the load measured, announces it just ahead of its GO so it is in force
+   from the first tick, and may move it once more in the fight's first seconds
+   (`net_sync.c`). Up to six frames of one-way trip it is all but two of them;
+   past that the trip is split between delay and rollback, half each, up to a
+   delay of 8 (`net_pick.c`). How far each phone predicts before it stalls is
+   picked the same way once every phone has loaded: 7 frames, or the part of
+   the trip the delay leaves plus 4, up to 12 (each one a ~6 MB snapshot more
+   in the ring). The fight's first 10 frames are lockstep; the hold's own
+   loads, all finished at frame 0, no longer hold it for 120. Time sync slows
+   each phone for the one it runs furthest ahead of. A desync is repaired from
+   the acting leader's state (Resync).
 7. At GAME! every phone has the same results, fires `ended`, shows the results
    screen for [15] s in lockstep, and leaves it on the same frame (the scene
-   hand-off: the latest frame any phone asked for, plus 20). Each then says
+   hand-off: the latest frame any phone asked for, plus 60). Each then says
    DONE, waits up to 5 s for the others', closes the session and fires
    `parked`.
 
@@ -513,7 +522,7 @@ settle it away (below) and play on; with no other phone left, a phone gets
 From the hold on, a phone that goes silent is settled away. Silent means: its
 BYE arrived, or `status(port)` says -1 (the link failed for good), or nothing
 has been heard from it and nothing new of its input has reached anyone
-(relayed, or in another phone's report) for 1.5 s; while it is still loading a
+(relayed, or in another phone's report) for 4 s; while it is still loading a
 scene (before that scene's first frames of its input), 120 s.
 
 - The acting leader settles it: the lowest human port not settled and not
@@ -526,7 +535,7 @@ scene (before that scene's first frames of its input), 120 s.
   sends no delay change, and does not lead the hold.
   - U counts the phones not settled and not gone by their own word: a BYE, or a
     link the page reported failed. L counts the ones of U it has heard from in
-    the last half of the limit (0.75 s in play), so that phones cut off
+    the last half of the limit (2 s in play), so that phones cut off
     together are not settled one by one as each crosses the limit.
   - Between two phones there is no majority, so each settles the other as
     before. Three phones settle a third that is really gone. Four phones split
@@ -572,10 +581,10 @@ still disagree.
 A phone that refuses a mismatched match waits 0.6 s after its own HELLO went
 out before closing, so the others see the mismatch as well (4, not 5).
 
-Every mesh datagram carries protocol 10 in its second byte, where an M2 engine
+Every mesh datagram carries protocol 11 in its second byte, where an M2 engine
 reads its own 9: a mesh phone that hears an M2 one fails with 7. Until a phone
 answers in the mesh's protocol, the mesh also sends it a 16-byte BYE in the M2
-wire's own format, carrying protocol 10, which an M2 engine refuses as another
+wire's own format, carrying protocol 11, which an M2 engine refuses as another
 version: it fails with 7 too (its page delivering it without the port byte).
 
 ### A page that reloads before GO
@@ -630,7 +639,7 @@ state to the other phones, and every phone plays on from it.
 The leader holds before frame S until every other phone has applied the
 snapshot. The leader has written its input up to S + delay when it holds.
 Each receiver goes on until it needs more of it, then waits. Every phone is
-therefore stopped within delay + 8 frames of S when the bytes land. Each one restores the snapshot and
+therefore stopped within delay + window + 1 frames of S when the bytes land. Each one restores the snapshot and
 re-runs at most those few frames from inputs it already holds, which costs
 about the same as an ordinary rollback.
 
@@ -653,7 +662,7 @@ arrival anyway. The stall is the transfer time, and nothing else.
      `ptr = _eggy_snapshot_buffer()`.
    - Send it in 60 KB pieces on the reliable bulk lane to every other phone
      still in: stats [8 + port] 3 or 4.
-3. **The receivers play on, then wait.** They run to at most S + delay + 8,
+3. **The receivers play on, then wait.** They run to at most S + delay + window + 1,
    then wait on the leader's next input. That wait is the stall.
 4. **Each receiver's page hands the snapshot over.** It reassembles the pieces,
    then makes three calls in one go, inside the same JavaScript task:
@@ -722,7 +731,7 @@ and the leader resends.
   seconds. From the snapshot (on the leader) or its announcement (on the
   others) until the leader moves on, a phone counts as silent only after 35 s
   without a datagram; a BYE or a failed link still counts at once. After the
-  hold, every phone's silence is measured afresh, with 1.5 s of grace.
+  hold, every phone's silence is measured afresh, with 4 s of grace.
 
 **Testing it.** `_eggy_test_desync()` needs `MELEE_EGGY_TEST=1` in `ENV`. It
 returns 1 when armed. At the next fighting tick that no rollback can undo, this

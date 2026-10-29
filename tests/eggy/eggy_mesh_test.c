@@ -62,13 +62,15 @@ static void test_input_codec(void) {
     pk.ck_frame = 990;
     pk.ck = 0xDEADBEEFu;
     section(&pk, 1, 971, MESH_RED); /* our own, a full window */
-    section(&pk, 0, 990, 11);       /* a relay */
+    section(&pk, 0, 990, 8);        /* a relay, in the room a full window leaves */
     section(&pk, 2, 5, 0);          /* nothing of it, just the port */
 
     uint8_t out[MESH_SLOT_BYTES];
     const size_t n = mesh_input_encode(&pk, out, sizeof out);
     CHECK(n == mesh_input_len(&pk));
-    CHECK(n == MESH_INPUT_FIXED + 3 * MESH_SECTION_FIXED + (MESH_RED + 11) * 8);
+    /* pad_of moves the button, a stick axis, the c-stick and a trigger every
+     * frame: six bytes a frame; the first frames also set what neutral lacks. */
+    CHECK(n < MESH_INPUT_FIXED + 3 * MESH_SECTION_FIXED + (MESH_RED + 8) * 8);
     CHECK(n > 0 && n <= MESH_DGRAM_MAX);
     CHECK(out[0] == 'I' && out[1] == MESH_VERSION && out[6] == 1 && out[7] == 3);
     CHECK(out[2] == 0xC0 && out[3] == 0xFF && out[4] == 0xEE && out[5] == 0x01); /* big-endian */
@@ -101,13 +103,30 @@ static void test_input_codec(void) {
     out[MESH_INPUT_FIXED + 5] = MESH_RED + 1;
     CHECK(!mesh_input_decode(out, n, &back));
 
-    /* A fourth full section does not fit the slot: refused, never cut. */
+    /* Sections of pads that never repeat a field (the most each frame can
+     * take) do not all fit the slot: refused, never cut. */
     MeshInput big = pk;
-    big.nsec = 2;
-    big.sec[1].count = MESH_RED;
-    section(&big, 3, 900, MESH_RED);
+    big.nsec = 0;
+    for (int k = 0; k < 2; k++) {
+        MeshSection* s = &big.sec[big.nsec++];
+        s->port = (uint8_t)k;
+        s->first = 100;
+        s->count = MESH_RED;
+        for (int i = 0; i < MESH_RED; i++) {
+            s->pads[i] = (MeshPad){(uint16_t)(0x0101 * (i + 1)), (int8_t)(i + 1), (int8_t)-(i + 1),
+                (int8_t)(i + 2), (int8_t)-(i + 2), (uint8_t)(i + 1), (uint8_t)(i + 2)};
+        }
+    }
+    CHECK(mesh_input_len(&big) ==
+          MESH_INPUT_FIXED + 2 * (MESH_SECTION_FIXED + MESH_RED * MESH_PAD_MAX_BYTES));
     CHECK(mesh_input_len(&big) > MESH_DGRAM_MAX);
     CHECK(mesh_input_encode(&big, out, sizeof out) == 0);
+    /* ...but one of them always does, and comes back as it went. */
+    big.nsec = 1;
+    const size_t bn = mesh_input_encode(&big, out, sizeof out);
+    CHECK(bn == MESH_INPUT_FIXED + MESH_SECTION_FIXED + MESH_RED * MESH_PAD_MAX_BYTES);
+    CHECK(mesh_input_decode(out, bn, &back) && back.sec[0].count == MESH_RED);
+    CHECK(memcmp(back.sec[0].pads, big.sec[0].pads, MESH_RED * sizeof(MeshPad)) == 0);
     /* Nor does a section wider than the window, or a bad port. */
     MeshInput wide = pk;
     wide.sec[2].count = MESH_RED + 1;
@@ -115,6 +134,60 @@ static void test_input_codec(void) {
     MeshInput port = pk;
     port.sec[1].port = 4;
     CHECK(mesh_input_encode(&port, out, sizeof out) == 0);
+}
+
+/* A held input is most of a far link's frames: a run of them is a byte. */
+static void test_input_runs(void) {
+    MeshInput pk;
+    memset(&pk, 0, sizeof pk);
+    pk.h = (MeshHdr){MESH_INPUT, MESH_VERSION, 7, 0, 1};
+    pk.nsec = 1;
+    MeshSection* s = &pk.sec[0];
+    s->port = 0;
+    s->first = 5000;
+    s->count = MESH_RED;
+    const MeshPad held = {0x0100, 80, 0, 0, 0, 0, 0}; /* A, stick right */
+    for (int i = 0; i < MESH_RED; i++) {
+        s->pads[i] = i < 10 ? (MeshPad){0} : i < 40 ? held : (MeshPad){0x0100, 80, -40, 0, 0, 0, 0};
+    }
+    uint8_t out[MESH_SLOT_BYTES];
+    const size_t n = mesh_input_encode(&pk, out, sizeof out);
+    /* neutral x10: a run; then A and x: 1 + 2 + 1; held x29: a run; then y: 1 + 1; held x7: a run.
+     */
+    CHECK(n == MESH_INPUT_FIXED + MESH_SECTION_FIXED + 1 + 4 + 1 + 2 + 1);
+    MeshInput back;
+    CHECK(mesh_input_decode(out, n, &back));
+    CHECK(back.sec[0].count == MESH_RED && back.sec[0].first == 5000);
+    CHECK(memcmp(back.sec[0].pads, s->pads, MESH_RED * sizeof(MeshPad)) == 0);
+
+    /* Every frame the same pad: one byte, however many frames up to MESH_RED. */
+    for (int i = 0; i < MESH_RED; i++) {
+        s->pads[i] = held;
+    }
+    CHECK(mesh_input_len(&pk) == MESH_INPUT_FIXED + MESH_SECTION_FIXED + 4 + 1);
+    /* No frames at all: the section's head alone. */
+    s->count = 0;
+    const size_t z = mesh_input_encode(&pk, out, sizeof out);
+    CHECK(z == MESH_INPUT_FIXED + MESH_SECTION_FIXED);
+    CHECK(mesh_input_decode(out, z, &back) && back.sec[0].count == 0);
+
+    /* Refused: a run past the section's count, a change naming nothing, a
+     * change cut short, and bytes left over. */
+    s->count = 3;
+    s->pads[0] = s->pads[1] = s->pads[2] = held;
+    size_t m = mesh_input_encode(&pk, out, sizeof out);
+    CHECK(m == MESH_INPUT_FIXED + MESH_SECTION_FIXED + 4 + 1);
+    CHECK(mesh_input_decode(out, m, &back));
+    const size_t body = MESH_INPUT_FIXED + MESH_SECTION_FIXED;
+    out[body + 4] = 0x80 | 2; /* three more frames after the first: four */
+    CHECK(!mesh_input_decode(out, m, &back));
+    out[body + 4] = 0x80 | 1;
+    CHECK(mesh_input_decode(out, m, &back));
+    out[body] = 0x00;
+    CHECK(!mesh_input_decode(out, m, &back));
+    out[body] = 0x03;
+    CHECK(!mesh_input_decode(out, body + 2, &back)); /* the button's second byte is missing */
+    CHECK(!mesh_input_decode(out, m + 1, &back));
 }
 
 static void test_rel_codec(void) {
@@ -190,7 +263,7 @@ static void test_addressing(void) {
 
     /* Everything a mesh sends puts the version second, where an M2 engine
      * (protocol 9) reads its own: the two refuse each other. */
-    CHECK(MESH_VERSION == 10);
+    CHECK(MESH_VERSION == 11);
     uint8_t probe[MESH_M2_PROBE_LEN];
     mesh_m2_probe(probe, 0xA1B2C3D4u, 1);
     const uint8_t want[MESH_M2_PROBE_LEN] = {
@@ -253,7 +326,7 @@ static void test_quorum(void) {
      * phone that hears nobody else settle the last. */
     CHECK(mesh_quorum(0x0F, 0, 0x05, 0x05, 1));
     CHECK(mesh_quorum(0x07, 0, 0x03, 0x01, 2));
-    CHECK(!mesh_quorum(0x0F, 0, 0x07, 0x01, 3)); /* one BYE, two silent: 1 of 3 */
+    CHECK(!mesh_quorum(0x0F, 0, 0x07, 0x01, 3));   /* one BYE, two silent: 1 of 3 */
     CHECK(mesh_quorum(0x0F, 0x08, 0x07, 0x07, 3)); /* all the others gone */
 }
 
@@ -307,7 +380,7 @@ static void test_settle_rules(void) {
     CHECK(mesh_away_decide(&v, &f) == 2 && f == 52);
     v.self = 1; /* port 0 leads: port 1 does nothing */
     CHECK(mesh_away_decide(&v, &f) == -1);
-    v.quiet_ms[0] = 1500; /* port 0 silent too: port 1 hears nobody, one of */
+    v.quiet_ms[0] = 1500;  /* port 0 silent too: port 1 hears nobody, one of */
     v.stable_ms[0] = 1500; /* three, and settles neither of the two */
     CHECK(mesh_silent_mask(&v) == 0x05 && mesh_away_decide(&v, &f) == -1);
     v.bye[0] = true; /* unless port 0 said BYE: then it is the last two */
@@ -369,7 +442,7 @@ typedef struct SimEvent {
     int64_t at;
     int from, to;
     bool away;
-    int rs; /* 1 the resync announcement (frame: rs_release), 2 an answer */
+    int rs;        /* 1 the resync announcement (frame: rs_release), 2 an answer */
     int port;      /* away */
     int32_t frame; /* away */
     int32_t have[MESH_PORTS];
@@ -530,7 +603,7 @@ static void sim_receive(const SimEvent* e) {
     }
     if (e->rs == 1) { /* net.c net_resync_announce -> mesh_resync_hold */
         pb->heard[e->from] = sim.now;
-        sim.ph[e->from].rs_owed &= (uint8_t) ~(1u << e->to);
+        sim.ph[e->from].rs_owed &= (uint8_t)~(1u << e->to);
         if (!pb->rs_on || pb->rs_leader != e->from || pb->rs_release != e->frame) {
             pb->rs_on = true;
             pb->rs_leader = e->from;
@@ -546,7 +619,7 @@ static void sim_receive(const SimEvent* e) {
         return;
     }
     if (e->away) {
-        sim.ph[e->from].away_owed[e->to] &= (uint8_t) ~(1u << e->port);
+        sim.ph[e->from].away_owed[e->to] &= (uint8_t)~(1u << e->port);
         const int what = mesh_away_accept(pb->settled, e->to, e->from, e->port);
         if (what == MESH_AWAY_EVICTED && !pb->evicted) {
             pb->evicted = true;
@@ -935,7 +1008,7 @@ static void test_sim_resync_hold(void) {
             CHECK(sim.ph[q].alive && !sim.ph[q].evicted);
             CHECK(sim_settled_any(q) == 0);
             CHECK(!sim.ph[q].hold && !sim.ph[q].rs_on); /* the resync is over everywhere */
-            CHECK(sim.ph[q].wrote > held + 200);         /* and the match goes on */
+            CHECK(sim.ph[q].wrote > held + 200);        /* and the match goes on */
         }
         CHECK(sim.ph[0].answers == (uint8_t)(sim.humans & ~1u));
     }
@@ -1021,6 +1094,7 @@ static void test_sim_loading(void) {
 
 int main(void) {
     test_input_codec();
+    test_input_runs();
     test_rel_codec();
     test_addressing();
     test_leader();

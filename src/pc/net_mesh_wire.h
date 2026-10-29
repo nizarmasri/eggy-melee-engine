@@ -24,15 +24,20 @@
 extern "C" {
 #endif
 
-/* One past melee-web's PC_NET_PROTO_VERSION (9): another engine build is
- * refused rather than misread. */
-#define MESH_VERSION 10
+/* Past melee-web's PC_NET_PROTO_VERSION (9): another engine build is refused
+ * rather than misread. 11: a section carries 48 frames, not 32. */
+#define MESH_VERSION 11
 #define MESH_PORTS 4
 #define MESH_SLOT_BYTES 512                  /* net_web.c WEB_SLOT_BYTES */
 #define MESH_DGRAM_MAX (MESH_SLOT_BYTES - 1) /* after the port byte */
-#define MESH_RED 32                          /* frames one section carries at most */
-#define MESH_SECTIONS 4                      /* own port plus relays */
-#define MESH_REL_MAX 256                     /* reliable payload */
+/* Frames one section carries at most. The mesh has no acks: what a phone
+ * holds of us rides back on its own next input, so our unacked span is the
+ * round trip, the delay and a few frames of turnaround, and a packet carries
+ * the oldest MESH_RED of it. 32 held 60 Hz only to ~400 ms at a delay of 7;
+ * 48 holds it to ~600 ms at 8, and own section plus header is 431 bytes. */
+#define MESH_RED 48
+#define MESH_SECTIONS 4  /* own port plus relays */
+#define MESH_REL_MAX 256 /* reliable payload */
 
 enum MeshMagic {
     MESH_INPUT = 'I',
@@ -81,6 +86,14 @@ typedef struct MeshInput {
 #define MESH_ECHO 0x01
 #define MESH_INPUT_FIXED 41
 #define MESH_SECTION_FIXED 6
+/* A section's frames go out as changes (mesh_input_encode): a run of frames
+ * the same as the one before is one byte, a frame that changed is a byte
+ * naming its changed fields and then those fields. The most one frame can
+ * take is that byte and all eight bytes of the pad. */
+#define MESH_PAD_MAX_BYTES 9
+_Static_assert(
+    MESH_INPUT_FIXED + MESH_SECTION_FIXED + MESH_RED * MESH_PAD_MAX_BYTES <= MESH_DGRAM_MAX,
+    "a phone's own section always fits, whatever its frames");
 
 typedef struct MeshRel {
     MeshHdr h;
@@ -91,7 +104,7 @@ typedef struct MeshRel {
 } MeshRel;
 #define MESH_REL_FIXED 13
 
-/* Bytes an input packet with these sections takes. */
+/* Bytes an input packet with these sections takes, encoded. */
 size_t mesh_input_len(const MeshInput* pk);
 /* Encode into out (cap bytes); 0 when it does not fit. */
 size_t mesh_input_encode(const MeshInput* pk, uint8_t* out, size_t cap);
