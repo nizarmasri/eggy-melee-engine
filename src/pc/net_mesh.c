@@ -527,10 +527,10 @@ static void send_input_to(int port, uint64_t now) {
             continue;
         }
         const size_t used = mesh_input_len(&pk) + MESH_SECTION_FIXED;
-        if (used + sizeof(MeshPad) > MESH_DGRAM_MAX) {
+        if (used + MESH_PAD_MAX_BYTES > MESH_DGRAM_MAX) {
             break;
         }
-        int room = (int)((MESH_DGRAM_MAX - used) / sizeof(MeshPad));
+        int room = (int)((MESH_DGRAM_MAX - used) / MESH_PAD_MAX_BYTES); /* whatever its frames */
         room = room > MESH_RED ? MESH_RED : room;
         int64_t rf = (int64_t)theirs + 1;
         const int64_t oldest = (int64_t)(mine > net.frame ? mine : net.frame) - RING + 1;

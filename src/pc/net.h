@@ -220,6 +220,17 @@ bool pc_net_mesh_connect(
 void pc_net_mesh_set_timing(int away_ms, int load_ms);
 /* From here on silent phones are settled away (the match's hold). */
 void pc_net_mesh_arm(void);
+/* A match held at frame 0 (src/pc/eggy), sized to its link: each a no-op
+ * once the session has ticked. Once every phone has loaded, every phone picks
+ * how far its fight may predict (net_pick.c), then has its snapshot ring paged
+ * in a slot per held frame; the acting leader picks the fight's delay just
+ * before it sends GO, so it is in force from the first tick on every phone;
+ * every phone, as it releases, drops the rollback barrier the hold's loads
+ * raised. */
+void pc_net_fight_window_pick(void);
+void pc_net_hold_reserve(void);
+void pc_net_fight_delay_pick(void);
+void pc_net_hold_released(void);
 enum {
     PC_NET_MESH_NONE,         /* not a human port of the mesh */
     PC_NET_MESH_SELF,         /* this phone */

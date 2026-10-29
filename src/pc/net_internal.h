@@ -72,6 +72,7 @@
 #include "pc/net.h"
 #include "pc/net_lan.h"
 #include "pc/net_mesh_wire.h"
+#include "pc/net_pick.h"
 #include "pc/net_resync.h"
 #include "pc/pc.h"
 
@@ -140,8 +141,11 @@ void net_web_reset(void);
 /* Unacked frames an input packet can carry. Delivery runs at one packet's
  * worth per round trip (net.c send_inputs), so 32 holds 60 Hz to ~530 ms. */
 #define REDUNDANCY 32
-#define WINDOW 7 /* predicted frames allowed before a hard stall */
-#define SNAPS 8  /* snapshot ring, one per predicted frame; > WINDOW */
+/* Predicted frames allowed before a hard stall: net.window, picked for each
+ * fight from its link (net_pick.c), NET_WINDOW_MIN to NET_WINDOW_MAX. The
+ * snapshot ring holds one per predicted frame, net.window + 1 of its slots. */
+#define SNAPS 16 /* > NET_WINDOW_MAX, a power of two for what is sized by it */
+_Static_assert(SNAPS > NET_WINDOW_MAX, "a slot per predicted frame and one more");
 #define FRAME_US ((int32_t)(pc_sim_period_ns() / 1000)) /* the boundary's pacing target */
 #define STALL_TIMEOUT_MS 3000
 #define CONNECT_TIMEOUT_MS 60000
@@ -203,7 +207,7 @@ typedef struct Packet {
      * phase controller acts on the DIFFERENCE, which is the one form of the
      * measurement with no clock, no round trip and no symmetric-path
      * assumption in it (net_sync.c time_sync). Clamped to a byte; the window
-     * it can legitimately reach is WINDOW + delay. */
+     * it can legitimately reach is net.window + delay. */
     int8_t adv;
     WirePad pads[REDUNDANCY];
 } __attribute__((packed)) Packet;
@@ -378,6 +382,9 @@ struct NetSession {
     bool resim;         /* re-running frames after a rollback */
     bool desync_reported;
     int32_t rb_barrier; /* no frame <= this is rolled back to */
+    /* Predicted frames before a hard stall (net_pick.c). Laid out the snapshot
+     * ring, so it only changes before a session's first tick. */
+    int window;
 
     /* transmit: timer thread + game thread under tx_lock */
     SDL_Mutex* tx_lock;

@@ -54,8 +54,12 @@ _Static_assert(
 /* Connected, for every other phone to answer (its page may call eggy_load a
  * little later) and then for every HELLO. */
 #define EGGY_CONNECT_MS 30000
-/* A phone silent this long mid-match is settled away. */
-#define EGGY_AWAY_MS 1500
+/* A phone silent this long mid-match is settled away, and between two phones
+ * that ends the match for good. 1.5 s ended matches over a TURN relay or
+ * mobile data on the first hiccup of a second or two (the other phone's data
+ * also lands a trip late there, ~250 ms of the limit gone); GGPO waits 5 s.
+ * The others hold still meanwhile, so it stays short of that. */
+#define EGGY_AWAY_MS 4000
 /* The other phones' loads, from ours: a cold phone compiling shaders is slow.
  * A phone still loading a scene is also given this long before it is
  * settled away. */
@@ -96,6 +100,7 @@ static struct {
     int desyncs;            /* reported this match */
     uint8_t away_told;      /* ports whose 'away' was reported */
     uint64_t go_release_at; /* the leader's own release, once its GO is on the way (SDL ms) */
+    bool delay_picked;      /* the leader's fight delay, picked as its GO first went out */
     int32_t stats[EGGY_NET_STATS_WORDS];
 } s;
 
@@ -348,6 +353,7 @@ int eggy_net_hold_step(bool go, bool* loaded) {
             break;
         case EGGY_HOLD_REPORT:
             *loaded = true;
+            pc_net_fight_window_pick(); /* the load has measured the link by now */
             break;
         case EGGY_HOLD_SEND_ARMED:
             if (!send_msg(EGGY_REL_ARMED)) {
@@ -355,6 +361,10 @@ int eggy_net_hold_step(bool go, bool* loaded) {
             }
             break;
         case EGGY_HOLD_SEND_GO: {
+            if (!s.delay_picked) {
+                s.delay_picked = true;
+                pc_net_fight_delay_pick(); /* ahead of the GO, on the same lane */
+            }
             if (!send_msg(EGGY_REL_GO)) {
                 return 0;
             }
@@ -374,12 +384,16 @@ int eggy_net_hold_step(bool go, bool* loaded) {
             if (s.hold.sent_go && now < s.go_release_at) {
                 return 0;
             }
+            pc_net_hold_released();
             set_state(EGGY_NET_LIVE);
             pc_log_line("eggy: netplay released, ping %d ms, delay %d", s.stats[1], s.stats[2]);
             return 1;
         default:
             if (!s.hold.reported && now - s.hold_t0 > EGGY_LOADED_MS) {
                 return fail(EGGY_NET_ERR_TIMEOUT);
+            }
+            if (s.hold.reported) {
+                pc_net_hold_reserve(); /* the window's snapshots, a slot a held frame */
             }
             return 0;
         }

@@ -7,6 +7,7 @@
  *   gcc -std=c11 -Wall -Wextra -Werror -Isrc tests/eggy/eggy_resync_test.c \
  *       src/pc/net_resync.c -o eggy_resync_test && ./eggy_resync_test
  */
+#include "pc/net_pick.h"
 #include "pc/net_resync.h"
 
 #include <stdio.h>
@@ -192,7 +193,9 @@ static void test_layout(void) {
 
 /* ---- the frame choice --------------------------------------------------------- */
 
-#define WINDOW 7 /* net_internal.h: predicted frames before a hard stall */
+/* The widest a fight predicts before a hard stall (net_pick.h): a narrower
+ * window only stops every phone closer to S. */
+#define WINDOW NET_WINDOW_MAX
 
 static void test_frame_final(void) {
     /* Entering S is final once every input before S is real and nothing
@@ -273,8 +276,10 @@ static void test_mesh_positions(void) {
             }
         }
     }
-    /* RESYNC_REPLAY_MAX holds every delay up to 22 at WINDOW 7. */
-    CHECK(resync_apply_when(1000, 1000 + 22 + WINDOW + 1) == RESYNC_ROLLBACK);
+    /* RESYNC_REPLAY_MAX holds every delay up to 17 at the widest window, and a
+     * fight's delay is at most NET_FIGHT_DELAY_MAX. */
+    CHECK(resync_apply_when(1000, 1000 + 17 + WINDOW + 1) == RESYNC_ROLLBACK);
+    CHECK(NET_FIGHT_DELAY_MAX <= 17);
 }
 
 /* ---- the leader's budget ------------------------------------------------------ */

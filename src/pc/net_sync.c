@@ -24,17 +24,17 @@
 
 #define OFFSET_SAMPLES 30
 #define JITTER_SAMPLES 30
-#define DELAY_LEAD 120    /* frames between announcing a delay and applying it */
-#define DELAY_EVERY 60    /* frames between auto-delay decisions */
-#define DELAY_HOLDOFF 300 /* frames between link-driven delay changes */
-/* A fight predicts and rolls back, so the frames of the trip covered here are
- * paid by the rollback window instead of by the player's hands. Menus are
- * lockstep and pay all of it. */
-#define ROLLBACK_COVER 2
-/* ...but never below FIGHT_DELAY_MIN. Covering the trip with rollback instead
- * of delay only pays while the rollbacks stay shallow: a phone on mobile data
- * at 53 ms of ping got a fight delay of 1, rolled back 8 frames deep, and
- * waited on the PC 2,472 times in one match. 2 is also Slippi's default. */
+#define DELAY_LEAD 120         /* frames between announcing a delay and applying it */
+#define DELAY_EVERY 60         /* frames between auto-delay decisions */
+#define DELAY_HOLDOFF 300      /* frames between link-driven delay changes */
+#define DELAY_REFINE_UNTIL 600 /* frames a fight may still refine its entry pick */
+/* A fight predicts and rolls back, so part of the trip is paid by the
+ * rollback window instead of by the player's hands (net_pick.c says how
+ * much). Menus are lockstep and pay all of it. The fight's delay is never
+ * below FIGHT_DELAY_MIN: covering the trip with rollback instead of delay
+ * only pays while the rollbacks stay shallow, and a phone on mobile data at
+ * 53 ms of ping got a fight delay of 1, rolled back 8 frames deep, and waited
+ * on the PC 2,472 times in one match. 2 is also Slippi's default. */
 #define FIGHT_DELAY_MIN 2
 /* A LAN whose whole round trip, jitter included, sits well inside a frame
  * gets 1 instead: the peer's input is in before it is needed nearly every
@@ -69,9 +69,13 @@ static uint32_t s_rtt_prev;            /* last RTT sample, for the jitter ring *
 static uint32_t s_jit[JITTER_SAMPLES]; /* |dRTT| ring; its mean scales the thresholds */
 static int s_jit_n, s_jit_i;
 static uint64_t s_jit_sum;
-static int64_t s_nudge_ns;    /* slow-down carried by every frame's pacing wait */
-static int s_delay_base;      /* frames of delay the link needs while lockstep */
-static int s_delay_seen;      /* last window's measurement, for confirm-twice */
+static uint32_t
+    s_rtt_ring[JITTER_SAMPLES]; /* the same peer's last RTT samples, for the entry picks */
+static int s_rtt_n, s_rtt_i;
+static bool s_delay_entry; /* the fight's delay was picked at its entry (pc_net_fight_delay_pick) */
+static int64_t s_nudge_ns; /* slow-down carried by every frame's pacing wait */
+static int s_delay_base;   /* frames of delay the link needs while lockstep */
+static int s_delay_seen;   /* last window's measurement, for confirm-twice */
 static int32_t s_delay_acted; /* frame of the last delay announcement */
 static bool s_delay_fight;    /* in_fight() when that announcement was made */
 
@@ -116,6 +120,11 @@ static int32_t offset_us(void) {
 
 /* 30-sample mean of |dRTT|: what the delay has to cover on top of the trip. */
 void jitter_note(uint32_t rtt) {
+    s_rtt_ring[s_rtt_i] = rtt;
+    s_rtt_i = (s_rtt_i + 1) % JITTER_SAMPLES;
+    if (s_rtt_n < JITTER_SAMPLES) {
+        s_rtt_n++;
+    }
     if (s_rtt_prev != 0) {
         uint32_t d = rtt > s_rtt_prev ? rtt - s_rtt_prev : s_rtt_prev - rtt;
         if (s_jit_n == JITTER_SAMPLES) {
@@ -132,6 +141,42 @@ void jitter_note(uint32_t rtt) {
 
 uint32_t jitter_us(void) {
     return s_jit_n ? (uint32_t)(s_jit_sum / s_jit_n) : 0;
+}
+
+/* The median of n samples (n <= JITTER_SAMPLES). */
+static uint32_t median_of(const uint32_t* v, int n) {
+    uint32_t b[JITTER_SAMPLES];
+    memcpy(b, v, (size_t)n * sizeof b[0]);
+    for (int i = 1; i < n; i++) {
+        uint32_t x = b[i];
+        int j = i;
+        while (j > 0 && b[j - 1] > x) {
+            b[j] = b[j - 1];
+            j--;
+        }
+        b[j] = x;
+    }
+    return b[n / 2];
+}
+
+/* The link as the entry picks read it: the median round trip and the median
+ * |dRTT| of the last samples rather than the running mean of each. The hold
+ * measures through the load, where either phone's main thread stops for a
+ * pipeline compile now and then, and each such stop lands on one sample as
+ * trip and as jitter both: the means took a 434 ms link for 510. */
+#define ENTRY_SAMPLES_MIN 8
+static uint32_t entry_ping_us(void) {
+    return s_rtt_n >= ENTRY_SAMPLES_MIN ? median_of(s_rtt_ring, s_rtt_n) : net.ping_us;
+}
+static uint32_t entry_jitter_us(void) {
+    return s_jit_n >= ENTRY_SAMPLES_MIN ? median_of(s_jit, s_jit_n) : jitter_us();
+}
+
+/* The fight's delay floor for this link: 1 on a LAN whose whole round trip,
+ * jitter included, sits well inside a frame, 2 everywhere else. */
+static int fight_delay_floor(void) {
+    bool lan = net.ping_us < LAN_PING_US && jitter_us() < LAN_JITTER_US;
+    return lan ? FIGHT_DELAY_LAN : FIGHT_DELAY_MIN;
 }
 
 /* The delay is shared state: the frame a local sample is written for is
@@ -157,8 +202,8 @@ static void delay_apply(void) {
  * A lockstep frame cannot start until the peer's input for it has arrived, so
  * a menu needs delay * frame >= the one-way trip or BOTH peers stall every
  * frame and the pair runs at trip/delay instead of 60 Hz. A fight does not:
- * it predicts up to WINDOW frames past the remote and corrects by rolling
- * back, so ROLLBACK_COVER frames of that trip are paid by the rollback
+ * it predicts up to net.window frames past the remote and corrects by
+ * rolling back, so part of that trip (net_pick.c) is paid by the rollback
  * window rather than by the player's hands. One delay sized for the menus
  * therefore carries one to two frames of dead input lag through the whole
  * match, which is exactly the latency rollback exists to remove.
@@ -206,13 +251,21 @@ static void delay_auto(void) {
         return;
     }
     bool fight = in_fight();
-    int d = fight ? s_delay_base - ROLLBACK_COVER : s_delay_base + LOCKSTEP_PROCESSING;
-    bool lan = net.ping_us < LAN_PING_US && jitter_us() < LAN_JITTER_US;
-    int lo = !fight ? 1 : lan ? FIGHT_DELAY_LAN : FIGHT_DELAY_MIN;
-    /* Lockstep must cover the trip; a 200 ms link needs about seven frames.
-     * Fights still cap delay at four and use rollback for the rest. */
-    int hi = fight ? 4 : 8;
-    d = d < lo ? lo : d > hi ? hi : d;
+    /* A delay picked at the fight's entry is refined once in its first
+     * seconds, on what the fight itself measures, and then left alone: a
+     * window that rounds the other way a minute in is noise, and a delay that
+     * moves mid-match is the worse thing to play against. */
+    if (fight && s_delay_entry && !s_delay_fight && net.frame >= DELAY_REFINE_UNTIL) {
+        s_delay_fight = true;
+    }
+    int d;
+    if (fight) {
+        d = net_pick_fight_delay(s_delay_base, fight_delay_floor());
+    } else {
+        /* Lockstep must cover the trip; a 200 ms link needs about seven frames. */
+        d = s_delay_base + LOCKSTEP_PROCESSING;
+        d = d < 1 ? 1 : d > 8 ? 8 : d;
+    }
     if (d == net.delay) {
         return;
     }
@@ -284,8 +337,65 @@ void net_delay_rel(const void* payload, int len) {
      * delays costs a frame of fairness and nothing else. */
     net.delay_at = at > net.frame ? at : net.frame;
     pc_log_line("net: auto delay %d -> %d at frame %d (host's pick%s)", net.delay, d, net.delay_at,
-        at > net.frame ? "" : ", late");
+        at > net.frame ? "" :
+        at == 0        ? ", the fight's entry" :
+                         ", late");
+    if (net.delay_at == 0) {
+        /* The fight's entry pick (pc_net_fight_delay_pick), ahead of the GO
+         * on the same lane: nothing has been simulated, so it is in force
+         * from the first tick. 0 is also delay_at's "none". */
+        net.delay = d;
+        return;
+    }
     delay_apply();
+}
+
+/* Eggy's hold (eggy_net.c), on every phone once every phone has loaded: how
+ * far this fight may predict, for the trip the load has been measuring (pings
+ * ride every keepalive) and the delay that trip gets. Only before the first
+ * tick, because the window lays out the snapshot ring. */
+void pc_net_fight_window_pick(void) {
+    if (!net.active || net.frame != 0) {
+        return;
+    }
+    int need = net_pick_need(entry_ping_us(), entry_jitter_us(), FRAME_US);
+    int d = net.delay_auto ? net_pick_fight_delay(need, fight_delay_floor()) : net.delay;
+    net.window = net_pick_window(need, d);
+    pc_log_line("net: the fight predicts up to %d frames (a trip of %d frames: ping %u ms, "
+                "jitter %u ms, delay %d)",
+        net.window, need, entry_ping_us() / 1000, entry_jitter_us() / 1000, d);
+}
+
+/* Eggy's hold, on the acting leader as it sends GO. The fight used to open on
+ * the session's guess of 2 and wait for delay_auto's first fight decision,
+ * which two phones 450 ms apart got at frame 360: six seconds of a delay plus
+ * window that covered 9 of the trip's 14 frames, stalled most of the time.
+ * Every phone has been measuring the link through the whole load, so the
+ * leader picks for the trip now and announces it ahead of the GO on the same
+ * ordered lane: every phone has it before its first tick (net_delay_rel takes
+ * frame 0 as in force at once). delay_auto still moves it once in the fight,
+ * on what the fight measures. */
+void pc_net_fight_delay_pick(void) {
+    if (!net.active || !net.delay_auto || !net_delay_announcer() || net.frame != 0) {
+        return;
+    }
+    int need = net_pick_need(entry_ping_us(), entry_jitter_us(), FRAME_US);
+    if (need == 0) {
+        return; /* unmeasured: the fight's own decision sets it */
+    }
+    s_delay_entry = true;
+    int d = net_pick_fight_delay(need, fight_delay_floor());
+    if (d == net.delay) {
+        return;
+    }
+    DelayMsg m = {htonl((uint32_t)d), htonl(0)};
+    if (!pc_net_send_reliable(REL_DELAY, &m, sizeof m)) {
+        return; /* lane full: the fight's decision picks it up */
+    }
+    pc_log_line("net: auto delay %d -> %d from the first tick (ping %u ms, jitter %u ms)",
+        net.delay, d, entry_ping_us() / 1000, entry_jitter_us() / 1000);
+    net.delay = net.delay_next = d;
+    net.delay_at = 0;
 }
 
 /* Every SYNC_INTERVAL frames. net.offset_last is half the disagreement
@@ -437,12 +547,12 @@ uint64_t pc_net_pace_adjust_ns(void) {
 /* A boundary that is late because this peer froze (a GC, a shader compile,
  * the OS taking the core) owes the frames it did not run. Dropping them, as
  * offline pacing does, leaves this side behind the peer by the whole freeze;
- * the peer meanwhile runs WINDOW + delay frames ahead on predictions and
+ * the peer meanwhile runs net.window + delay frames ahead on predictions and
  * stays there, rolling back that deep on every input change and stalling on
  * every late packet, until time sync has slowed it down by as much. Measured
  * with tools/net_test.py --hitch 250:300: back within a frame of the peer
  * 147 frames after each 250 ms freeze, against 1-4 frames with the debt
- * kept. So it is paid by running boundaries back to back, up to WINDOW +
+ * kept. So it is paid by running boundaries back to back, up to net.window +
  * delay frames: that is the most the peer can have got ahead during the
  * freeze, so paying more would put this side in front.
  *
@@ -470,7 +580,7 @@ uint64_t pc_net_catch_up_ns(uint64_t late_ns) {
     if (late > 2 * frame && late >= s_catch_up_ns && late < s_catch_up_ns + frame) {
         late = 0;
     }
-    const uint64_t cap = (uint64_t)(WINDOW + net.delay) * frame;
+    const uint64_t cap = (uint64_t)(net.window + net.delay) * frame;
     s_catch_up_ns = late < cap ? late : cap;
     return s_catch_up_ns;
 }
@@ -500,6 +610,8 @@ void sync_reset(void) {
     s_rtt_prev = 0;
     s_jit_n = s_jit_i = 0;
     s_jit_sum = 0;
+    s_rtt_n = s_rtt_i = 0;
+    s_delay_entry = false;
     net.delay_at = 0;
     net.pad_reused = false;
     net.pad_reuse = net.pad_empty = 0;

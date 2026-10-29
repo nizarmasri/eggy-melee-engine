@@ -43,7 +43,9 @@
 extern "C" {
 #endif
 
-#define NET_SFX_FRAMES 16    /* frames logged; a power of two deeper than any rollback (SNAPS) */
+/* Frames logged: a power of two deeper than any re-run, a resync's included
+ * (delay + window + 1, up to 21). */
+#define NET_SFX_FRAMES 32
 #define NET_SFX_PER_FRAME 32 /* starts logged per frame */
 
 /* net_sfx_set: which parameter a call changes. */
